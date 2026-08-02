@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.tsbuildinfo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.run-state/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.local
+.env.example
+
+# PyCharm
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+dist/
+build/
+
+# Logs
+*.log
+logs/
+
+# Outputs
+outputs/
+reports/generated/
+backend/storage/
+data/app.db
+data/app.db-shm
+data/app.db-wal
+data/audit_archives/
+data/qdrant/
+data/models/
+data/model_cache/
+data/documents/originals/*
+!data/documents/originals/.gitkeep
+.qdrant-initialized
+data/test_documents/parser_samples/*
+data/evaluation/
+data/contest-data/
+data/contest_dataset/
+data/contest_staging/
+data/contest dataset/
+data/dev_runtime/
+dist-delivery/
+delivery/
+release/
+ResumeMind-Delivery*/
+*.zip
+*.7z
+*.tar
+.agents/
+.cache/
+models/
+model_cache/
+hf_cache/
+
+# Large or generated files
+*.sqlite3
+*.db
+
+# External contest briefs and raw binary source material
+/docs/*.docx

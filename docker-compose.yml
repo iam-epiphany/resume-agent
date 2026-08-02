@@ -1,0 +1,106 @@
+﻿services:
+  app:
+    image: ${RESUME_APP_IMAGE:-resumemind/app:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RESUME_BUILD_ID: ${RESUME_BUILD_ID:-dev}
+    container_name: resumemind-app
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      RESUME_DATA_DIR: /app/data
+      RESUME_MODEL_CACHE_DIR: /app/data/model_cache
+      RESUME_OFFLINE_MODE: ${RESUME_OFFLINE_MODE:-false}
+      RESUME_BUILD_ID: ${RESUME_BUILD_ID:-dev}
+      SEMANTIC_GROUNDING_MODE: ${SEMANTIC_GROUNDING_MODE:-risk_based}
+      SEMANTIC_GROUNDING_MODEL: ${SEMANTIC_GROUNDING_MODEL:-deepseek-v4-flash}
+      SEMANTIC_GROUNDING_TIMEOUT_SECONDS: ${SEMANTIC_GROUNDING_TIMEOUT_SECONDS:-12}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-resumemind_chunks}
+      QDRANT_AUTO_CREATE_COLLECTION: ${QDRANT_AUTO_CREATE_COLLECTION:-true}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      QUERY_PLANNER_MODEL: ${QUERY_PLANNER_MODEL:-deepseek-v4-flash}
+      ANSWER_GENERATION_MODEL: ${ANSWER_GENERATION_MODEL:-deepseek-v4-flash}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-4}
+      EMBEDDING_MAX_BATCH_SIZE: ${EMBEDDING_MAX_BATCH_SIZE:-8}
+      RESUME_PERFORMANCE_MODE: ${RESUME_PERFORMANCE_MODE:-cpu_low_resource}
+      MODEL_BACKEND: ${MODEL_BACKEND:-pytorch}
+      MODEL_WARMUP_POLICY: ${MODEL_WARMUP_POLICY:-background}
+      RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-2}
+      RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-512}
+      RERANK_INPUT_MODE: ${RERANK_INPUT_MODE:-embedding}
+      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-2}
+      TORCH_NUM_INTEROP_THREADS: ${TORCH_NUM_INTEROP_THREADS:-1}
+      QUERY_EMBEDDING_CACHE_BYTES: ${QUERY_EMBEDDING_CACHE_BYTES:-67108864}
+      RERANK_SCORE_CACHE_BYTES: ${RERANK_SCORE_CACHE_BYTES:-33554432}
+      MODEL_DEVICE: ${MODEL_DEVICE:-cpu}
+      MIN_RERANK_SCORE: ${MIN_RERANK_SCORE:-0.004}
+      RERANK_PROMPT_THRESHOLD: ${RERANK_PROMPT_THRESHOLD:-0.01}
+      MIN_EVIDENCE_COVERAGE: ${MIN_EVIDENCE_COVERAGE:-0}
+      MAX_PROMPT_TOKENS: ${MAX_PROMPT_TOKENS:-3600}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+      INDEX_QUEUE_CAPACITY: ${INDEX_QUEUE_CAPACITY:-8}
+      INDEX_TASK_MAX_RETRIES: ${INDEX_TASK_MAX_RETRIES:-3}
+      QA_QUEUE_CAPACITY: ${QA_QUEUE_CAPACITY:-16}
+      QA_TASK_MAX_RETRIES: ${QA_TASK_MAX_RETRIES:-1}
+      MAX_OOXML_ENTRIES: ${MAX_OOXML_ENTRIES:-20000}
+      MAX_OOXML_UNCOMPRESSED_BYTES: ${MAX_OOXML_UNCOMPRESSED_BYTES:-524288000}
+      MAX_SPREADSHEET_LOGICAL_CELLS: ${MAX_SPREADSHEET_LOGICAL_CELLS:-5000000}
+      OFFICE_CONVERSION_TIMEOUT_SECONDS: ${OFFICE_CONVERSION_TIMEOUT_SECONDS:-120}
+      OFFICE_CONVERSION_MAX_BYTES: ${OFFICE_CONVERSION_MAX_BYTES:-209715200}
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HOME: /app/data/model_cache/huggingface
+      HF_HUB_CACHE: /app/data/model_cache/huggingface/hub
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
+      HF_DATASETS_OFFLINE: ${HF_DATASETS_OFFLINE:-0}
+      SENTENCE_TRANSFORMERS_HOME: /app/data/model_cache/sentence_transformers
+      TORCH_HOME: /app/data/model_cache/torch
+      EMBEDDING_MODEL_PATH: ${EMBEDDING_MODEL_PATH:-/app/data/models/bge-base-zh-v1.5}
+      RERANKER_MODEL_PATH: ${RERANKER_MODEL_PATH:-/app/data/models/bge-reranker-base}
+      # 前台/后台权限分离：管理员密码（必填）、JWT、限流参数
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET:-}
+      ADMIN_TOKEN_EXPIRY_HOURS: ${ADMIN_TOKEN_EXPIRY_HOURS:-12}
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-true}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      QA_IP_RATE_LIMIT_PER_MINUTE: ${QA_IP_RATE_LIMIT_PER_MINUTE:-30}
+      QA_IP_DAILY_LIMIT: ${QA_IP_DAILY_LIMIT:-500}
+      QA_GLOBAL_CONCURRENCY: ${QA_GLOBAL_CONCURRENCY:-4}
+      LOGIN_RATE_LIMIT_PER_MINUTE: ${LOGIN_RATE_LIMIT_PER_MINUTE:-10}
+      RATE_LIMIT_TRUST_PROXY: ${RATE_LIMIT_TRUST_PROXY:-false}
+    ports:
+      - "127.0.0.1:${RESUME_APP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./data/models:/app/data/models:ro
+    restart: unless-stopped
+    # /api/health/ready 已收进管理员后台，容器探活降级为公开存活接口 /api/health
+    # （容器 healthy 不再等于模型就绪；模型就绪状态由后台系统状态面板查看）
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.0
+    container_name: resumemind-qdrant
+    environment:
+      # 限制 Qdrant 优化器内存，2C4G 预算下留空间给模型
+      QDRANT__STORAGE__OPTIMIZER__MEMORY_LIMIT: "200MB"
+    ports:
+      - "127.0.0.1:${RESUME_QDRANT_HTTP_PORT:-6333}:6333"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && grep -q 'healthz check passed' <&3"]
+      interval: 10s
+      timeout: 3s
+      retries: 10

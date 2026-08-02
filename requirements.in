@@ -1,0 +1,18 @@
+# Direct runtime dependencies. requirements.txt is the reproducible lock used by Docker.
+fastapi
+uvicorn
+pydantic
+python-dotenv
+python-multipart
+SQLAlchemy
+python-docx
+openpyxl
+xlrd
+pypdf
+pyjwt
+reportlab
+pymupdf4llm
+FlagEmbedding
+qdrant-client
+torch
+transformers<5

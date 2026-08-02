@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="none">
+  <defs>
+    <linearGradient id="resumemind-brand-bg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+      <stop stopColor="#4f46e5" />
+      <stop offset="1" stopColor="#8b5cf6" />
+    </linearGradient>
+  </defs>
+  <rect width="40" height="40" rx="11" fill="url(#resumemind-brand-bg)" />
+  <path d="M11.5 10.5h10l6 6v13a2.5 2.5 0 0 1-2.5 2.5H14a2.5 2.5 0 0 1-2.5-2.5V13a2.5 2.5 0 0 1 2.5-2.5z" stroke="white" strokeWidth="1.7" fill="rgba(255,255,255,0.12)" />
+  <path d="M21.5 10.5v6h6" stroke="white" strokeWidth="1.7" strokeLinejoin="round" />
+  <path d="M14.5 17.5h8.5M14.5 21.5h8.5M14.5 25.5h5.5" stroke="white" strokeWidth="1.7" strokeLinecap="round" />
+  <path d="M27.5 30.2c2.6 0 4.2-1.6 4.2-3.6s-1.6-3.6-4.2-3.6h-3.2" stroke="white" strokeWidth="1.6" fill="none" strokeLinecap="round" />
+  <circle cx="26" cy="26.6" r="0.95" fill="white" />
+  <circle cx="29" cy="26.6" r="0.95" fill="white" />
+  <circle cx="32" cy="26.6" r="0.95" fill="white" />
+</svg>
