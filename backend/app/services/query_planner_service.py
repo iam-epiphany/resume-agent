@@ -25,6 +25,11 @@ from backend.app.services.llm_client import (
     ChatCompletionError,
     chat_completion_content,
 )
+from backend.app.services.question_analyzer import (
+    analyze_question,
+    is_enumerative_question as _analyzer_is_enumerative_question,
+    object_name_from_filename,
+)
 
 
 class QueryPlannerError(RuntimeError):
@@ -55,6 +60,9 @@ class QueryAspect:
     search_queries: tuple[QuerySearchQuery, ...]
     evidence_need: str
     keywords: tuple[str, ...]
+    # 确定性规划：本 aspect 锚定的对象文档文件名（如"项目介绍_高并发电商秒杀平台.md"），
+    # 供选择层做对象配额/排除文档优先级；LLM 规划的 aspect 为空
+    anchor_documents: tuple[str, ...] = ()
 
     @property
     def expected_evidence_type(self) -> str:
@@ -68,6 +76,7 @@ class QueryAspect:
             "expected_evidence_type": self.evidence_need,
             "search_queries": [query.to_debug_dict() for query in self.search_queries],
             "keywords": list(self.keywords),
+            "anchor_documents": list(self.anchor_documents),
         }
 
 
@@ -80,6 +89,8 @@ class QueryPlan:
     error: str | None = None
     budget: dict[str, Any] | None = None
     enumerative: bool = False  # 枚举类问句（多对象列举）：检索端放宽 prompt 容量
+    # 补集问句（"除了X之外还有哪些"）中被排除的对象文档（软约束：选择层优先非排除对象）
+    excluded_documents: tuple[str, ...] = ()
 
     def to_debug_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +101,7 @@ class QueryPlan:
             "budget": self.budget or {},
             "aspects": [aspect.to_debug_dict() for aspect in self.aspects],
             "enumerative": self.enumerative,
+            "excluded_documents": list(self.excluded_documents),
         }
 
 
@@ -116,15 +128,60 @@ class QueryBudget:
 def plan_query(
     question: str,
     *,
-    catalog: str | None = None,
+    catalog: str | list[tuple[str, str]] | None = None,
+    memory_context: dict | None = None,
     cancellation_checker: Callable[[], None] | None = None,
 ) -> QueryPlan:
     cleaned_question = question.strip()
     if not cleaned_question:
         return QueryPlan(original_question="", aspects=(), planner="empty", fallback_used=True)
 
+    catalog_entries = _catalog_entries(catalog)
     budget = plan_query_budget(cleaned_question)
-    enumerative = _is_enumerative_question(cleaned_question)
+    analysis = analyze_question(
+        cleaned_question,
+        catalog=catalog_entries,
+        memory_context=memory_context,
+    )
+    enumerative = analysis.enumerative or _is_enumerative_question(cleaned_question)
+
+    # 枚举/补集问句且文档清单可归类出对象文档 → 确定性拆 aspect：
+    # 每个对象文档一个 aspect（文档名锚定查询），LLM 只做查询措辞增强，不决定结构。
+    # 这替代了"让 LLM 猜对象清单/猜排除名单"，杜绝补集问句答错对象。
+    if enumerative and analysis.object_docs:
+        excluded_documents = _resolve_excluded_documents(analysis)
+        deterministic = _object_document_aspects(cleaned_question, analysis, budget)
+        if QUERY_PLANNER_ENABLED and QUERY_PLANNER_API_KEY:
+            try:
+                enhanced = _enhance_queries_with_llm(
+                    cleaned_question,
+                    deterministic,
+                    budget,
+                    catalog=catalog,
+                    memory_context=memory_context,
+                    cancellation_checker=cancellation_checker,
+                )
+                return QueryPlan(
+                    original_question=cleaned_question,
+                    aspects=tuple(enhanced),
+                    planner=f"{QUERY_PLANNER_PROVIDER}:{QUERY_PLANNER_MODEL}",
+                    fallback_used=False,
+                    budget=budget.to_debug_dict(),
+                    enumerative=True,
+                    excluded_documents=excluded_documents,
+                )
+            except QueryPlannerError:
+                # LLM 增强失败不影响确定性 aspect 的可用性，直接降级使用
+                pass
+        return QueryPlan(
+            original_question=cleaned_question,
+            aspects=tuple(deterministic),
+            planner="deterministic_catalog",
+            fallback_used=True,
+            budget=budget.to_debug_dict(),
+            enumerative=True,
+            excluded_documents=excluded_documents,
+        )
 
     if QUERY_PLANNER_ENABLED and QUERY_PLANNER_API_KEY:
         try:
@@ -132,6 +189,7 @@ def plan_query(
                     cleaned_question,
                     budget,
                     catalog=catalog,
+                    memory_context=memory_context,
                     cancellation_checker=cancellation_checker,
                 )
                 if aspects:
@@ -167,6 +225,251 @@ def plan_query(
     )
 
 
+def _catalog_entries(catalog: str | list[tuple[str, str]] | None) -> list[tuple[str, str]]:
+    """把 catalog 规范化为 [(filename, title)]：兼容 "- 文件名（标题）" 字符串与结构化列表。"""
+    if not catalog:
+        return []
+    if isinstance(catalog, list):
+        return [(str(filename), str(title)) for filename, title in catalog]
+    entries: list[tuple[str, str]] = []
+    for line in str(catalog).splitlines():
+        line = line.strip()
+        if not line.startswith("- "):
+            continue
+        body = line[2:].strip()
+        title_match = re.match(r"^(.*?)（(.*?)）$", body)
+        if title_match:
+            entries.append((title_match.group(1).strip(), title_match.group(2).strip()))
+        else:
+            entries.append((body, ""))
+    return entries
+
+
+def _resolve_excluded_documents(analysis: Any) -> tuple[str, ...]:
+    """补集问句的排除对象 → 文档名：显式实体直接重叠匹配；指代代词用会话已知实体解析。"""
+    entities = list(analysis.excluded_entities)
+    if analysis.needs_context_entities:
+        entities.extend(analysis.known_entities)
+    resolved: list[str] = []
+    for entity in dict.fromkeys(entities):
+        compact = re.sub(r"[\s.。！？!?、，,；;]+", "", str(entity))
+        if not compact:
+            continue
+        best = _best_matching_document(compact, analysis.object_docs)
+        if best:
+            resolved.append(best)
+    return tuple(dict.fromkeys(resolved))
+
+
+def _best_matching_document(entity_name: str, object_docs: tuple[str, ...]) -> str:
+    """把用户口中的实体（"秒杀项目"/"高并发秒杀"）匹配到对象文档名。
+
+    匹配优先级：归一化后互为子串 → 实体中的非通用术语（含 2 字片段）出现在文档名 → 公共双字符比例。
+    """
+    compact = re.sub(r"\s+", "", entity_name)
+    if not compact:
+        return ""
+    for doc in object_docs:
+        doc_name = re.sub(r"\s+", "", object_name_from_filename(doc))
+        if doc_name and (compact in doc_name or doc_name in compact):
+            return doc
+    terms = _entity_match_terms(compact)
+    best: str = ""
+    best_score = 0.0
+    for doc in object_docs:
+        doc_name = re.sub(r"\s+", "", object_name_from_filename(doc))
+        if not doc_name:
+            continue
+        term_hits = sum(1 for term in terms if term in doc_name)
+        ratio = _bigram_ratio(doc_name, compact)
+        score = max(term_hits, ratio)
+        if score > best_score and (term_hits >= 1 or ratio >= 0.5):
+            best, best_score = doc, score
+    return best
+
+
+def _entity_match_terms(entity_name: str) -> list[str]:
+    """提取实体名中的非通用术语：整词 + 2 字重叠片段（"秒杀项目" → "秒杀"），过滤泛词。"""
+    runs = re.findall(r"[A-Za-z0-9_./%-]{2,}|[\u4e00-\u9fff]{2,12}", entity_name)
+    terms = list(runs)
+    for run in runs:
+        if len(run) < 2:
+            continue
+        terms.extend(run[index : index + 2] for index in range(max(len(run) - 1, 0)))
+    return [
+        term for term in dict.fromkeys(terms) if term.lower() not in query_planner_generic_terms
+    ]
+
+
+query_planner_generic_terms = frozenset(
+    "项目 平台 系统 介绍 经历 开发 技术 设计 实现 项目经历 项目介绍 内容 方案 工具".split()
+)
+
+
+def _bigram_ratio(left: str, right: str) -> float:
+    left_bigrams = {left[index : index + 2] for index in range(max(len(left) - 1, 0))}
+    right_bigrams = {right[index : index + 2] for index in range(max(len(right) - 1, 0))}
+    if not left_bigrams:
+        return 0.0
+    return len(left_bigrams & right_bigrams) / max(len(left_bigrams), 1)
+
+
+def _object_document_aspects(
+    question: str,
+    analysis: Any,
+    budget: QueryBudget,
+) -> list[QueryAspect]:
+    """为每个对象文档生成一个文档名锚定的 aspect（确定性结构，不依赖 LLM 猜测）。"""
+    category_label = analysis.object_category or "内容"
+    aspects: list[QueryAspect] = []
+    for index, doc in enumerate(analysis.object_docs[: budget.max_aspects], start=1):
+        name = object_name_from_filename(doc)
+        if category_label == "项目":
+            doc_style_query = f"{name} 项目简介 技术栈 主要工作 成果"
+            evidence_need = f"在《{doc}》中查找{name}的项目介绍、时间、职责与成果"
+            aspect_question = f"{name} 项目介绍（{doc}）"
+        else:
+            doc_style_query = f"{name} {category_label}介绍 主要内容"
+            evidence_need = f"在《{doc}》中查找与{name}相关的{category_label}内容"
+            aspect_question = f"{name} {category_label}介绍（{doc}）"
+        aspects.append(
+            QueryAspect(
+                aspect_id=f"object_{index}",
+                question=aspect_question,
+                search_queries=(
+                    QuerySearchQuery(doc_style_query, "document_style_statement", "材料原文风格查询，锚定对象文档"),
+                    QuerySearchQuery(f"{name} 介绍", "semantic_question", "贴近用户意图"),
+                    QuerySearchQuery(name, "keyword_anchor", "对象名精确锚定"),
+                ),
+                evidence_need=evidence_need,
+                keywords=tuple(dict.fromkeys([name, *analysis.keywords]))[:8],
+                anchor_documents=(doc,),
+            )
+        )
+    return aspects
+
+
+def _enhance_queries_with_llm(
+    question: str,
+    deterministic: list[QueryAspect],
+    budget: QueryBudget,
+    *,
+    catalog: str | list[tuple[str, str]] | None = None,
+    memory_context: dict | None = None,
+    cancellation_checker: Callable[[], None] | None = None,
+) -> list[QueryAspect]:
+    """确定性 aspect 的查询措辞增强：LLM 只补充检索查询，不改变对象结构与数量。"""
+    object_rows = "\n".join(
+        f"{index}. aspect_id={aspect.aspect_id}，对象文档={aspect.anchor_documents[0] if aspect.anchor_documents else ''}，对象名={aspect.keywords[0] if aspect.keywords else ''}"
+        for index, aspect in enumerate(deterministic, start=1)
+    )
+    memory_block = _memory_context_block(memory_context)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 ResumeMind 的检索前 QueryPlanner。检索计划的对象清单已由确定性规则确定："
+                "必须为下面列出的每个对象保留一个 aspect，禁止增删、合并或遗漏对象，禁止改动 aspect_id。"
+                "你只为每个对象补充 1-2 条更贴近材料原文的检索查询（document_style_statement 或 semantic_question）。"
+                "只输出 JSON 对象。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"对象清单（确定性，不得修改）：\n{object_rows}\n"
+                f"为每个对象补充检索查询，输出 JSON：{{\"aspects\":[{{\"aspect_id\":\"...\","
+                f"\"search_queries\":[{{\"query\":\"...\",\"query_type\":\"semantic_question|document_style_statement\","
+                f"\"rationale\":\"...\"}}]}}]}}\n"
+                f"{_catalog_block(catalog)}\n"
+                f"用户问题：{question}{memory_block}"
+            ),
+        },
+    ]
+    if cancellation_checker is not None:
+        cancellation_checker()
+    with measure("query_planner.external_api"):
+        try:
+            content = chat_completion_content(
+                ChatCompletionConfig(
+                    provider=QUERY_PLANNER_PROVIDER,
+                    api_key=QUERY_PLANNER_API_KEY,
+                    base_url=QUERY_PLANNER_BASE_URL,
+                    model=QUERY_PLANNER_MODEL,
+                    timeout_seconds=QUERY_PLANNER_TIMEOUT_SECONDS,
+                    include_thinking=QUERY_PLANNER_INCLUDE_THINKING,
+                    response_format=QUERY_PLANNER_RESPONSE_FORMAT,
+                ),
+                messages,
+                temperature=0,
+                response_format=QUERY_PLANNER_RESPONSE_FORMAT,
+                opener=urllib.request.urlopen,
+            )
+        except ChatCompletionError as exc:
+            # LLM 增强失败不影响确定性 aspect 的可用性：转 QueryPlannerError 由调用方降级
+            raise QueryPlannerError("LLM 查询增强调用失败") from exc
+    try:
+        parsed = json.loads(_extract_json_object(content))
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise QueryPlannerError("LLM 查询增强返回格式不可解析") from exc
+    llm_aspects = _aspects_from_payload(question, parsed, max_aspects=len(deterministic))
+    return _merge_llm_queries(deterministic, llm_aspects)
+
+
+def _merge_llm_queries(
+    deterministic: list[QueryAspect],
+    llm_aspects: list[QueryAspect],
+) -> list[QueryAspect]:
+    """把 LLM 补充的查询并入对应的确定性 aspect（按对象名包含优先，其次按位置）。"""
+    merged: list[QueryAspect] = []
+    for index, det in enumerate(deterministic):
+        name = det.keywords[0] if det.keywords else ""
+        matched = None
+        for llm_aspect in llm_aspects:
+            text = re.sub(
+                r"\s+",
+                "",
+                " ".join(
+                    [
+                        llm_aspect.question,
+                        " ".join(query.query for query in llm_aspect.search_queries),
+                        " ".join(llm_aspect.keywords),
+                    ]
+                ),
+            )
+            if name and name in text:
+                matched = llm_aspect
+                break
+        if matched is None and index < len(llm_aspects):
+            matched = llm_aspects[index]
+        if matched is None:
+            merged.append(det)
+            continue
+        existing = {re.sub(r"\s+", "", query.query) for query in det.search_queries}
+        extra = [
+            query
+            for query in matched.search_queries
+            if re.sub(r"\s+", "", query.query) not in existing
+        ][: max(QUERY_PLANNER_MAX_SEARCH_QUERIES - 1, 1)]
+        merged.append(
+            replace(det, search_queries=det.search_queries + tuple(extra))
+            if extra
+            else det
+        )
+    return merged
+
+
+def _memory_context_block(memory_context: dict | None) -> str:
+    if not memory_context:
+        return ""
+    return (
+        "\n上一轮对话上下文（仅用于理解指代，如“这三个/那三个”指代的对象；"
+        "严禁输出到回答内容中）：\n"
+        f"Q: {str(memory_context.get('question') or '')}\n"
+        f"A: {str(memory_context.get('answer_excerpt') or '')[:300]}"
+    )
+
+
 def plan_query_budget(question: str) -> QueryBudget:
     explicit_items = _explicit_requested_items(question)
     detected_items = tuple(_dedupe(explicit_items))
@@ -194,28 +497,8 @@ def plan_query_budget(question: str) -> QueryBudget:
 
 
 def _is_enumerative_question(question: str) -> bool:
-    """枚举问句检测（仅用于放宽 planner 预算，不参与检索/意图判定）。
-
-    识别"列举多个对象"的提问形态：对象名词 + 哪些/有什么/列举/介绍下你的 X。
-    要求带知识库对象名词，避免"哪些问题要排查"这类单主题细节问句被误判。
-    具体拆成几个 aspect 仍由 LLM 决定；这里只提高预算天花板。
-    """
-    compact = re.sub(r"\s+", "", str(question or ""))
-    objects = r"(?:项目|技能|奖项|荣誉|课程|活动|经历|证书|竞赛|比赛|成就|特长|优点|作品)"
-    # "哪些项目" / "项目有哪些" 两种语序
-    if re.search(r"(?:哪些|有哪|什么)(?:的)?(?:" + objects + r")", compact):
-        return True
-    if re.search(objects + r"(?:有哪些|有什么)", compact):
-        return True
-    if re.search(r"(?:列举|罗列|列出)", compact):
-        return True
-    if re.search(
-        r"(?:介绍|说说|讲讲|说一下)(?:一下|下)?(?:你的|您)?(?:全部|所有)?"
-        r"(?:参与|做过|获得|掌握|取得|参加)?(?:过的?)?(?:" + objects + r")",
-        compact,
-    ):
-        return True
-    return False
+    """枚举问句检测（委托确定性分析器：覆盖"还有哪些/除了…之外/哪些其他"等形态）。"""
+    return _analyzer_is_enumerative_question(question)
 
 
 def _explicit_requested_items(question: str) -> list[str]:
@@ -505,6 +788,7 @@ def _plan_with_llm(
     budget: QueryBudget,
     *,
     catalog: str | None = None,
+    memory_context: dict | None = None,
     cancellation_checker: Callable[[], None] | None = None,
 ) -> tuple[list[QueryAspect], list[str]]:
     messages = [
@@ -570,7 +854,7 @@ def _plan_with_llm(
                     f"本次规则识别到的用户处理对象：{json.dumps(list(budget.detected_items), ensure_ascii=False)}\n"
                     "输出格式：{\"aspects\":[...],\"omitted_or_merged_items\":[]}\n\n"
                     f"{_catalog_block(catalog)}\n"
-                    f"用户问题：{question}"
+                    f"用户问题：{question}{_memory_context_block(memory_context)}"
                 ),
             },
         ]

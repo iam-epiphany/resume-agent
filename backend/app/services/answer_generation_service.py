@@ -75,12 +75,14 @@ def generate_answer(
     llm_prompt: str | None = None,
     cancellation_checker: CancellationChecker | None = None,
     preview_reporter: PreviewReporter | None = None,
+    no_evidence: bool = False,
 ) -> GeneratedAnswer:
     """单次 LLM 生成 + 答案自评 + 置信度分级。
 
     - greeting / off_topic → 礼貌转移（零 LLM）
     - 其余 → 单次 LLM 调用输出 {answer, evidence_sufficiency, reason}
-    - 自评 partial/insufficient → hedged 模式，后端强制“根据现有知识库推测”前缀
+    - 自评 partial/insufficient → hedged 模式，后端强制“根据现有知识库推测”前缀（唯一一次）
+    - no_evidence（兜底链第 3 级）：无检索证据，限制为 persona 软信息，硬事实必须说明未收录
     - LLM 异常 → 摘录兜底（hedged）；无上下文且 LLM 异常 → 礼貌兜底文案
     """
     if intent == INTENT_GREETING:
@@ -97,6 +99,7 @@ def generate_answer(
                 llm_prompt=llm_prompt,
                 cancellation_checker=cancellation_checker,
                 preview_reporter=preview_reporter,
+                no_evidence=no_evidence,
             )
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             logger.warning("LLM 回答生成失败，降级: %s: %s", type(exc).__name__, exc)
@@ -120,7 +123,12 @@ def _redirected(text: str, mode: AnswerMode = "redirected") -> GeneratedAnswer:
 
 
 def _apply_confidence_mode(generated: GeneratedAnswer) -> GeneratedAnswer:
-    """按自评结果分级；partial/insufficient 强制推测前缀。"""
+    """按自评结果分级；partial/insufficient 时由系统统一加推测前缀（且只加一次）。
+
+    旧实现同时让 LLM 自写前缀 + 后端 prepend，出现过"根据现有知识库推测"双前缀
+    （LLM 中途插入 + 后端开头追加）。现在前缀完全由系统管理：先剥掉 LLM 在
+    开头自写的（含旧 prompt 历史行为的残留），再精确 prepend 一次。
+    """
     sufficiency = generated.evidence_sufficiency or "partial"
     generated.evidence_sufficiency = (
         sufficiency if sufficiency in {"sufficient", "partial", "insufficient"} else "partial"
@@ -130,8 +138,10 @@ def _apply_confidence_mode(generated: GeneratedAnswer) -> GeneratedAnswer:
         return generated
     generated.answer_mode = "hedged"
     answer = (generated.answer or "").strip()
-    if answer and not answer.startswith(HEDGE_PREFIX):
-        generated.answer = f"{HEDGE_PREFIX}，{answer}"
+    while answer.startswith(HEDGE_PREFIX):
+        answer = answer[len(HEDGE_PREFIX):].lstrip("，,。;； ")
+    answer = answer.strip()
+    generated.answer = f"{HEDGE_PREFIX}，{answer}" if answer else HEDGE_PREFIX
     return generated
 
 
@@ -142,11 +152,13 @@ def _call_llm(
     llm_prompt: str | None = None,
     cancellation_checker: CancellationChecker | None = None,
     preview_reporter: PreviewReporter | None = None,
+    no_evidence: bool = False,
 ) -> GeneratedAnswer:
     messages = RAGPromptBuilder().build_generation_messages(
         question,
         context_chunks,
         llm_prompt=llm_prompt,
+        no_evidence=no_evidence,
     )
     config = ChatCompletionConfig(
         provider=ANSWER_GENERATION_PROVIDER,

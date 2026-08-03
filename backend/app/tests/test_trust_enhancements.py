@@ -12,11 +12,11 @@ from backend.app.schemas.qa import RetrievalResult
 from backend.app.services.answer_generation_service import GeneratedAnswer, generate_answer
 from backend.app.services.intent_router_service import INTENT_RESUME_QA
 from backend.app.services.retrieval_service import filter_candidates_by_metadata
-from backend.app.services.query_planner_service import QueryAspect, QuerySearchQuery
+from backend.app.services.query_planner_service import QueryAspect, QueryPlan, QuerySearchQuery
 from backend.app.services.rag_service import (
-    _best_non_duplicate_candidate,
-    _best_shared_candidate,
+    AspectRetrieval,
     _chunk_matches_query_aspect,
+    _select_prompt_chunks,
 )
 from backend.app.services.vector_store_service import VectorSearchResult, _retrieval_filter
 
@@ -38,15 +38,6 @@ def _document(document_id: str, title: str, authority: str) -> Document:
 
 
 def test_prompt_selection_reuses_one_chunk_for_two_explicit_aspects() -> None:
-    shared = RetrievalResult(
-        chunk_id="C1",
-        rank=1,
-        source_doc="材料.pdf",
-        text="不得以时间紧张为由变更架构；除非项目需求变化，否则架构设计不可变更。",
-        citation_label="[1]",
-        score=0.8,
-        metadata={"rerank_score": 0.9},
-    )
     aspect = QueryAspect(
         aspect_id="condition_2",
         question="请说明与“除非项目需求变化，否则架构设计不可变更”相关的说明。",
@@ -55,9 +46,44 @@ def test_prompt_selection_reuses_one_chunk_for_two_explicit_aspects() -> None:
         keywords=("架构设计不可变更",),
     )
 
-    reused = _best_shared_candidate([shared], [shared], aspect)
+    # 同一 chunk 同时是两个 aspect 的候选：选择后通过覆盖同步复用于第二个 aspect
+    chunk = RetrievalResult(
+        chunk_id="C1",
+        rank=1,
+        source_doc="材料.pdf",
+        text="不得以时间紧张为由变更架构；除非项目需求变化，否则架构设计不可变更。",
+        citation_label="[1]",
+        score=0.8,
+        metadata={"rerank_score": 0.9, "document_id": "DOC-1"},
+    )
+    aspect_a = QueryAspect(
+        aspect_id="condition_1",
+        question="请说明与“不得以时间紧张为由变更架构”相关的说明。",
+        search_queries=(QuerySearchQuery("架构设计不可变更", "keyword_anchor"),),
+        evidence_need="变更原则",
+        keywords=("架构设计",),
+    )
+    retrievals = [
+        AspectRetrieval(
+            aspect=aspect,
+            candidates=[chunk],
+            diagnostics=[],
+            citation_validation={"valid_chunks": 1},
+            selected_chunk_ids=[],
+            retrieval_covered=True,
+        )
+        for aspect in (aspect_a, aspect)
+    ]
+    plan = QueryPlan(
+        original_question="架构变更的原则与例外是什么？",
+        aspects=(aspect_a, aspect),
+        planner="test",
+    )
+    selected, summary = _select_prompt_chunks(plan.original_question, plan, retrievals)
 
-    assert reused is shared
+    assert [item.chunk_id for item in selected] == ["C1"]  # 共享块只选一次
+    assert summary["covered_aspects"] == ["condition_1", "condition_2"]
+    assert summary["final_prompt_chunks"] == 1
 
 
 @dataclass
@@ -248,6 +274,27 @@ def test_prompt_core_prefers_explicit_condition_match_over_generic_higher_score(
         metadata={},
     )
 
-    selected = _best_non_duplicate_candidate([generic, exact], [], aspect)
+    selected, _summary = _select_prompt_chunks(
+        aspect.question,
+        QueryPlan(original_question=aspect.question, aspects=(aspect,), planner="test"),
+        [
+            AspectRetrieval(
+                aspect=aspect,
+                candidates=[generic, exact],
+                diagnostics=[],
+                citation_validation={"valid_chunks": 2},
+                selected_chunk_ids=[],
+                retrieval_covered=True,
+            )
+        ],
+    )
 
-    assert selected is exact
+    # 引号锚点命中的块（EXACT）优先于高分泛化块（GENERIC）：EXACT 必须是 aspect 的核心块
+    # （final 排序按分数/章节重排，GENERIC 会作为补位块排在前面，因此断言核心归属而非顺序）
+    core_chunks = [
+        chunk
+        for chunk in selected
+        if chunk.metadata.get("prompt_selection_reason") == "core"
+    ]
+    assert core_chunks and core_chunks[0].chunk_id == "EXACT"
+    assert {chunk.chunk_id for chunk in selected} == {"GENERIC", "EXACT"}

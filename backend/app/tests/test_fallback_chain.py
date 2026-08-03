@@ -168,7 +168,7 @@ def rewritten_calls(monkeypatch):
     monkeypatch.setattr("backend.app.services.intent_router_service.INTENT_ROUTER_ENABLED", False)
     monkeypatch.setattr(
         "backend.app.services.rag_service.plan_query",
-        lambda question, *, catalog=None, cancellation_checker=None: _plan(question),
+        lambda question, *, catalog=None, memory_context=None, cancellation_checker=None: _plan(question),
     )
     monkeypatch.setattr("backend.app.services.rag_service.rewrite_search_queries", fake_rewrite)
     return calls

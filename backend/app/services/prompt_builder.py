@@ -5,7 +5,7 @@ from backend.app.schemas.qa import RetrievalResult
 CORE_RAG_RULES = (
     "回答要自然、完整、口语化，像一个真实求职者在面试中回答。",
     "可以基于检索到的知识片段适度组织、补充衔接与展开说明，但数字、日期、机构名、证书名等硬事实必须来自检索片段，不得编造。",
-    "检索到的内容不足或只能推断时，必须使用“根据现有知识库推测”的措辞，不得把推测表述为事实。",
+    "不得断言知识库中不存在某信息或没有某记录；检索片段未包含所需信息时，只能表述为“检索到的材料中未包含”或“暂未检索到相关记录”，不得说“知识库中没有”。",
     "不要输出任何引用标注（如[1]或“来源”字样）。",
     "当问题要求列举项目、技能或奖项时，把检索到的全部相关材料一并列出（说明名称、时间与职责/等级）；"
     "只列检索到的内容，不得补充知识库外的项目、技能或奖项。",
@@ -26,7 +26,7 @@ SELF_ASSESSMENT_OUTPUT_RULES = (
     "只输出JSON对象，不要输出任何其他内容。",
     '输出结构：{"answer": "完整回答", "evidence_sufficiency": "sufficient|partial|insufficient", "reason": "一句话说明依据情况"}',
     "evidence_sufficiency 取值：sufficient=检索内容足以直接回答；partial=检索内容部分相关、需要合理推断；insufficient=几乎没有相关检索内容、主要靠推断。",
-    "当 evidence_sufficiency 为 partial 或 insufficient 时，answer 必须以“根据现有知识库推测”开头。",
+    "回答中不得自行添加“根据现有知识库推测”等前缀（前缀由系统统一处理）。",
 )
 
 
@@ -57,10 +57,18 @@ class RAGPromptBuilder:
         *,
         llm_prompt: str | None = None,
         correction: str | None = None,
+        no_evidence: bool = False,
     ) -> list[dict[str, str]]:
         prompt = llm_prompt or self.build(query, chunks)
         structured_rule_block = "\n".join(
             f"{index}. {rule}" for index, rule in enumerate(SELF_ASSESSMENT_OUTPUT_RULES, start=1)
+        )
+        no_evidence_block = (
+            "当前未检索到任何知识库材料。只允许基于对话上下文作答，且只能使用性格特质、"
+            "兴趣爱好、求职动机等个人软性信息；时间、机构、项目名、数字、成果等硬事实"
+            "必须明确说明“知识库未收录”，不得编造。"
+            if no_evidence
+            else ""
         )
         return [
             {
@@ -70,6 +78,7 @@ class RAGPromptBuilder:
                     f"{PERSONA_AND_PRONOUN_RULES}"
                     + "".join(f"{index}. {rule}\n" for index, rule in enumerate(CORE_RAG_RULES, start=1))
                     + structured_rule_block
+                    + (no_evidence_block if no_evidence_block else "")
                     + (f"\n上次生成存在的问题（请修正）：{correction}" if correction else "")
                 ),
             },

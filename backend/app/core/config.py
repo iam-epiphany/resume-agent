@@ -163,6 +163,10 @@ MIN_PROMPT_CHUNKS = _env_int("MIN_PROMPT_CHUNKS", 6, minimum=0)
 FORCE_MIN_CHUNKS = _env_bool("FORCE_MIN_CHUNKS", True)
 RERANK_PROMPT_THRESHOLD = _env_float("RERANK_PROMPT_THRESHOLD", 0.20)
 RELATIVE_SCORE_RATIO = _env_float("RELATIVE_SCORE_RATIO", 0.40)
+# 每个文档在最终 prompt 中的最大片段数（多样性约束，防止单一文档霸屏挤掉其他对象）
+PER_DOCUMENT_PROMPT_CAP = _env_int("PER_DOCUMENT_PROMPT_CAP", 2, minimum=1)
+# 关键词精确召回：每个 aspect 最多注入的关键词候选数（小库全量扫，0=关闭）
+KEYWORD_RECALL_LIMIT = _env_int("KEYWORD_RECALL_LIMIT", 6, minimum=0)
 FINAL_CITATION_LIMIT = MAX_PROMPT_CHUNKS
 MIN_RERANK_SCORE = _env_float("MIN_RERANK_SCORE", 0.30)
 MIN_EVIDENCE_COVERAGE = _env_float("MIN_EVIDENCE_COVERAGE", 0.25)

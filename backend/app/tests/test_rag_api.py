@@ -25,7 +25,7 @@ from backend.app.schemas.health import RagHealthResponse
 from backend.main import app
 from backend.app.services.embedding_service import EmbeddingServiceError, TextEmbedding
 from backend.app.services.document_storage import next_document_id
-from backend.app.services.query_planner_service import QueryAspect, QuerySearchQuery
+from backend.app.services.query_planner_service import QueryAspect, QueryPlan, QuerySearchQuery
 from backend.app.services.retrieval_service import RetrievalDiagnostics, RetrievalMatch, RetrievalServiceUnavailable
 from backend.app.services.rerank_service import RerankedChunk
 from backend.app.services.vector_store_service import VectorStoreError
@@ -1914,18 +1914,30 @@ def test_qa_passes_raw_question_to_retrieval_without_option_stripping(monkeypatc
     reset_database()
     captured: dict[str, object] = {}
 
-    def fake_build_context_package(db, question, options=None, progress_reporter=None, cancellation_checker=None):
+    def fake_plan_and_retrieve(
+        db,
+        question,
+        progress_reporter=None,
+        cancellation_checker=None,
+        *,
+        rewritten_queries=None,
+        memory_context=None,
+    ):
         captured["question"] = question
-        captured["options"] = options
-        return LLMContextPackage(
-            query=question,
-            instruction="test",
-            retrieval_summary={"used_chunks": 0, "has_sufficient_context": False},
-            context_chunks=[],
-            llm_prompt="",
+        captured["memory_context"] = memory_context
+        aspect = QueryAspect(
+            aspect_id="aspect_1",
+            question=question,
+            search_queries=(QuerySearchQuery(question, "semantic_question", ""),),
+            evidence_need="相关材料依据",
+            keywords=(),
         )
+        query_plan = QueryPlan(original_question=question, aspects=(aspect,), planner="test")
+        return query_plan, []
 
-    monkeypatch.setattr("backend.app.services.rag_service.build_context_package", fake_build_context_package)
+    monkeypatch.setattr(
+        "backend.app.services.rag_service._plan_and_retrieve", fake_plan_and_retrieve
+    )
 
     response = client.post(
         "/api/qa/ask",
@@ -1939,7 +1951,6 @@ def test_qa_passes_raw_question_to_retrieval_without_option_stripping(monkeypatc
     body = response.json()
     assert body["answer_mode"] == "failed"
     assert captured["question"] == "关于《材料》，以下哪项正确？ A 第一项事实 B 第二项事实 C 第三项事实"
-    assert captured["options"] == []
 
 
 def test_qa_task_persists_progress_and_final_answer(monkeypatch) -> None:

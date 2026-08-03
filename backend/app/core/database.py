@@ -182,6 +182,17 @@ def _upgrade_sqlite_schema() -> None:
                     "ON qa_tasks(client_request_id)"
                 )
             )
+        if "qa_logs" in table_names:
+            qa_log_columns = {column["name"] for column in inspector.get_columns("qa_logs")}
+            qa_log_migrations = {
+                "answer_mode": "ALTER TABLE qa_logs ADD COLUMN answer_mode VARCHAR(20)",
+                "evidence_sufficiency": "ALTER TABLE qa_logs ADD COLUMN evidence_sufficiency VARCHAR(20)",
+                "fallback_level": "ALTER TABLE qa_logs ADD COLUMN fallback_level INTEGER DEFAULT 0",
+                "used_chunks": "ALTER TABLE qa_logs ADD COLUMN used_chunks INTEGER DEFAULT 0",
+            }
+            for column_name, statement in qa_log_migrations.items():
+                if column_name not in qa_log_columns:
+                    connection.execute(text(statement))
         # 银行场景遗留表已不再建模（模型已移除 SpreadsheetCell），幂等清理旧库残留
         connection.execute(text("DROP TABLE IF EXISTS spreadsheet_cells"))
 

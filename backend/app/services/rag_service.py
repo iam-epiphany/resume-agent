@@ -20,6 +20,7 @@ from backend.app.core.config import (
     FALLBACK_REWRITE_RETRY_ENABLED,
     FINAL_CITATION_LIMIT,
     FORCE_MIN_CHUNKS,
+    KEYWORD_RECALL_LIMIT,
     MAX_PROMPT_CHUNKS,
     MAX_PROMPT_TOKENS,
     MIN_CORE_RERANK_SCORE,
@@ -27,9 +28,11 @@ from backend.app.core.config import (
     MIN_LEXICAL_RERANK_SCORE,
     MIN_LEXICAL_SCORE,
     MIN_PROMPT_CHUNKS,
+    PER_DOCUMENT_PROMPT_CAP,
     RELAXED_MIN_PROMPT_CHUNKS,
     RELAXED_RERANK_THRESHOLD,
     RELATIVE_SCORE_RATIO,
+    RERANK_CANDIDATE_LIMIT,
     RERANK_TOP_K,
     RERANK_PROMPT_THRESHOLD,
 )
@@ -49,6 +52,7 @@ from backend.app.services.query_planner_service import (
     QueryAspect,
     QueryPlan,
     QuerySearchQuery,
+    object_name_from_filename,
     plan_query,
     rewrite_search_queries,
 )
@@ -72,7 +76,7 @@ from backend.app.services.embedding_service import EmbeddingServiceError
 from backend.app.services.model_device_service import get_model_device_info
 from backend.app.services.performance_metrics import measure, trace_operation
 from backend.app.services.rerank_service import RerankServiceError, rerank_candidates
-from backend.app.services.vector_store_service import VectorStoreError
+from backend.app.services.vector_store_service import VectorSearchResult, VectorStoreError
 
 
 CONTEXT_INSTRUCTION = (
@@ -293,10 +297,26 @@ def answer_question(
 
     # ④ 检索与上下文（兜底链：标准 → 降阈 → 改写 → 直接生成）
     fallback_level = 0
-    package = build_context_package(
+    memory_context = (
+        {
+            "question": previous_turn.get("question") or "",
+            "answer_excerpt": previous_turn.get("answer_excerpt") or "",
+        }
+        if previous_turn
+        else None
+    )
+    query_plan, aspect_retrievals = _plan_and_retrieve(
         db,
         resolved_question,
-        options=options or [],
+        progress_reporter=progress_reporter,
+        cancellation_checker=cancellation_checker,
+        memory_context=memory_context,
+    )
+    package = _package_from_retrieval(
+        db,
+        resolved_question,
+        query_plan,
+        aspect_retrievals,
         progress_reporter=progress_reporter,
         cancellation_checker=cancellation_checker,
     )
@@ -306,15 +326,16 @@ def answer_question(
         fallback_level = 3
         package = _empty_context_package(resolved_question)
     elif grade == "weak":
-        # level 1：降阈重选（放宽门槛，按 rerank 分数补足候选）
+        # level 1：降阈重选（复用同一 plan 与候选池，仅放宽选择门槛，不再整链重跑）
         if FALLBACK_LOWER_THRESHOLD_ENABLED:
-            relaxed_package = build_context_package(
+            relaxed_package = _package_from_retrieval(
                 db,
                 resolved_question,
-                options=options or [],
+                query_plan,
+                aspect_retrievals,
+                relaxed=True,
                 progress_reporter=progress_reporter,
                 cancellation_checker=cancellation_checker,
-                relaxed=True,
             )
             if relaxed_package.context_chunks:
                 package = relaxed_package
@@ -341,14 +362,21 @@ def answer_question(
                 cancellation_checker=cancellation_checker,
             )
             if queries:
-                rewritten_package = build_context_package(
+                rewritten_plan, rewritten_retrievals = _plan_and_retrieve(
                     db,
                     resolved_question,
-                    options=options or [],
                     progress_reporter=progress_reporter,
                     cancellation_checker=cancellation_checker,
-                    relaxed=True,
                     rewritten_queries=queries,
+                )
+                rewritten_package = _package_from_retrieval(
+                    db,
+                    resolved_question,
+                    rewritten_plan,
+                    rewritten_retrievals,
+                    relaxed=True,
+                    progress_reporter=progress_reporter,
+                    cancellation_checker=cancellation_checker,
                 )
                 _report_progress(
                     progress_reporter,
@@ -388,6 +416,13 @@ def answer_question(
         progress_reporter,
         {"stage": "generation", "status": "running", "title": "正在生成回答", "detail": "正在基于检索内容组织面试回答……"},
     )
+    # 对话上下文（上轮 Q/A 摘要）注入生成 prompt：多轮衔接（"除了这三个"类指代）不依赖模型记忆
+    conversation_context = _conversation_context_text(memory_turns)
+    if conversation_context and package.llm_prompt:
+        package.llm_prompt = (
+            f"{package.llm_prompt.rstrip()}\n\n"
+            f"【对话上下文】（仅用于理解指代与衔接，回答不得照抄原文）\n{conversation_context}"
+        )
     generated = generate_answer(
         resolved_question,
         package.context_chunks,
@@ -395,6 +430,7 @@ def answer_question(
         llm_prompt=package.llm_prompt,
         cancellation_checker=cancellation_checker,
         preview_reporter=report_preview,
+        no_evidence=(fallback_level == 3),
     )
     _report_progress(
         progress_reporter,
@@ -451,6 +487,19 @@ def _record_turn_if_needed(
     )
 
 
+def _conversation_context_text(memory_turns: list[dict]) -> str:
+    """最近两轮的 Q/A 摘要文本，注入生成 prompt 帮助多轮指代衔接。"""
+    lines: list[str] = []
+    for turn in memory_turns[-2:]:
+        question = str(turn.get("question") or "").strip()
+        answer = str(turn.get("answer_excerpt") or "").strip()
+        if question:
+            lines.append(f"Q: {question}")
+        if answer:
+            lines.append(f"A: {answer[:200]}")
+    return "\n".join(lines)
+
+
 def retrieve_context_package(
     db: Session,
     question: str,
@@ -463,16 +512,21 @@ def retrieve_context_package(
     return build_context_package(db, preprocessed.question, options=preprocessed.options)
 
 
-def build_context_package(
+def _plan_and_retrieve(
     db: Session,
     question: str,
-    options: list[str] | None = None,
     progress_reporter: ProgressReporter | None = None,
     cancellation_checker: Callable[[], None] | None = None,
     *,
-    relaxed: bool = False,
     rewritten_queries: list[str] | None = None,
-) -> LLMContextPackage:
+    memory_context: dict | None = None,
+) -> tuple[QueryPlan, list[AspectRetrieval]]:
+    """检索规划 + 候选召回（标准与改写重试两条路径共用）。
+
+    规划层已接入确定性问句分析（question_analyzer）：枚举/补集问句由文档清单
+    确定性拆 aspect，LLM 只做查询措辞增强；会话上下文（上轮 Q/A）贯穿 planner，
+    用于解析"这三个/那三个"类指代。
+    """
     planning_started_at = perf_counter()
     _report_progress(
         progress_reporter,
@@ -500,7 +554,8 @@ def build_context_package(
     else:
         query_plan = plan_query(
             question,
-            catalog=_document_catalog_summary(db),
+            catalog=_document_catalog_entries(db),
+            memory_context=memory_context,
             cancellation_checker=cancellation_checker,
         )
     planning_elapsed_ms = _elapsed_ms(planning_started_at)
@@ -521,6 +576,24 @@ def build_context_package(
         },
     )
     aspect_retrievals = _retrieve_aspects(db, query_plan, progress_reporter=progress_reporter)
+    return query_plan, aspect_retrievals
+
+
+def _package_from_retrieval(
+    db: Session,
+    question: str,
+    query_plan: QueryPlan,
+    aspect_retrievals: list[AspectRetrieval],
+    *,
+    relaxed: bool = False,
+    progress_reporter: ProgressReporter | None = None,
+    cancellation_checker: Callable[[], None] | None = None,
+) -> LLMContextPackage:
+    """基于已完成的检索结果构造最终上下文包（选择/摘要/prompt）。
+
+    relaxed=True 时复用同一候选池降阈重选——兜底链第 1 级不再重新规划、
+    重新检索、重新重排（旧实现整链重跑，单问多花一次 LLM 规划 + 10s+）。
+    """
     citation_validation = {
         "checked_chunks": sum(int(item.citation_validation.get("checked_chunks") or 0) for item in aspect_retrievals),
         "valid_chunks": sum(int(item.citation_validation.get("valid_chunks") or 0) for item in aspect_retrievals),
@@ -634,6 +707,37 @@ def build_context_package(
     )
 
 
+def build_context_package(
+    db: Session,
+    question: str,
+    options: list[str] | None = None,
+    progress_reporter: ProgressReporter | None = None,
+    cancellation_checker: Callable[[], None] | None = None,
+    *,
+    relaxed: bool = False,
+    rewritten_queries: list[str] | None = None,
+    memory_context: dict | None = None,
+) -> LLMContextPackage:
+    """检索规划 → 召回 → 选择 → 上下文包（保留的公开入口，供 retrieve API 等使用）。"""
+    query_plan, aspect_retrievals = _plan_and_retrieve(
+        db,
+        question,
+        progress_reporter=progress_reporter,
+        cancellation_checker=cancellation_checker,
+        rewritten_queries=rewritten_queries,
+        memory_context=memory_context,
+    )
+    return _package_from_retrieval(
+        db,
+        question,
+        query_plan,
+        aspect_retrievals,
+        relaxed=relaxed,
+        progress_reporter=progress_reporter,
+        cancellation_checker=cancellation_checker,
+    )
+
+
 def _evidence_grade(context_chunks: list[RetrievalResult]) -> str:
     """证据强度评估：none=零候选 / weak=分数过低或数量不足 / strong=足够。
 
@@ -647,11 +751,10 @@ def _evidence_grade(context_chunks: list[RetrievalResult]) -> str:
     return "strong"
 
 
-def _document_catalog_summary(db: Session, limit: int = 60) -> str:
-    """运行时生成知识库文档清单（文件名 + 标题），供 planner/改写 prompt 使用。
+def _document_catalog_entries(db: Session, limit: int = 60) -> list[tuple[str, str]]:
+    """运行时读取知识库文档清单 [(filename, title)]，供 planner 结构化使用。
 
-    动态数据（每次从 Document 表读取），非硬编码：文档增删后自动反映；
-    仅作 LLM 检索规划的提示上下文，不参与任何分数计算。
+    动态数据（每次从 Document 表读取），非硬编码：文档增删后自动反映。
     """
     try:
         documents = db.scalars(
@@ -661,14 +764,22 @@ def _document_catalog_summary(db: Session, limit: int = 60) -> str:
             .limit(limit)
         ).all()
     except Exception:
-        return ""
+        return []
+    return [(document.filename, (document.title or "").strip()) for document in documents]
+
+
+def _document_catalog_summary(db: Session, limit: int = 60) -> str:
+    """运行时生成知识库文档清单（文件名 + 标题），供 planner/改写 prompt 使用。
+
+    动态数据（每次从 Document 表读取），非硬编码：文档增删后自动反映；
+    仅作 LLM 检索规划的提示上下文，不参与任何分数计算。
+    """
     lines: list[str] = []
-    for document in documents:
-        title = (document.title or "").strip()
-        if title and title != document.filename:
-            lines.append(f"- {document.filename}（{title}）")
+    for filename, title in _document_catalog_entries(db, limit=limit):
+        if title and title != filename:
+            lines.append(f"- {filename}（{title}）")
         else:
-            lines.append(f"- {document.filename}")
+            lines.append(f"- {filename}")
     return "\n".join(lines)
 
 
@@ -702,11 +813,91 @@ def _empty_context_package(question: str) -> LLMContextPackage:
     )
 
 
+def _indexed_document_ids(db: Session) -> set[str]:
+    return set(
+        db.scalars(
+            select(Document.document_id).where(
+                Document.status.in_(["indexed", "table_indexed"])
+            )
+        ).all()
+    )
+
+
+def _keyword_recall_candidates(
+    db: Session,
+    terms: list[str],
+    limit: int = KEYWORD_RECALL_LIMIT,
+) -> list[tuple[_DocumentChunkSnapshot, int]]:
+    """关键词精确召回：小库优势——全量扫描已索引 chunk，术语子串命中计数取 top-N。
+
+    dense 向量对列举对象/精确术语召回弱（语义查询下对象文档常排到 40 名开外），
+    本路径用词面子串匹配保证对象文档的片段进入候选池，相关性最终由 rerank 裁决。
+    """
+    normalized_terms = [
+        re.sub(r"\s+", "", term)
+        for term in terms
+        if term and re.sub(r"\s+", "", term)
+    ]
+    if not normalized_terms or limit <= 0:
+        return []
+    chunks_by_document = _chunks_by_document(db, _indexed_document_ids(db))
+    scored: list[tuple[int, _DocumentChunkSnapshot]] = []
+    for chunks in chunks_by_document.values():
+        for chunk in chunks:
+            text = re.sub(
+                r"\s+",
+                "",
+                "\n".join(
+                    part
+                    for part in (
+                        chunk.source_file,
+                        chunk.section_title or "",
+                        chunk.embedding_text or "",
+                        chunk.text or "",
+                    )
+                    if part
+                ),
+            )
+            if not text:
+                continue
+            hits = sum(1 for term in normalized_terms if term in text)
+            if hits:
+                scored.append((hits, chunk))
+    scored.sort(key=lambda item: (-item[0], item[1].id))
+    return [(chunk, hits) for hits, chunk in scored[:limit]]
+
+
+def _keyword_snapshot_candidate(snapshot: _DocumentChunkSnapshot, hits: int) -> VectorSearchResult:
+    """把关键词命中的 chunk 快照包装为候选（合成分数仅作排序占位，相关性由 rerank 裁决）。"""
+    return VectorSearchResult(
+        chunk_id=snapshot.chunk_id,
+        document_id=snapshot.document_id,
+        filename=snapshot.source_file,
+        section_title=snapshot.section_title,
+        page_number=snapshot.page_number,
+        text=snapshot.text,
+        embedding_text=snapshot.embedding_text or snapshot.text,
+        token_count=max(len(snapshot.text or "") // 2, 1),
+        score=min(0.5 * hits, 1.0),
+        chunk_type="paragraph",
+        section_path=None,
+        section_number=None,
+        parent_section_number=None,
+        previous_chunk_id=None,
+        next_chunk_id=None,
+        metadata={"recall_path": "keyword", "keyword_hits": hits},
+    )
+
+
 def _retrieve_aspects(
     db: Session,
     query_plan: QueryPlan,
     progress_reporter: ProgressReporter | None = None,
 ) -> list[AspectRetrieval]:
+    if query_plan.enumerative and len(query_plan.aspects) > 1:
+        # 枚举/补集问句：对象文档跨 aspect 高度重叠（5 个项目文档被 5 个 aspect 各查一遍），
+        # 走融合检索——全部查询一次召回、一次重排，再按 aspect 切分（省 4/5 重排计算）
+        return _retrieve_aspects_fused(db, query_plan, progress_reporter=progress_reporter)
     retrieval_started_at = perf_counter()
     _report_progress(
         progress_reporter,
@@ -810,6 +1001,289 @@ def _retrieve_aspects(
     return aspect_retrievals
 
 
+def _retrieve_aspects_fused(
+    db: Session,
+    query_plan: QueryPlan,
+    progress_reporter: ProgressReporter | None = None,
+) -> list[AspectRetrieval]:
+    """枚举问句融合检索：全部 aspect 的查询一次 dense 召回 + 关键词精确召回 → 一次 BGE rerank。
+
+    枚举/补集问句（"还有哪些项目"）的对象文档跨 aspect 高度重叠：5 个项目文档会被
+    5 个 aspect 各查一遍、各重排一遍（CPU 上每次重排 20 对 ≈ 8-9s），浪费约 4/5 计算。
+    融合路径把召回与重排合并为一次，再按"查询命中"把候选切分回各 aspect，
+    随后统一走配额式多样性选择。相关性信号与单 aspect 路径完全一致（加权 RRF + rerank）。
+    """
+    aspects = query_plan.aspects
+    retrieval_started_at = perf_counter()
+    _report_progress(
+        progress_reporter,
+        {
+            "stage": "retrieval",
+            "status": "running",
+            "title": "正在检索相关依据",
+            "detail": f"正在按 {len(aspects)} 个问题方面融合召回知识库片段……",
+            "summary": {"total_aspects": len(aspects), "fusion": "enumerative_fused"},
+        },
+    )
+
+    # 1. 全部检索查询（跨 aspect 去重）
+    seen_queries: set[str] = set()
+    queries: list[str] = []
+    query_metadata: list[dict[str, str]] = []
+    for aspect in aspects:
+        for search_query in aspect.search_queries:
+            key = re.sub(r"\s+", "", search_query.query)
+            if not key or key in seen_queries:
+                continue
+            seen_queries.add(key)
+            queries.append(search_query.query)
+            query_metadata.append(
+                {"query_type": search_query.query_type, "rationale": search_query.rationale}
+            )
+
+    # 2. 一次 dense 召回 + 关键词精确召回（对象名锚定，保证对象文档的片段必然入池）
+    diagnostics = RetrievalDiagnostics()
+    try:
+        candidates, query_hits_by_chunk_id, _diagnostics_by_query = collect_candidates_with_query_hits(
+            queries,
+            query_metadata=query_metadata,
+            diagnostics=diagnostics,
+        )
+    except (EmbeddingServiceError, VectorStoreError) as exc:
+        raise RetrievalServiceUnavailable(str(exc)) from exc
+    if KEYWORD_RECALL_LIMIT > 0:
+        all_keywords = [keyword for aspect in aspects for keyword in aspect.keywords]
+        existing_ids = {candidate.chunk_id for candidate in candidates}
+        for snapshot, hits in _keyword_recall_candidates(db, all_keywords):
+            if snapshot.chunk_id in existing_ids:
+                continue
+            candidates.append(_keyword_snapshot_candidate(snapshot, hits))
+            existing_ids.add(snapshot.chunk_id)
+
+    # 3. 加权 RRF 融合（与单 aspect 路径的 QUERY_TYPE_WEIGHTS/RRF_K 完全一致）
+    fusion_scores: dict[str, float] = {}
+    for candidate in candidates:
+        for hit in query_hits_by_chunk_id.get(candidate.chunk_id, []):
+            query_type = str(hit.get("query_type") or "semantic_question")
+            query_weight = QUERY_TYPE_WEIGHTS.get(query_type, 1.0)
+            rank = int(hit.get("rank") or 1)
+            fusion_scores[candidate.chunk_id] = (
+                fusion_scores.get(candidate.chunk_id, 0.0) + query_weight / (RRF_K + rank)
+            )
+    document_style_scores = _fused_document_style_scores(candidates, aspects)
+    for candidate in candidates:
+        if candidate.metadata is None:
+            candidate.metadata = {}
+        candidate.metadata["document_style_evidence_score"] = round(
+            document_style_scores.get(candidate.chunk_id, 0.0), 6
+        )
+    candidates.sort(
+        key=lambda candidate: (
+            document_style_scores.get(candidate.chunk_id, 0.0),
+            fusion_scores.get(candidate.chunk_id, 0.0),
+            candidate.score,
+        ),
+        reverse=True,
+    )
+
+    # 4. 一次重排（rerank 查询 = 原问题 + 全部对象文档名）
+    rerank_started_at = perf_counter()
+    object_names = [
+        object_name_from_filename(doc)
+        for aspect in aspects
+        for doc in aspect.anchor_documents
+    ]
+    rerank_question = "\n".join(
+        [query_plan.original_question, *dict.fromkeys(name for name in object_names if name)]
+    )
+    # 重排输入：融合排序后的 dense 候选取前 RERANK_CANDIDATE_LIMIT，
+    # 关键词精确召回的对象块（排序在融合末尾）无条件保留——它们是对象文档的可靠锚点，
+    # 不能被截断挤出（否则"外卖平台"等对象文档会像旧实现一样从 prompt 中消失）
+    dense_pool = [
+        candidate
+        for candidate in candidates
+        if candidate.metadata.get("recall_path") != "keyword"
+    ]
+    keyword_pool = [
+        candidate
+        for candidate in candidates
+        if candidate.metadata.get("recall_path") == "keyword"
+    ]
+    rerank_input = limit_rerank_candidates(
+        dense_pool,
+        preserve_order=True,
+        limit=RERANK_CANDIDATE_LIMIT,
+    )
+    rerank_input = rerank_input + [
+        candidate
+        for candidate in keyword_pool
+        if not any(candidate.chunk_id == item.chunk_id for item in rerank_input)
+    ]
+    diagnostics.rerank_input_count = len(rerank_input)
+    diagnostics.candidate_count = len(candidates)
+    _report_progress(
+        progress_reporter,
+        {
+            "stage": "retrieval",
+            "status": "running",
+            "title": "正在重排候选片段",
+            "detail": f"融合候选 {len(rerank_input)} 个片段进入重排……",
+            "summary": {"rerank_input_count": len(rerank_input), "fusion": "enumerative_fused"},
+        },
+    )
+    try:
+        reranked = rerank_candidates(
+            question=rerank_question,
+            candidates=rerank_input,
+            limit=RERANK_TOP_K,
+        )
+    except RerankServiceError as exc:
+        raise RetrievalServiceUnavailable(str(exc)) from exc
+    diagnostics.timings_ms["rerank"] = _elapsed_ms(rerank_started_at)
+    diagnostics.rerank_call_count = 1 if rerank_input else 0
+    diagnostics.reranked_count = len(reranked)
+    # 枚举/补集问句：保留全部重排结果（不只 top-12），由选择层的对象配额做最终取舍，
+    # 避免高分文档（如自我介绍/简历）挤掉对象文档（如外卖平台/EchoGuide）
+    matches = matches_from_reranked(
+        question=query_plan.original_question,
+        reranked=reranked,
+        diagnostics=diagnostics,
+        limit=max(FINAL_CITATION_LIMIT, len(reranked)),
+    )
+    matches = _filter_indexed_matches(db, matches)
+
+    # 5. 按查询命中把候选切分回各 aspect（关键词候选归属所有 aspect，选择层按块去重）
+    query_texts_by_aspect = {
+        aspect.aspect_id: {re.sub(r"\s+", "", sq.query) for sq in aspect.search_queries}
+        for aspect in aspects
+    }
+    matches_by_aspect: dict[str, list[RetrievalMatch]] = {aspect.aspect_id: [] for aspect in aspects}
+    for match in matches:
+        hit_queries = {
+            re.sub(r"\s+", "", hit.get("query") or "")
+            for hit in query_hits_by_chunk_id.get(match.citation.chunk_id, [])
+        }
+        for aspect in aspects:
+            if match.metadata.get("recall_path") == "keyword" or (
+                hit_queries & query_texts_by_aspect[aspect.aspect_id]
+            ):
+                matches_by_aspect[aspect.aspect_id].append(match)
+
+    aspect_retrievals: list[AspectRetrieval] = []
+    for aspect in aspects:
+        aspect_matches = matches_by_aspect[aspect.aspect_id]
+        for match in aspect_matches:
+            chunk_id = match.citation.chunk_id
+            match.metadata["aspect_id"] = aspect.aspect_id
+            match.metadata["aspect_question"] = aspect.question
+            match.metadata["aspect_search_queries"] = _search_query_debug_list(aspect)
+            match.metadata["aspect_search_query_hits"] = query_hits_by_chunk_id.get(chunk_id, [])
+            match.metadata["aspect_query_fusion_score"] = round(
+                fusion_scores.get(chunk_id, 0.0), 6
+            )
+            match.metadata["fusion_method"] = ASPECT_QUERY_FUSION_METHOD
+            match.metadata["expected_evidence_type"] = aspect.expected_evidence_type
+            match.metadata["evidence_need"] = aspect.evidence_need
+        aspect_matches.sort(
+            key=lambda match: (
+                fusion_scores.get(match.citation.chunk_id, 0.0),
+                match.rerank_score,
+                match.score,
+            ),
+            reverse=True,
+        )
+        candidates_for_aspect = _to_retrieval_results(aspect_matches)
+        valid_candidates, citation_validation = _validate_context_chunks(db, candidates_for_aspect)
+        fused_diagnostics = diagnostics.to_summary_fields()
+        fused_diagnostics.update(
+            {
+                "query_type": "enumerative_fused",
+                "search_query": query_plan.original_question,
+                "rationale": "枚举问句融合检索：全部查询一次召回、一次重排后按查询命中切分",
+                "match_count": len(valid_candidates),
+            }
+        )
+        aspect_retrievals.append(
+            AspectRetrieval(
+                aspect=aspect,
+                candidates=valid_candidates,
+                diagnostics=[fused_diagnostics],
+                citation_validation=citation_validation,
+                selected_chunk_ids=[],
+                retrieval_covered=bool(valid_candidates),
+                covered=False,
+            )
+        )
+        _report_progress(
+            progress_reporter,
+            {
+                "stage": "retrieval",
+                "status": "completed" if valid_candidates else "failed",
+                "title": f"方面检索完成" if valid_candidates else f"方面未找到足够依据",
+                "detail": (
+                    f"已为“{aspect.question}”召回 {len(valid_candidates)} 个可回溯候选片段"
+                    if valid_candidates
+                    else f"“{aspect.question}”暂未召回可回溯依据"
+                ),
+                "aspect_id": aspect.aspect_id,
+                "summary": {"aspect_index": aspects.index(aspect) + 1, "total_aspects": len(aspects),
+                            "candidate_count": len(valid_candidates), "aspect_question": aspect.question},
+            },
+        )
+
+    diagnostics.timings_ms["total"] = _elapsed_ms(retrieval_started_at)
+    _report_progress(
+        progress_reporter,
+        {
+            "stage": "retrieval",
+            "status": "completed",
+            "title": "融合检索完成",
+            "detail": f"一次重排输出 {diagnostics.reranked_count} 个片段，切分给 {len(aspects)} 个方面",
+            "elapsed_ms": diagnostics.timings_ms.get("total"),
+            "summary": {
+                "total_aspects": len(aspects),
+                "rerank_call_count": 1,
+                "reranked_count": diagnostics.reranked_count,
+                "fusion": "enumerative_fused",
+            },
+        },
+    )
+    return aspect_retrievals
+
+
+def _fused_document_style_scores(
+    candidates: list[Any],
+    aspects: tuple[QueryAspect, ...],
+) -> dict[str, float]:
+    """融合路径的文档风格证据分：取所有 aspect 的 document_style 语句在候选文本中的最大覆盖。"""
+    statements = [
+        statement.strip()
+        for aspect in aspects
+        for search_query in aspect.search_queries
+        if search_query.query_type == "document_style_statement"
+        for statement in search_query.query.splitlines()
+        if statement.strip()
+    ]
+    if not statements:
+        return {}
+    scores: dict[str, float] = {}
+    for candidate in candidates:
+        text = "\n".join(
+            part
+            for part in (
+                candidate.filename,
+                candidate.section_title or "",
+                candidate.embedding_text or "",
+                candidate.text,
+            )
+            if part
+        )
+        scores[candidate.chunk_id] = max(
+            evidence_coverage(question_terms(statement), text) for statement in statements
+        )
+    return scores
+
+
 def _document_style_evidence_score(candidate: Any, aspect: QueryAspect) -> float:
     statements = [
         statement.strip()
@@ -878,6 +1352,16 @@ def _retrieve_aspect_matches(
             hit["rrf_contribution"] = round(contribution, 6)
 
     pre_filter_candidate_count = len(candidates)
+    # 枚举/补集问句：dense 召回对列举对象文档弱（语义查询下对象文档常排 40 名开外），
+    # 用关键词精确召回把对象文档的片段注入候选池（相关性最终由 rerank 裁决）
+    if enumerative and KEYWORD_RECALL_LIMIT > 0:
+        keyword_candidates = _keyword_recall_candidates(db, list(aspect.keywords))
+        existing_ids = {candidate.chunk_id for candidate in candidates}
+        for snapshot, hits in keyword_candidates:
+            if snapshot.chunk_id in existing_ids:
+                continue
+            candidates.append(_keyword_snapshot_candidate(snapshot, hits))
+            existing_ids.add(snapshot.chunk_id)
     diagnostics.candidate_count = len(candidates)
     document_style_scores = {
         candidate.chunk_id: _document_style_evidence_score(candidate, aspect)
@@ -1313,7 +1797,14 @@ def _select_prompt_chunks(
     *,
     relaxed: bool = False,
 ) -> tuple[list[RetrievalResult], dict[str, Any]]:
-    selected: list[RetrievalResult] = []
+    """配额式多样性选择：统一以 rerank 分数为相关性信号。
+
+    替代旧的多 pass 特判（core/anchor/query/generic/forced_minimum/relaxed）：
+    1. 每个 aspect 至少保留 1 块最优候选（问题各个方面都有依据）
+    2. 每个文档最多 PER_DOCUMENT_PROMPT_CAP 块（杜绝单一文档霸屏挤掉其他对象）
+    3. 枚举/补集问句：对象文档优先填充配额，被排除文档降权到最后（软约束，仅对照）
+    4. relaxed 兜底：同一候选池降阈重选（兜底链第 1 级不再整链重跑）
+    """
     candidate_count = len(
         {
             chunk.chunk_id
@@ -1321,244 +1812,136 @@ def _select_prompt_chunks(
             for chunk in item.candidates
         }
     )
+    # 绝对相关性门槛：标准 = max(RERANK_PROMPT_THRESHOLD, MIN_CORE_RERANK_SCORE)；
+    # 枚举问句补选放宽一半（宽泛问句下 rerank 分数整体偏低，与旧行为一致）；
+    # relaxed 兜底降到 RELAXED_RERANK_THRESHOLD
+    if relaxed:
+        bar = RELAXED_RERANK_THRESHOLD
+    elif query_plan.enumerative:
+        bar = max(RERANK_PROMPT_THRESHOLD, MIN_CORE_RERANK_SCORE) * 0.5
+    else:
+        bar = max(RERANK_PROMPT_THRESHOLD, MIN_CORE_RERANK_SCORE)
+    target = MAX_PROMPT_CHUNKS if query_plan.enumerative else MIN_PROMPT_CHUNKS
+    if relaxed:
+        target = max(target, RELAXED_MIN_PROMPT_CHUNKS)
 
-    for aspect_retrieval in aspect_retrievals:
-        if len(selected) >= MAX_PROMPT_CHUNKS:
-            break
-        shared_chunk = _best_shared_candidate(
-            aspect_retrieval.candidates,
-            selected,
-            aspect_retrieval.aspect,
+    excluded_docs = set(query_plan.excluded_documents)
+    object_docs = {
+        doc
+        for item in aspect_retrievals
+        for doc in item.aspect.anchor_documents
+    }
+
+    def _doc_key(chunk: RetrievalResult) -> str:
+        return str(chunk.metadata.get("document_id") or "") or chunk.source_doc
+
+    def _doc_priority(doc_key: str) -> int:
+        # 对象文档（非排除）最高 → 其他文档 → 被排除对象文档（仅对照）
+        if doc_key in object_docs:
+            return 0 if doc_key not in excluded_docs else 2
+        return 1
+
+    def _passes_fill_bar(chunk: RetrievalResult) -> bool:
+        """填充阶段门槛：绝对分数为主；关键词精确召回的对象块允许低分逃生。"""
+        score = _prompt_score(chunk)
+        if score >= bar:
+            return True
+        if chunk.metadata.get("recall_path") == "keyword":
+            return score >= MIN_LEXICAL_RERANK_SCORE
+        return False
+
+    def _passes_bar(chunk: RetrievalResult, aspect: QueryAspect) -> bool:
+        """aspect 覆盖阶段门槛：填充门槛 + 词法逃生通道（词面命中 ≥2 且 rerank 不低于下限）。"""
+        if _passes_fill_bar(chunk):
+            return True
+        if _aspect_lexical_score(chunk, aspect) < MIN_LEXICAL_SCORE:
+            return False
+        return _prompt_score(chunk) >= MIN_LEXICAL_RERANK_SCORE
+
+    pool: list[tuple[RetrievalResult, AspectRetrieval]] = [
+        (chunk, item)
+        for item in aspect_retrievals
+        for chunk in item.candidates
+    ]
+    pool.sort(
+        key=lambda pair: (
+            _doc_priority(_doc_key(pair[0])),
+            -_prompt_score(pair[0]),
+            pair[0].rank or 999,
         )
-        if shared_chunk is not None:
-            _mark_chunk_for_aspect(shared_chunk, aspect_retrieval.aspect)
-            aspect_retrieval.selected_chunk_ids.append(shared_chunk.chunk_id)
-            aspect_retrieval.covered = True
-            continue
-        core_chunk = _best_non_duplicate_candidate(
-            aspect_retrieval.candidates,
-            selected,
-            aspect_retrieval.aspect,
-        )
-        if core_chunk is None:
-            aspect_retrieval.covered = False
-            continue
-        if not _passes_core_relevance(core_chunk, aspect_retrieval.aspect):
-            # Best candidate still has essentially no relevance (rerank far
-            # below the absolute bar and no lexical overlap with the question).
-            # Marking the aspect uncovered makes the request refuse politely
-            # instead of pushing unrelated evidence into the prompt and later
-            # failing grounding validation with a raw-excerpt fallback.
-            aspect_retrieval.covered = False
-            aspect_retrieval.retrieval_covered = False
-            aspect_retrieval.diagnostics.append(
-                {
-                    "query_type": "relevance_gate",
-                    "search_query": aspect_retrieval.aspect.question,
-                    "match_count": 1,
-                    "match_status": "below_rerank_threshold",
-                    "reason": "best candidate below absolute relevance bar",
-                    "rerank_score": round(_prompt_score(core_chunk), 6),
-                    "rerank_prompt_threshold": RERANK_PROMPT_THRESHOLD,
-                    "query_count": 0,
-                    "raw_candidate_count": 0,
-                    "candidate_count": 0,
-                    "rerank_input_count": 0,
-                    "rerank_call_count": 0,
-                    "reranked_count": 0,
-                    "filtered_count": 0,
-                    "timings_ms": {},
-                    "score_range": {},
-                }
-            )
-            continue
-        core_chunk.metadata["prompt_selection_reason"] = "core"
-        _mark_chunk_for_aspect(core_chunk, aspect_retrieval.aspect)
-        selected.append(core_chunk)
-        aspect_retrieval.selected_chunk_ids.append(core_chunk.chunk_id)
-        aspect_retrieval.covered = True
-
-    # A single planner aspect can contain several explicit conditions.  Preserve
-    # at least one directly matching evidence block for each condition before
-    # spending the remaining budget on generic neighbours.
-    for aspect_retrieval in aspect_retrievals:
-        added_for_anchors = 0
-        for anchor in _aspect_anchor_phrases(aspect_retrieval.aspect):
-            if len(selected) >= MAX_PROMPT_CHUNKS or added_for_anchors >= 3:
-                break
-            aspect_selected = [
-                chunk
-                for chunk in selected
-                if aspect_retrieval.aspect.aspect_id
-                in (chunk.metadata.get("prompt_matched_aspects") or [])
-            ]
-            if any(_anchor_coverage(anchor, chunk.text) >= 0.82 for chunk in aspect_selected):
-                continue
-            candidates = [
-                chunk
-                for chunk in aspect_retrieval.candidates
-                if _anchor_coverage(anchor, chunk.text) >= 0.72
-                and not _is_duplicate_or_redundant(chunk, selected)
-            ]
-            if not candidates:
-                continue
-            chunk = max(
-                candidates,
-                key=lambda item: (
-                    _anchor_coverage(anchor, item.text),
-                    _aspect_lexical_score(item, aspect_retrieval.aspect),
-                    _prompt_score(item),
-                ),
-            )
-            chunk.metadata["prompt_selection_reason"] = "anchor"
-            _mark_chunk_for_aspect(chunk, aspect_retrieval.aspect)
-            selected.append(chunk)
-            aspect_retrieval.selected_chunk_ids.append(chunk.chunk_id)
-            added_for_anchors += 1
-
-    # A planner may deliberately keep several evidence-seeking queries inside
-    # one aspect (for example, a rule plus its exception). Preserve the best
-    # direct candidate for each substantive query before generic neighbours;
-    # otherwise one high rerank score can crowd out another requested clause.
-    for aspect_retrieval in aspect_retrievals:
-        added_for_queries = 0
-        for search_query in aspect_retrieval.aspect.search_queries:
-            if search_query.query_type not in {"semantic_question", "document_style_statement"}:
-                continue
-            if len(selected) >= MAX_PROMPT_CHUNKS or added_for_queries >= 4:
-                break
-            candidates: list[tuple[float, int, RetrievalResult]] = []
-            for chunk in aspect_retrieval.candidates:
-                if not _passes_prompt_relevance_bar(chunk, aspect_retrieval.aspect):
-                    continue
-                if not (
-                    _chunk_matches_query_aspect(chunk, aspect_retrieval.aspect)
-                    or _aspect_lexical_score(chunk, aspect_retrieval.aspect) > 0
-                    or _chunk_question_coverage(chunk, aspect_retrieval.aspect.question) >= MIN_EVIDENCE_COVERAGE
-                ):
-                    continue
-                hits = chunk.metadata.get("aspect_search_query_hits") or []
-                matching_hits = [
-                    hit
-                    for hit in hits
-                    if isinstance(hit, dict) and hit.get("query") == search_query.query
-                ]
-                if not matching_hits:
-                    continue
-                best_hit = max(
-                    matching_hits,
-                    key=lambda hit: (float(hit.get("vector_score") or 0.0), -int(hit.get("rank") or 9999)),
-                )
-                candidates.append(
-                    (
-                        float(best_hit.get("vector_score") or 0.0),
-                        -int(best_hit.get("rank") or 9999),
-                        chunk,
-                    )
-                )
-            candidates.sort(key=lambda item: (item[0], item[1], _prompt_score(item[2])), reverse=True)
-            chosen = next(
-                (chunk for _, _, chunk in candidates if not _is_duplicate_or_redundant(chunk, selected)),
-                None,
-            )
-            if chosen is None:
-                continue
-            chosen.metadata["prompt_selection_reason"] = "query"
-            _mark_chunk_for_aspect(chosen, aspect_retrieval.aspect)
-            selected.append(chosen)
-            aspect_retrieval.selected_chunk_ids.append(chosen.chunk_id)
-            added_for_queries += 1
-
-    # 枚举类问句（"哪些项目/有什么技能"）：宽泛问句下 rerank 分数整体偏低
-    #（项目简介块常在 0.05-0.2 区间），0.2 绝对门槛会把被列举对象的材料
-    # 全部挡在 prompt 外。枚举时把补选门槛降到绝对下限 RERANK_PROMPT_THRESHOLD 的一半。
-    prompt_score_bar = (
-        RERANK_PROMPT_THRESHOLD * 0.5
-        if query_plan.enumerative
-        else None
     )
-    for aspect_retrieval in aspect_retrievals:
-        if len(selected) >= MAX_PROMPT_CHUNKS:
+
+    selected: list[RetrievalResult] = []
+    selected_ids: set[str] = set()
+    doc_used: dict[str, int] = {}
+    in_phase_one = True
+
+    def _select(chunk: RetrievalResult, aspect: AspectRetrieval) -> None:
+        nonlocal in_phase_one
+        if len(selected) >= target or chunk.chunk_id in selected_ids:
+            return
+        if _is_duplicate_or_redundant(chunk, selected):
+            return
+        doc_key = _doc_key(chunk)
+        if doc_used.get(doc_key, 0) >= PER_DOCUMENT_PROMPT_CAP:
+            return
+        chunk.metadata["prompt_selection_reason"] = (
+            "relaxed_fallback"
+            if relaxed
+            else ("core" if in_phase_one else "generic")
+        )
+        selected.append(chunk)
+        selected_ids.add(chunk.chunk_id)
+        doc_used[doc_key] = doc_used.get(doc_key, 0) + 1
+        # 覆盖标记：只标记该块被选中的 aspect（多 aspect 共享块由覆盖同步兜底判定）
+        _mark_chunk_for_aspect(chunk, aspect.aspect)
+        aspect.selected_chunk_ids.append(chunk.chunk_id)
+
+    # 阶段 1：每个 aspect 至少 1 块最优候选——词法命中优先（引号锚点/对象名命中优先于高分泛化块），
+    # 分数其次；保证问题各个方面都有依据，且锚定对象（《材料》/项目名）优先入选
+    for item in aspect_retrievals:
+        if len(selected) >= target:
             break
-        top_score = max((_prompt_score(chunk) for chunk in aspect_retrieval.candidates), default=0.0)
-        for chunk in aspect_retrieval.candidates:
-            if len(selected) >= MAX_PROMPT_CHUNKS:
+        best = max(
+            (chunk for chunk in item.candidates if _passes_bar(chunk, item.aspect)),
+            key=lambda chunk: (
+                _aspect_lexical_score(chunk, item.aspect),
+                _prompt_score(chunk),
+                -(chunk.rank or 999),
+            ),
+            default=None,
+        )
+        if best is not None:
+            _select(best, item)
+    in_phase_one = False
+
+    # 阶段 2：配额填充——按 (文档优先级, rerank 分) 降序，每文档最多 PER_DOCUMENT_PROMPT_CAP 块
+    for chunk, item in pool:
+        if len(selected) >= target:
+            break
+        if chunk.chunk_id in selected_ids or not _passes_fill_bar(chunk):
+            continue
+        _select(chunk, item)
+
+    # 阶段 3：文档配额兜底——当所有有候选的文档都已入池仍不足目标时，放宽配额按分数补足。
+    # 单文档/小知识库场景不会被多样性约束饿死证据；多文档场景阶段 2 已达标，不会触发。
+    represented_docs = {_doc_key(chunk) for chunk in selected}
+    available_docs = {_doc_key(chunk) for chunk, _item in pool if _passes_fill_bar(chunk)}
+    if len(selected) < target and represented_docs and represented_docs == available_docs:
+        for chunk, item in pool:
+            if len(selected) >= target:
                 break
-            if chunk.chunk_id in aspect_retrieval.selected_chunk_ids:
-                continue
-            if prompt_score_bar is not None:
-                if _prompt_score(chunk) < prompt_score_bar:
-                    continue
-            elif not _passes_prompt_score(chunk, top_score):
+            if chunk.chunk_id in selected_ids or not _passes_fill_bar(chunk):
                 continue
             if _is_duplicate_or_redundant(chunk, selected):
                 continue
-            if not (
-                query_plan.enumerative
-                or _chunk_matches_query_aspect(chunk, aspect_retrieval.aspect)
-                or _is_structural_support(chunk, selected, question)
-            ):
-                continue
-            chunk.metadata["prompt_selection_reason"] = "generic"
-            _mark_chunk_for_aspect(chunk, aspect_retrieval.aspect)
+            chunk.metadata["prompt_selection_reason"] = (
+                "relaxed_fallback" if relaxed else "generic"
+            )
             selected.append(chunk)
-            aspect_retrieval.selected_chunk_ids.append(chunk.chunk_id)
-
-    # 枚举类问句（"哪些项目/有什么技能"）：多对象列举需要更多证据块，
-    # 把最小补选目标提到容量上限，让全部被列举对象的材料都能进 prompt
-    target_min_chunks = MAX_PROMPT_CHUNKS if query_plan.enumerative else MIN_PROMPT_CHUNKS
-    if FORCE_MIN_CHUNKS and len(selected) < target_min_chunks:
-        for aspect_retrieval in aspect_retrievals:
-            top_score = max((_prompt_score(chunk) for chunk in aspect_retrieval.candidates), default=0.0)
-            for chunk in aspect_retrieval.candidates:
-                if len(selected) >= min(target_min_chunks, MAX_PROMPT_CHUNKS):
-                    break
-                if _is_duplicate_or_redundant(chunk, selected):
-                    continue
-                # The minimum is a lower-bound preference, not permission to
-                # inject unrelated evidence. Apply the same score and aspect
-                # relevance gate used by ordinary prompt selection.
-                if prompt_score_bar is not None:
-                    if _prompt_score(chunk) < prompt_score_bar:
-                        continue
-                elif not _passes_prompt_score(chunk, top_score):
-                    continue
-                if not (
-                    # 枚举问句：rerank 分数已是相关度信号，被列举对象的材料块
-                    # 未必与问句有词法重叠，跳过 aspect 词法匹配门槛
-                    query_plan.enumerative
-                    or _chunk_matches_query_aspect(chunk, aspect_retrieval.aspect)
-                    or _is_structural_support(chunk, selected, question)
-                ):
-                    continue
-                chunk.metadata["prompt_selection_reason"] = "forced_minimum"
-                _mark_chunk_for_aspect(chunk, aspect_retrieval.aspect)
-                selected.append(chunk)
-                aspect_retrieval.selected_chunk_ids.append(chunk.chunk_id)
-
-    if relaxed and len(selected) < RELAXED_MIN_PROMPT_CHUNKS:
-        # 兜底链降阈重试：放宽门槛，按 rerank 分数直接补足候选（相关甚至不太相关，
-        # 交给 LLM 推理 + 推测标注兜底，而不是拒答）
-        pool: list[tuple[RetrievalResult, AspectRetrieval]] = []
-        seen_pool: set[str] = set()
-        for aspect_retrieval in aspect_retrievals:
-            for chunk in aspect_retrieval.candidates:
-                if chunk.chunk_id in seen_pool or chunk.chunk_id in {
-                    item.chunk_id for item in selected
-                }:
-                    continue
-                seen_pool.add(chunk.chunk_id)
-                pool.append((chunk, aspect_retrieval))
-        pool.sort(key=lambda item: _prompt_score(item[0]), reverse=True)
-        for chunk, aspect_retrieval in pool:
-            if len(selected) >= min(RELAXED_MIN_PROMPT_CHUNKS, MAX_PROMPT_CHUNKS):
-                break
-            if _is_duplicate_or_redundant(chunk, selected):
-                continue
-            chunk.metadata["prompt_selection_reason"] = "relaxed_fallback"
-            _mark_chunk_for_aspect(chunk, aspect_retrieval.aspect)
-            selected.append(chunk)
-            aspect_retrieval.selected_chunk_ids.append(chunk.chunk_id)
+            selected_ids.add(chunk.chunk_id)
+            _mark_chunk_for_aspect(chunk, item.aspect)
+            item.selected_chunk_ids.append(chunk.chunk_id)
 
     selected = _filter_prompt_relevance(selected, query_plan)
     selected = _apply_prompt_token_budget(selected)
@@ -1573,11 +1956,20 @@ def _select_prompt_chunks(
         aspect_retrievals,
         covered_aspects,
     )
+
+
 def _filter_prompt_relevance(
     selected: list[RetrievalResult],
     query_plan: QueryPlan,
 ) -> list[RetrievalResult]:
-    """Apply a final trust gate after all quota and prompt passes."""
+    """最终信任门：拦截与问句明显无关的块（非枚举问句）。
+
+    保留词法/结构门槛的理由：rerank 分数偏高但词面无关联的块（如"综合成绩"
+    问句召回"项目经历与竞赛奖项"章节，mock 场景 rerank 0.86）必须被拦下。
+    枚举/补集问句放行：被列举对象（如各项目文档的"技术栈"块）与宽泛问句无
+    词法重叠，靠 rerank 分数与对象配额裁决（旧实现曾因词法门挤掉 0.61 分
+    的对象块——"除了这三个还有哪些项目"案例）。
+    """
 
     relevant: list[RetrievalResult] = []
     for chunk in selected:
@@ -1589,8 +1981,6 @@ def _filter_prompt_relevance(
             relevant.append(chunk)
             continue
         if query_plan.enumerative:
-            # 枚举问句：generic/forced_minimum 块已通过 rerank 门槛与补选，
-            # 宽泛 aspect 下词法匹配不可靠，终检放行（材料即被列举对象）
             relevant.append(chunk)
             continue
         if any(_chunk_matches_query_aspect(chunk, aspect) for aspect in query_plan.aspects):
@@ -1605,6 +1995,7 @@ def _filter_prompt_relevance(
             continue
         if _is_structural_support(chunk, relevant, query_plan.original_question):
             relevant.append(chunk)
+            continue
     return relevant
 
 
@@ -1788,64 +2179,6 @@ def _apply_prompt_token_budget(chunks: list[RetrievalResult]) -> list[RetrievalR
     return selected
 
 
-def _first_non_duplicate_candidate(
-    candidates: list[RetrievalResult],
-    selected: list[RetrievalResult],
-) -> RetrievalResult | None:
-    for chunk in candidates:
-        if _is_duplicate_or_redundant(chunk, selected):
-            continue
-        return chunk
-    return None
-
-
-def _best_non_duplicate_candidate(
-    candidates: list[RetrievalResult],
-    selected: list[RetrievalResult],
-    aspect: QueryAspect,
-) -> RetrievalResult | None:
-    available = [
-        chunk for chunk in candidates if not _is_duplicate_or_redundant(chunk, selected)
-    ]
-    if not available:
-        return None
-    return max(
-        available,
-        key=lambda chunk: (
-            _aspect_lexical_score(chunk, aspect),
-            _prompt_score(chunk),
-            -(chunk.rank or 999),
-        ),
-    )
-
-
-def _best_shared_candidate(
-    candidates: list[RetrievalResult],
-    selected: list[RetrievalResult],
-    aspect: QueryAspect,
-) -> RetrievalResult | None:
-    candidate_ids = {chunk.chunk_id for chunk in candidates}
-    reusable = [chunk for chunk in selected if chunk.chunk_id in candidate_ids]
-    if not reusable:
-        return None
-    anchors = _aspect_anchor_phrases(aspect)
-    strongly_matching = [
-        chunk
-        for chunk in reusable
-        if any(_anchor_coverage(anchor, chunk.text) >= 0.72 for anchor in anchors)
-    ]
-    if not strongly_matching:
-        return None
-    return max(
-        strongly_matching,
-        key=lambda chunk: (
-            _aspect_lexical_score(chunk, aspect),
-            _prompt_score(chunk),
-            -(chunk.rank or 999),
-        ),
-    )
-
-
 def _aspect_anchor_phrases(aspect: QueryAspect) -> list[str]:
     phrases = [
         re.sub(r"\s+", "", item)
@@ -1915,62 +2248,11 @@ def _chunk_matches_query_aspect(chunk: RetrievalResult, aspect: QueryAspect) -> 
     return bool(question_text and question_text in text)
 
 
-def _passes_prompt_score(chunk: RetrievalResult, top_score: float) -> bool:
-    score = _prompt_score(chunk)
-    if score < max(RERANK_PROMPT_THRESHOLD, MIN_CORE_RERANK_SCORE):
-        return False
-    return not top_score or score >= top_score * RELATIVE_SCORE_RATIO
-
-
 def _prompt_score(chunk: RetrievalResult) -> float:
     metadata_score = _float_or_none(chunk.metadata.get("rerank_score"))
     if metadata_score is not None:
         return metadata_score
     return float(chunk.score or 0.0)
-
-
-def _passes_core_relevance(chunk: RetrievalResult, aspect: QueryAspect) -> bool:
-    """Best-candidate core evidence must clear the absolute relevance bar.
-
-    The generic prompt pass already enforces RERANK_PROMPT_THRESHOLD, but the
-    core pass used to accept the best candidate unconditionally, so an
-    off-topic question (rerank scores near zero) still entered the prompt and
-    later failed grounding validation, surfacing a raw-excerpt fallback.
-    The bar is max(RERANK_PROMPT_THRESHOLD, MIN_CORE_RERANK_SCORE): deployed
-    configs tune RERANK_PROMPT_THRESHOLD down to ~0.01 for the old 0.001-0.03
-    score distribution, while the actual bge-reranker-base scores are 0-1
-    (off-topic ≈ 0.012, real matches ≥ 0.48), so a bare threshold would let
-    off-topic evidence through.  Lexical overlap with the question is an
-    alternative proof of relevance: chunks recovered by the exact/bounded
-    support passes always satisfy it, and it keeps genuine keyword hits
-    usable even when the reranker under-scores them.  Question-coverage is
-    deliberately not used here: for broad Chinese questions it is unreliable
-    (MIN_EVIDENCE_COVERAGE is 0 in deployed configs), and the rerank bar
-    above already separates off-topic from real evidence.
-    """
-
-    return _passes_prompt_relevance_bar(chunk, aspect)
-
-
-def _passes_prompt_relevance_bar(chunk: RetrievalResult, aspect: QueryAspect) -> bool:
-    """Shared absolute relevance bar for the unconditional selection passes.
-
-    Core and per-query selection must both refuse candidates below the bar;
-    the query pass additionally gates on ``MIN_EVIDENCE_COVERAGE``, which is 0
-    in deployed configs and would otherwise admit any candidate with a query
-    hit.  See ``_passes_core_relevance`` for the threshold rationale.
-    """
-
-    if _prompt_score(chunk) >= max(RERANK_PROMPT_THRESHOLD, MIN_CORE_RERANK_SCORE):
-        return True
-    # 词法逃生通道收紧（2026-08-02 拒答校准）：此前仅“词法重叠 > 0”即可绕过门槛，
-    # “你的银行卡密码是什么”（rerank 0.004-0.03，命中“密码”关键词）与“你爱弹吉他吗”
-    # （0.06-0.33，命中“爱好”类词）均混入并产出跑题摘录。
-    # 现要求：词法命中数 ≥ MIN_LEXICAL_SCORE（引号锚点命中或 ≥2 个关键词），
-    # 且 rerank ≥ MIN_LEXICAL_RERANK_SCORE（近零分不认）。
-    if _aspect_lexical_score(chunk, aspect) < MIN_LEXICAL_SCORE:
-        return False
-    return _prompt_score(chunk) >= MIN_LEXICAL_RERANK_SCORE
 
 
 def _is_structural_support(chunk: RetrievalResult, selected: list[RetrievalResult], question: str) -> bool:
@@ -2339,12 +2621,22 @@ def _filter_indexed_matches(db: Session, matches: list[RetrievalMatch]) -> list[
 
 
 def _save_qa_log(db: Session, question: str, response: QAResponse) -> None:
+    package = response.context_package
+    used_chunks = (
+        int(package.retrieval_summary.get("used_chunks") or 0)
+        if package
+        else 0
+    )
     log = QALog(
         question=question,
         answer=response.answer or EMPTY_ANSWER_LOG_TEXT,
         refused=response.answer_mode == "failed",
         confidence=0.0,
-        citation_count=0,
+        citation_count=used_chunks,
+        answer_mode=response.answer_mode,
+        evidence_sufficiency=response.evidence_sufficiency,
+        fallback_level=response.retrieval_fallback_level,
+        used_chunks=used_chunks,
     )
     db.add(log)
     db.commit()
