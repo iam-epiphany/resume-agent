@@ -204,6 +204,87 @@ def test_query_planner_llm_returns_structured_multi_view_queries(monkeypatch) ->
     assert aspect.search_queries[0].query != "课程成绩 差异"
 
 
+def test_plan_query_injects_dynamic_document_catalog_into_prompt(monkeypatch) -> None:
+    """运行时知识库清单注入 planner prompt（动态数据，非硬编码）。"""
+    monkeypatch.setattr(query_planner_service, "QUERY_PLANNER_API_KEY", "test-key")
+    captured: dict = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            payload = {
+                "aspects": [
+                    {
+                        "aspect_id": "project_exp",
+                        "question": "你参与过哪些项目？",
+                        "evidence_need": "项目经历",
+                        "search_queries": [
+                            {"query": "参与过的项目 项目经历", "query_type": "semantic_question", "rationale": "贴近用户意图"}
+                        ],
+                        "keywords": ["项目"],
+                    }
+                ]
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}, ensure_ascii=False).encode()
+
+    def fake_urlopen(request, *args, **kwargs):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(query_planner_service.urllib.request, "urlopen", fake_urlopen)
+
+    catalog = "- 项目介绍_高并发电商秒杀平台.md（高并发电商秒杀平台）\n- 证书说明.md"
+    plan_query("你参与过哪些项目？", catalog=catalog)
+
+    user_content = captured["body"]["messages"][-1]["content"]
+    assert "项目介绍_高并发电商秒杀平台.md" in user_content
+    assert "证书说明.md" in user_content
+    assert "仅用于检索规划" in user_content
+    assert "输出到回答内容中" in user_content
+
+
+def test_plan_query_omits_catalog_block_when_empty(monkeypatch) -> None:
+    """空清单时不注入目录段落（测试环境/空库兼容）。"""
+    monkeypatch.setattr(query_planner_service, "QUERY_PLANNER_API_KEY", "test-key")
+    captured: dict = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            payload = {
+                "aspects": [
+                    {
+                        "aspect_id": "intro",
+                        "question": "介绍一下自己",
+                        "evidence_need": "自我介绍",
+                        "search_queries": [{"query": "自我介绍", "query_type": "semantic_question", "rationale": "贴近用户意图"}],
+                        "keywords": ["自我介绍"],
+                    }
+                ]
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}, ensure_ascii=False).encode()
+
+    def fake_urlopen(request, *args, **kwargs):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(query_planner_service.urllib.request, "urlopen", fake_urlopen)
+
+    plan_query("介绍一下自己", catalog="")
+    user_content = captured["body"]["messages"][-1]["content"]
+    assert "知识库文档清单" not in user_content
+
+
 def test_query_planner_accepts_legacy_string_search_queries() -> None:
     aspects = query_planner_service._aspects_from_payload(
         "课程成绩怎么表述",

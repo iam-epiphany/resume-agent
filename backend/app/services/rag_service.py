@@ -335,7 +335,10 @@ def answer_question(
                 },
             )
             queries = rewrite_search_queries(
-                resolved_question, intent_result.intent, cancellation_checker
+                resolved_question,
+                intent_result.intent,
+                catalog=_document_catalog_summary(db),
+                cancellation_checker=cancellation_checker,
             )
             if queries:
                 rewritten_package = build_context_package(
@@ -495,7 +498,11 @@ def build_context_package(
             original_question=question, aspects=(aspect,), planner="rewrite"
         )
     else:
-        query_plan = plan_query(question, cancellation_checker=cancellation_checker)
+        query_plan = plan_query(
+            question,
+            catalog=_document_catalog_summary(db),
+            cancellation_checker=cancellation_checker,
+        )
     planning_elapsed_ms = _elapsed_ms(planning_started_at)
     _report_progress(
         progress_reporter,
@@ -638,6 +645,31 @@ def _evidence_grade(context_chunks: list[RetrievalResult]) -> str:
     if top < RELAXED_RERANK_THRESHOLD or len(context_chunks) < RELAXED_MIN_PROMPT_CHUNKS:
         return "weak"
     return "strong"
+
+
+def _document_catalog_summary(db: Session, limit: int = 60) -> str:
+    """运行时生成知识库文档清单（文件名 + 标题），供 planner/改写 prompt 使用。
+
+    动态数据（每次从 Document 表读取），非硬编码：文档增删后自动反映；
+    仅作 LLM 检索规划的提示上下文，不参与任何分数计算。
+    """
+    try:
+        documents = db.scalars(
+            select(Document)
+            .where(Document.status == "indexed")
+            .order_by(Document.filename.asc())
+            .limit(limit)
+        ).all()
+    except Exception:
+        return ""
+    lines: list[str] = []
+    for document in documents:
+        title = (document.title or "").strip()
+        if title and title != document.filename:
+            lines.append(f"- {document.filename}（{title}）")
+        else:
+            lines.append(f"- {document.filename}")
+    return "\n".join(lines)
 
 
 def _empty_context_package(question: str) -> LLMContextPackage:

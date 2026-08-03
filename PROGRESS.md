@@ -30,7 +30,9 @@
 
 **测试改造**：test_intent_router_service 整文件重写（≈17 个：3 类分类/混合归 resume_qa/LLM 失败 fallback/合并消解）；test_conversation_memory_service 删消解 5 个（持久化保留，intent 值改 resume_qa）；test_trust_enhancements 删 3 个（别名归一化/bounded lexical/身份快通道）；test_rag_api intent 断言 resume_detail→resume_qa（8 处）+ 邻块扩展 2 测试改为新行为断言；test_retrieval_service 排序断言适配 rerank 主导
 
-**遗留**：① 枚举问句 LLM planner 仍常拆 1 个宽泛 aspect（预算已放宽、检索端已配套，靠全量 rerank + prompt 容量覆盖列举）；② `.env` 的 RERANK_PROMPT_THRESHOLD=0.20 对宽泛问句偏严（枚举问句已自动降半，普通问句如觉召回不足可再校准）；③ scripts/eval_interview_set.py 新增评测脚本（A-H 8 组一键复跑）
+**动态文档清单注入（2026-08-03 追加，用户拍板）**：planner/改写 prompt 注入运行时知识库文档清单（`rag_service._document_catalog_summary` 查 Document 表拼"文件名（标题）"，动态数据非硬编码）——planner 枚举规则强化"对照清单逐项拆 aspect + 查询引用文档名/主题锚点"，prompt 显式约束清单不得输出到回答。**效果**：枚举问句 planner 从 1 个宽泛 aspect 升级为 5 个精准 aspect（每项目独立检索查询带项目名），fallback=0、5 项目全列出、文件名不泄漏；测试 258 全绿（新增 catalog 注入/空清单兼容 2 用例，mock 签名适配 catalog 参数）
+
+**遗留**：① `.env` 的 RERANK_PROMPT_THRESHOLD=0.20 对宽泛问句偏严（枚举问句已自动降半，普通问句如觉召回不足可再校准）；② scripts/eval_interview_set.py 新增评测脚本（A-H 8 组一键复跑）；③ 延迟 <6s 未达标（DeepSeek API 主导，见阶段 4 说明，`INTENT_ROUTER_MODEL` 可独立降配）
 
 ## ✅ 架构改造：从"银行可信/精确"到"简历面试宽松推理"（2026-08-02，后端 288 + 前端 44 全绿 + 端到端实测通过）
 

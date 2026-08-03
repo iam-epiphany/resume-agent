@@ -161,14 +161,14 @@ def rewritten_calls(monkeypatch):
     """Disable real intent LLM routing / planning / rewrite, returning fixed rewritten queries."""
     calls: list[str] = []
 
-    def fake_rewrite(question, intent=None, cancellation_checker=None):
+    def fake_rewrite(question, intent=None, *, catalog=None, cancellation_checker=None):
         calls.append(question)
         return list(REWRITTEN_QUERIES)
 
     monkeypatch.setattr("backend.app.services.intent_router_service.INTENT_ROUTER_ENABLED", False)
     monkeypatch.setattr(
         "backend.app.services.rag_service.plan_query",
-        lambda question, options=None, cancellation_checker=None: _plan(question),
+        lambda question, *, catalog=None, cancellation_checker=None: _plan(question),
     )
     monkeypatch.setattr("backend.app.services.rag_service.rewrite_search_queries", fake_rewrite)
     return calls

@@ -116,6 +116,7 @@ class QueryBudget:
 def plan_query(
     question: str,
     *,
+    catalog: str | None = None,
     cancellation_checker: Callable[[], None] | None = None,
 ) -> QueryPlan:
     cleaned_question = question.strip()
@@ -127,7 +128,12 @@ def plan_query(
 
     if QUERY_PLANNER_ENABLED and QUERY_PLANNER_API_KEY:
         try:
-                aspects, omitted_or_merged_items = _plan_with_llm(cleaned_question, budget, cancellation_checker=cancellation_checker)
+                aspects, omitted_or_merged_items = _plan_with_llm(
+                    cleaned_question,
+                    budget,
+                    catalog=catalog,
+                    cancellation_checker=cancellation_checker,
+                )
                 if aspects:
                     aspects = _split_merged_llm_aspects(aspects, budget)
                     budget = _budget_with_omissions(budget, omitted_or_merged_items)
@@ -479,10 +485,26 @@ def _budget_with_omissions(budget: QueryBudget, omitted_or_merged_items: list[st
     )
 
 
+def _catalog_block(catalog: str | None) -> str:
+    """把运行时知识库文档清单格式化为 prompt 段落（动态数据，非硬编码）。
+
+    清单仅用于检索规划（拆 aspect、生成带文档锚点的查询），
+    明确约束不得出现在最终回答中。
+    """
+    if not catalog:
+        return ""
+    return (
+        "知识库文档清单（运行时动态获取，仅用于检索规划：拆 aspect 时可引用文档名/主题"
+        "生成更精准的检索查询；严禁把文档清单、文件名或文档主题输出到回答内容中）：\n"
+        f"{catalog}"
+    )
+
+
 def _plan_with_llm(
     question: str,
     budget: QueryBudget,
     *,
+    catalog: str | None = None,
     cancellation_checker: Callable[[], None] | None = None,
 ) -> tuple[list[QueryAspect], list[str]]:
     messages = [
@@ -498,6 +520,8 @@ def _plan_with_llm(
                     "通用枚举规则：当问题在列举知识库可能存在的多个对象（多个项目/技能/奖项/课程等）时，"
                     "为每个对象单独生成一个 aspect，不要遗漏任何对象，不要把它们合并进一个 aspect；"
                     "即使不知道知识库具体有哪些对象，也要按对象逐个拆出 aspect。"
+                    "用户问题中提供了知识库文档清单时，若问题是在列举项目/奖项/技能等对象，"
+                    "应把清单中属于该类对象的文档逐个作为独立 aspect（aspect 的检索查询可引用对应文档名/主题）。"
                     "只输出 JSON 对象。"
                 ),
             },
@@ -521,7 +545,7 @@ def _plan_with_llm(
                     "优先生成可能出现在个人材料原文中的自然语言查询，禁止只输出关键词串，也禁止套用公文/报告术语。"
                     "evidence_need 描述要找的材料内容（如项目经历、技能清单、获奖记录、教育背景、求职意向）。"
                     "如果问题只有一个主题，也返回一个 aspect。"
-                    "示例输入：你参与过哪些项目？"
+                    "示例输入（无文档清单）：你参与过哪些项目？"
                     "示例输出：{\"aspects\":["
                     "{\"aspect_id\":\"project_experience\","
                     "\"question\":\"你参与过哪些项目？\","
@@ -532,8 +556,20 @@ def _plan_with_llm(
                     "{\"query\":\"项目 经历 参与\",\"query_type\":\"keyword_anchor\",\"rationale\":\"术语兜底\"}],"
                     "\"keywords\":[\"项目\",\"经历\",\"参与\"]}"
                     "]}\n"
+                    "示例输入（有文档清单且问题在列举项目）：你参与过哪些项目？"
+                    "示例输出：{\"aspects\":["
+                    "{\"aspect_id\":\"project_1\",\"question\":\"参与过的项目之一：高并发电商秒杀平台\","
+                    "\"evidence_need\":\"高并发电商秒杀平台项目介绍\","
+                    "\"search_queries\":[{\"query\":\"高并发电商秒杀平台 项目 技术栈 主要工作 成果\",\"query_type\":\"document_style_statement\",\"rationale\":\"对照文档清单锚定项目\"}],"
+                    "\"keywords\":[\"高并发电商秒杀平台\"]},"
+                    "{\"aspect_id\":\"project_2\",\"question\":\"参与过的项目之一：外卖平台\","
+                    "\"evidence_need\":\"外卖平台项目介绍\","
+                    "\"search_queries\":[{\"query\":\"外卖平台 项目 技术栈 主要工作 成果\",\"query_type\":\"document_style_statement\",\"rationale\":\"对照文档清单锚定项目\"}],"
+                    "\"keywords\":[\"外卖平台\"]}"
+                    "]}\n"
                     f"本次规则识别到的用户处理对象：{json.dumps(list(budget.detected_items), ensure_ascii=False)}\n"
                     "输出格式：{\"aspects\":[...],\"omitted_or_merged_items\":[]}\n\n"
+                    f"{_catalog_block(catalog)}\n"
                     f"用户问题：{question}"
                 ),
             },
@@ -908,6 +944,8 @@ _REWRITE_PROMPT = """你是简历问答系统的查询改写器。面试官的�
 def rewrite_search_queries(
     question: str,
     intent: str | None = None,
+    *,
+    catalog: str | None = None,
     cancellation_checker: Callable[[], None] | None = None,
 ) -> list[str]:
     """LLM 查询改写：把口语化问题改写成 1-3 条检索式查询。
@@ -919,7 +957,7 @@ def rewrite_search_queries(
         return _rewrite_fallback(question)
     messages = [
         {"role": "system", "content": _REWRITE_PROMPT.format(max_queries=REWRITE_MAX_QUERIES)},
-        {"role": "user", "content": f"问题：{question}"},
+        {"role": "user", "content": f"{_catalog_block(catalog)}\n问题：{question}"},
     ]
     config = ChatCompletionConfig(
         provider=QUERY_PLANNER_PROVIDER,
