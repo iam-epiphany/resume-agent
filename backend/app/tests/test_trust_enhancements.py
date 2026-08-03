@@ -10,15 +10,13 @@ from backend.app.core.database import Base
 from backend.app.models.document import Document, DocumentChunk
 from backend.app.schemas.qa import RetrievalResult
 from backend.app.services.answer_generation_service import GeneratedAnswer, generate_answer
-from backend.app.services.document_identity_query_service import answer_document_identity_question
-from backend.app.services.intent_router_service import INTENT_RESUME_DETAIL
+from backend.app.services.intent_router_service import INTENT_RESUME_QA
 from backend.app.services.retrieval_service import filter_candidates_by_metadata
 from backend.app.services.query_planner_service import QueryAspect, QuerySearchQuery
 from backend.app.services.rag_service import (
     _best_non_duplicate_candidate,
     _best_shared_candidate,
     _chunk_matches_query_aspect,
-    _normalize_exact_support_text,
 )
 from backend.app.services.vector_store_service import VectorSearchResult, _retrieval_filter
 
@@ -60,40 +58,6 @@ def test_prompt_selection_reuses_one_chunk_for_two_explicit_aspects() -> None:
     reused = _best_shared_candidate([shared], [shared], aspect)
 
     assert reused is shared
-
-
-def test_exact_support_normalization_unifies_common_project_aliases() -> None:
-    left = _normalize_exact_support_text(
-        "高并发电商秒杀平台 使用 Redis 预扣库存"
-    )
-    right = _normalize_exact_support_text(
-        "秒杀平台 使用 Redis 预扣库存"
-    )
-
-    assert left == right
-
-
-def test_prompt_aspect_gate_preserves_bounded_lexical_support() -> None:
-    aspect = QueryAspect(
-        aspect_id="material_basis",
-        question="说明项目综合评分",
-        search_queries=(QuerySearchQuery("项目综合评分", "semantic_question"),),
-        evidence_need="项目综合评分依据",
-        keywords=("并不逐字出现的长问题",),
-    )
-    chunk = RetrievalResult(
-        chunk_id="DOC-TEST-CHUNK-0001",
-        rank=1,
-        score=0.9,
-        source_doc="test.docx",
-        section_title=None,
-        section_path=[],
-        text="原文直接支持该项目的综合评分。",
-        citation_label="[1]",
-        metadata={"evidence_role": "bounded_lexical_support"},
-    )
-
-    assert _chunk_matches_query_aspect(chunk, aspect)
 
 
 @dataclass
@@ -248,36 +212,13 @@ def test_mixed_answer_returns_llm_answer_unchanged(monkeypatch) -> None:
     result = generate_answer(
         "结合材料解释表格值",
         chunks,
-        intent=INTENT_RESUME_DETAIL,
+        intent=INTENT_RESUME_QA,
     )
     assert result.answer_mode == "answered"
     assert result.evidence_sufficiency == "sufficient"
     assert result.generation_status == "completed"
     assert result.answer == "该成绩应当如实说明。"
     assert not result.answer.startswith("根据现有知识库推测")
-
-
-def test_document_identity_question_returns_explicit_unknown_without_validity_inference() -> None:
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session_factory = sessionmaker(bind=engine)
-    with session_factory() as db:
-        document = _document("DOC-IDENTITY-1", "技能掌握情况表", "")
-        document.filename = "附件1：技能掌握情况表.doc"
-        document.filename_norm = document.filename.casefold()
-        document.file_sha256 = "a" * 64
-        document.version_status = "unknown"
-        document.identity_review_status = "unreviewed"
-        db.add(document)
-        db.commit()
-        response = answer_document_identity_question(
-            db,
-            "根据知识库中的材料信息，能否确认《附件1：技能掌握情况表》的真实性？",
-        )
-    assert response is not None
-    assert response.answer_mode == "answered"
-    assert response.generation_status == "deterministic"
-    assert "已收录在知识库材料中" in str(response.answer)
 
 
 def test_prompt_core_prefers_explicit_condition_match_over_generic_higher_score() -> None:

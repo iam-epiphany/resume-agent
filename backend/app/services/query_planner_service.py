@@ -79,6 +79,7 @@ class QueryPlan:
     fallback_used: bool = False
     error: str | None = None
     budget: dict[str, Any] | None = None
+    enumerative: bool = False  # 枚举类问句（多对象列举）：检索端放宽 prompt 容量
 
     def to_debug_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +89,7 @@ class QueryPlan:
             "error": self.error,
             "budget": self.budget or {},
             "aspects": [aspect.to_debug_dict() for aspect in self.aspects],
+            "enumerative": self.enumerative,
         }
 
 
@@ -113,7 +115,6 @@ class QueryBudget:
 @timed("query_planner.total")
 def plan_query(
     question: str,
-    options: list[str] | None = None,
     *,
     cancellation_checker: Callable[[], None] | None = None,
 ) -> QueryPlan:
@@ -122,6 +123,7 @@ def plan_query(
         return QueryPlan(original_question="", aspects=(), planner="empty", fallback_used=True)
 
     budget = plan_query_budget(cleaned_question)
+    enumerative = _is_enumerative_question(cleaned_question)
 
     if QUERY_PLANNER_ENABLED and QUERY_PLANNER_API_KEY:
         try:
@@ -135,6 +137,7 @@ def plan_query(
                         planner=f"{QUERY_PLANNER_PROVIDER}:{QUERY_PLANNER_MODEL}",
                     fallback_used=False,
                     budget=budget.to_debug_dict(),
+                    enumerative=enumerative,
                 )
         except QueryPlannerError as exc:
             fallback = _fallback_aspects(cleaned_question, budget)
@@ -145,6 +148,7 @@ def plan_query(
                 fallback_used=True,
                 error=str(exc),
                 budget=budget.to_debug_dict(),
+                enumerative=enumerative,
             )
 
     return QueryPlan(
@@ -153,6 +157,7 @@ def plan_query(
         planner="fallback",
         fallback_used=True,
         budget=budget.to_debug_dict(),
+        enumerative=enumerative,
     )
 
 
@@ -168,6 +173,10 @@ def plan_query_budget(question: str) -> QueryBudget:
     desired = max(desired, len(_coordinated_aspect_questions(question)))
     desired = max(desired, _explicit_requested_aspect_count(question))
     desired = max(desired, 1)
+    # 枚举类问句（"哪些项目/有什么技能/介绍一下你的项目"）放宽预算上限：
+    # 让 LLM planner 按对象逐个拆 aspect，而非被预算压成单个宽泛 aspect
+    if _is_enumerative_question(question):
+        desired = max(desired, min(6, QUERY_PLANNER_MAX_ASPECTS))
     max_aspects = min(desired, QUERY_PLANNER_MAX_ASPECTS)
     return QueryBudget(
         detected_items=detected_items,
@@ -176,6 +185,31 @@ def plan_query_budget(question: str) -> QueryBudget:
         capacity_limited=desired > QUERY_PLANNER_MAX_ASPECTS,
         omitted_or_merged_items=detected_items[QUERY_PLANNER_MAX_ASPECTS:],
     )
+
+
+def _is_enumerative_question(question: str) -> bool:
+    """枚举问句检测（仅用于放宽 planner 预算，不参与检索/意图判定）。
+
+    识别"列举多个对象"的提问形态：对象名词 + 哪些/有什么/列举/介绍下你的 X。
+    要求带知识库对象名词，避免"哪些问题要排查"这类单主题细节问句被误判。
+    具体拆成几个 aspect 仍由 LLM 决定；这里只提高预算天花板。
+    """
+    compact = re.sub(r"\s+", "", str(question or ""))
+    objects = r"(?:项目|技能|奖项|荣誉|课程|活动|经历|证书|竞赛|比赛|成就|特长|优点|作品)"
+    # "哪些项目" / "项目有哪些" 两种语序
+    if re.search(r"(?:哪些|有哪|什么)(?:的)?(?:" + objects + r")", compact):
+        return True
+    if re.search(objects + r"(?:有哪些|有什么)", compact):
+        return True
+    if re.search(r"(?:列举|罗列|列出)", compact):
+        return True
+    if re.search(
+        r"(?:介绍|说说|讲讲|说一下)(?:一下|下)?(?:你的|您)?(?:全部|所有)?"
+        r"(?:参与|做过|获得|掌握|取得|参加)?(?:过的?)?(?:" + objects + r")",
+        compact,
+    ):
+        return True
+    return False
 
 
 def _explicit_requested_items(question: str) -> list[str]:
@@ -461,7 +495,9 @@ def _plan_with_llm(
                     "知识库内容是个人材料：简历、证书说明、荣誉奖项、教育背景、技能专长、求职意向、项目介绍等文字文档。"
                     "为向量检索生成贴近用户意图、可能命中材料原文 chunk 的自然语言查询；"
                     "不要使用公文、报告类术语改写用户问题（例如把“参与过哪些项目”改写成“支持材料/项目清单”）。"
-                    "用户枚举多个方面时（如多个项目、多项技能），原则上一项一个 aspect，不要遗漏。"
+                    "通用枚举规则：当问题在列举知识库可能存在的多个对象（多个项目/技能/奖项/课程等）时，"
+                    "为每个对象单独生成一个 aspect，不要遗漏任何对象，不要把它们合并进一个 aspect；"
+                    "即使不知道知识库具体有哪些对象，也要按对象逐个拆出 aspect。"
                     "只输出 JSON 对象。"
                 ),
             },
@@ -480,6 +516,8 @@ def _plan_with_llm(
                     f"{QUERY_PLANNER_MAX_SEARCH_QUERIES} 条 search_queries："
                     "semantic_question 贴近用户意图；document_style_statement 像简历、项目介绍、证书荣誉等材料中的自然表述；"
                     "keyword_anchor 只用少量关键术语兜底。"
+                    "每个 aspect 至少包含一条 document_style_statement 查询，保证每个被列举对象都能以"
+                    "材料原文风格的表述召回。"
                     "优先生成可能出现在个人材料原文中的自然语言查询，禁止只输出关键词串，也禁止套用公文/报告术语。"
                     "evidence_need 描述要找的材料内容（如项目经历、技能清单、获奖记录、教育背景、求职意向）。"
                     "如果问题只有一个主题，也返回一个 aspect。"
@@ -592,7 +630,7 @@ def _fallback_aspects(question: str, budget: QueryBudget | None = None) -> list[
                 aspect_id=f"aspect_{index}",
                 question=part,
                 search_queries=_fallback_search_queries(part),
-                evidence_need=_infer_evidence_type(part),
+                evidence_need="相关材料依据",
                 keywords=tuple(keywords),
             )
         )
@@ -857,24 +895,13 @@ def _keywords_from_text(text: str) -> list[str]:
     return [token for token in _dedupe(tokens) if token not in stopwords][:8]
 
 
-def _infer_evidence_type(text: str) -> str:
-    normalized = re.sub(r"\s+", "", text)
-    if any(term in normalized for term in ["保留", "依据", "材料"]):
-        return "材料依据或支持材料"
-    if any(term in normalized for term in ["怎么", "如何", "处理", "实现", "完成"]):
-        return "做法或实现方式"
-    if any(term in normalized for term in ["哪些", "情形", "条件", "口径"]):
-        return "分类条件或表述口径"
-    return "相关材料依据"
-
-
 _REWRITE_PROMPT = """你是简历问答系统的查询改写器。面试官的问题可能是口语化的，需要改写成适合向量检索的查询。
-输出 1-{max_queries} 条检索式查询（去口语、补全技术术语与项目/文档锚点，每条独立成行，不要编号）。
+输出 1-{max_queries} 条检索式查询（去口语、补全技术术语与话题锚点，每条独立成行，不要编号）。
 示例：
-问题：秒杀系统那个超卖你们到底怎么防的？
+问题：你那个项目里的库存问题最后是怎么处理的？
 改写：
-高并发电商闪购平台 秒杀 防超卖 乐观锁 Redisson 分布式锁
-Redis 预扣库存 Lua 原子扣减 一人一单
+项目 库存扣减 原子操作 数据一致性
+缓存 库存 预扣 异步落库
 只输出改写后的查询，每行一条，不要任何解释。"""
 
 
@@ -885,7 +912,7 @@ def rewrite_search_queries(
 ) -> list[str]:
     """LLM 查询改写：把口语化问题改写成 1-3 条检索式查询。
 
-    RAGFlow 语义路由简化版（技术亮点 2）：深挖/技术类问题或检索兜底链第 2 级触发。
+    检索兜底链第 2 级触发（弱证据时用 LLM 改写重试）。
     失败回退：`_fallback_search_queries` + 引号/书名号锚点。
     """
     if not (REWRITE_ENABLED and QUERY_PLANNER_API_KEY):

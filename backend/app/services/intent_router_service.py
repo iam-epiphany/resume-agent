@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""面试官意图路由：规则优先 + LLM 兜底，把问题分类到 7 类面试意图。
+"""面试官意图路由：纯 LLM 3 类意图分类 + 追问补全（一次调用合并完成）。
 
-设计动机（技术亮点 2，参考 RAGFlow 语义路由思路）：
-普通 RAG 对一切问题一视同仁地"检索+生成"，无关问题硬检索 → 高幻觉、高延迟；
-本模块把 LLM 预算花在刀刃上——寒暄/无关话题零检索零生成，自我介绍单查询锚定，
-项目深挖多查询召回，并在规则无法判定时用一次小 LLM 调用兜底。
+设计动机（认知中间层，参考主流开源 RAG 项目 Router 思路）：
+用一次小 LLM 调用完成「意图分类 + 指代消解」双职责，替代此前关键词表与
+规则预检的硬编码。任何关键词表都无法穷尽面试官的表达方式，且易误伤
+（如"你好，介绍下你的项目"曾被整题转移为寒暄）。分类失败保守回退 resume_qa，
+意图层绝不当掉任何检索机会。
 """
 
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 
 from backend.app.core.config import (
@@ -25,129 +25,52 @@ from backend.app.core.config import (
 )
 from backend.app.services.llm_client import ChatCompletionConfig, ChatCompletionError, chat_completion_content
 
-# 7 类意图
-INTENT_SELF_INTRO = "self_intro"          # 自我介绍类
-INTENT_PROJECT_DEEP_DIVE = "project_deep_dive"  # 项目深挖类
-INTENT_TECH_QUIZ = "tech_quiz"            # 技术八股/原理类
-INTENT_HR_QUALITY = "hr_quality"          # HR 素质/动机/规划类
-INTENT_RESUME_DETAIL = "resume_detail"    # 简历细节类（默认兜底）
-INTENT_GREETING = "greeting"              # 寒暄类
-INTENT_OFF_TOPIC = "off_topic"            # 完全无关类
+# 3 类意图（精简：一切可检索的问题归 resume_qa，只留寒暄/无关两个旁路）
+INTENT_RESUME_QA = "resume_qa"      # 简历问答（默认，含自我介绍/项目/技术/经历/意向等全部可检索问题）
+INTENT_GREETING = "greeting"        # 寒暄类
+INTENT_OFF_TOPIC = "off_topic"      # 完全无关类
 
 ALL_INTENTS = (
-    INTENT_SELF_INTRO,
-    INTENT_PROJECT_DEEP_DIVE,
-    INTENT_TECH_QUIZ,
-    INTENT_HR_QUALITY,
-    INTENT_RESUME_DETAIL,
+    INTENT_RESUME_QA,
     INTENT_GREETING,
     INTENT_OFF_TOPIC,
 )
-
-# 一级强规则词表（零 LLM 成本；命中即返回）。顺序即优先级。
-_RULE_ORDER = (
-    INTENT_GREETING,
-    INTENT_OFF_TOPIC,
-    INTENT_SELF_INTRO,
-    INTENT_RESUME_DETAIL,
-)
-_RULE_TERMS: dict[str, tuple[str, ...]] = {
-    INTENT_GREETING: (
-        "你好", "您好", "嗨", "哈喽", "hello", "hi", "谢谢", "感谢", "辛苦了",
-        "在吗", "在不在", "晚上好", "早上好", "下午好", "再见", "拜拜", "好的", "嗯嗯",
-    ),
-    INTENT_OFF_TOPIC: (
-        "天气", "股票", "彩票", "中奖", "政治", "明星", "八卦", "娱乐新闻", "电影推荐",
-        "帮我写", "写一首", "讲个笑话", "菜谱", "做饭", "红烧肉", "几点", "现在时间",
-        "路怎么走", "打车", "出租车", "房价", "菜价", "今天几号", "生日快乐",
-    ),
-    INTENT_SELF_INTRO: (
-        "介绍你自己", "自我介绍", "介绍一下你", "你是谁", "讲讲你", "你的情况",
-        "简单介绍", "自我介绍一下", "介绍下你", "做个自我介绍",
-    ),
-    INTENT_RESUME_DETAIL: (
-        "学校", "专业", "成绩", "绩点", "排名", "证书", "荣誉", "获奖", "竞赛", "奖项",
-        "软考", "六级", "四级", "英语", "年龄", "出生", "生日", "家乡", "籍贯",
-        "毕业", "实习", "技能", "技术栈", "学历", "考研", "奖学金", "青训营",
-        "电话", "邮箱", "github", "联系方式", "本科", "硕士", "研究生", "大学",
-        "课程", "学分", "简历", "证书编号", "什么时候",
-    ),
-}
 
 
 @dataclass(frozen=True)
 class RetrievalStrategy:
-    """意图 → 检索策略映射。"""
+    """意图 → 检索策略映射（其余字段已随词表删除，只剩礼貌转移开关）。"""
 
-    anchor_documents: tuple[str, ...] = ()   # 锚定文档（文件名/书名号），空 = 不锚定
-    rewrite: bool = False                    # 是否需要 LLM 查询改写
-    min_prompt_chunks: int = 4               # prompt 最少 chunk 数
-    direct_generation_allowed: bool = True   # 允许"直接生成 + 推测标注"
-    polite_redirect: bool = False            # 跳过检索，直接礼貌转移
+    polite_redirect: bool = False   # 跳过检索，直接礼貌转移
 
 
 @dataclass(frozen=True)
 class IntentResult:
     intent: str
-    classifier: str          # "rule" | "llm" | "fallback"
+    classifier: str          # "llm" | "fallback"
     confidence: float
     reason: str | None = None
+    rewritten_question: str = ""    # 追问补全后的独立完整问题（无需补全时与原问题一致）
+    needs_context: bool = False     # 是否参考了上一轮对话并据此补全
     strategy: RetrievalStrategy = field(default_factory=RetrievalStrategy)
 
 
 _STRATEGIES: dict[str, RetrievalStrategy] = {
-    INTENT_SELF_INTRO: RetrievalStrategy(
-        anchor_documents=("自我介绍", "简历文字版"),
-        min_prompt_chunks=4,
-    ),
-    INTENT_PROJECT_DEEP_DIVE: RetrievalStrategy(
-        rewrite=True,
-        min_prompt_chunks=6,
-    ),
-    INTENT_TECH_QUIZ: RetrievalStrategy(
-        rewrite=True,
-        min_prompt_chunks=4,
-    ),
-    INTENT_HR_QUALITY: RetrievalStrategy(
-        anchor_documents=("求职动机与职业规划", "个人特质与兴趣爱好", "自我介绍"),
-        min_prompt_chunks=4,
-    ),
-    INTENT_RESUME_DETAIL: RetrievalStrategy(min_prompt_chunks=4),
-    INTENT_GREETING: RetrievalStrategy(
-        polite_redirect=True,
-        direct_generation_allowed=False,
-    ),
-    INTENT_OFF_TOPIC: RetrievalStrategy(
-        polite_redirect=True,
-        direct_generation_allowed=False,
-    ),
+    INTENT_RESUME_QA: RetrievalStrategy(),
+    INTENT_GREETING: RetrievalStrategy(polite_redirect=True),
+    INTENT_OFF_TOPIC: RetrievalStrategy(polite_redirect=True),
 }
 
-_CLASSIFY_PROMPT = """你是简历问答系统的意图分类器。用户是面试官，问题都围绕简历主人公（张三，计算机方向求职者）。
-把问题分类到以下 7 类之一：
-- self_intro: 让候选人做自我介绍/概括自己的问题
-- project_deep_dive: 深挖某个项目（秒杀/外卖/RAG 问答/校园助手/密码算法）的技术细节、难点、实现、复盘
-- tech_quiz: 计算机技术原理/八股问题（Java/MySQL/Redis/Kafka/算法/网络等，与候选人本人经历无关）
-- hr_quality: 个人素质、优缺点、动机、职业规划、薪资、爱好、抗压、团队等
-- resume_detail: 询问简历上的具体事实（教育/成绩/证书/竞赛/技能/联系方式/时间线）
-- greeting: 寒暄问候
-- off_topic: 与简历和计算机完全无关的话题（天气/烹饪/政治/娱乐等）
-只输出 JSON：{{"intent": "<类别>", "confidence": 0.0-1.0, "reason": "<一句话理由>"}}"""
-
-
-def _rule_classify(question: str) -> IntentResult | None:
-    normalized = re.sub(r"\s+", "", question).lower()
-    for intent in _RULE_ORDER:
-        for term in _RULE_TERMS[intent]:
-            if term in normalized:
-                return IntentResult(
-                    intent=intent,
-                    classifier="rule",
-                    confidence=0.9,
-                    reason=f"命中规则词：{term}",
-                    strategy=_STRATEGIES[intent],
-                )
-    return None
+_CLASSIFY_PROMPT = """你是简历问答系统的意图分类与追问理解模块。用户（面试官）的问题都围绕简历主人公（张三，计算机方向求职者），任何关于他本人、简历或计算机领域的问题都属于可检索问题。
+把问题分类到以下 3 类之一：
+- resume_qa: 与简历主人公/简历内容/计算机技术相关的任何问题（自我介绍、项目细节、技术原理、教育经历、证书荣誉、求职意向、个人特质等全部归入此类）
+- greeting: 纯寒暄问候（如"你好""谢谢""在吗"；寒暄之后跟着实质问题则归 resume_qa）
+- off_topic: 与简历和计算机完全无关的话题（天气、烹饪、娱乐等）
+规则：
+1. 无法确定类别时一律归 resume_qa
+2. 寒暄与实质问题混合的提问一律归 resume_qa
+3. 若提供了上一轮对话且当前问题明显省略了话题（如"那怎么解决的？"指代上一轮提到的事物），必须把 rewritten_question 补全为不依赖上下文的独立完整问题；若当前问题是新话题或无需补全，rewritten_question 原样返回当前问题
+只输出 JSON：{"intent": "<类别>", "confidence": 0.0-1.0, "reason": "<一句话理由>", "rewritten_question": "<补全后的问题>", "needs_context": true/false}"""
 
 
 def _llm_config() -> ChatCompletionConfig:
@@ -161,30 +84,60 @@ def _llm_config() -> ChatCompletionConfig:
     )
 
 
-def _llm_classify(question: str) -> IntentResult | None:
+def _fallback_result(question: str) -> IntentResult:
+    return IntentResult(
+        intent=INTENT_RESUME_QA,
+        classifier="fallback",
+        confidence=0.3,
+        reason="意图分类失败，保守回退简历问答",
+        rewritten_question=question,
+        strategy=_STRATEGIES[INTENT_RESUME_QA],
+    )
+
+
+def classify_and_resolve(question: str, previous_turn: dict | None = None) -> IntentResult:
+    """意图分类 + 追问补全合并调用（一次 LLM）。
+
+    - 纯 LLM 判断，无任何关键词表；失败/坏 JSON → 保守回退 resume_qa 原问
+    - previous_turn 提供时（dict 含 question/answer_excerpt）附上轮摘录供补全
+    """
+    if not INTENT_ROUTER_ENABLED:
+        return _fallback_result(question)
+    if previous_turn:
+        user_content = (
+            f"上一轮对话：\nQ: {previous_turn.get('question') or ''}\n"
+            f"A: {(previous_turn.get('answer_excerpt') or '')[:120]}\n\n"
+            f"当前问题：{question}"
+        )
+    else:
+        user_content = f"当前问题：{question}"
     messages = [
         {"role": "system", "content": _CLASSIFY_PROMPT},
-        {"role": "user", "content": f"问题：{question}"},
+        {"role": "user", "content": user_content},
     ]
     try:
         content = chat_completion_content(
             _llm_config(), messages, temperature=0, max_tokens=INTENT_ROUTER_MAX_TOKENS
         )
     except ChatCompletionError:
-        return None
+        return _fallback_result(question)
     try:
         payload = json.loads(_extract_json_object(content))
     except (json.JSONDecodeError, ValueError):
-        return None
+        return _fallback_result(question)
     intent = str(payload.get("intent") or "").strip().lower()
     if intent not in ALL_INTENTS:
-        return None
+        # LLM 输出非法意图：回退 resume_qa 并按失败处理（保守）
+        return _fallback_result(question)
     confidence = float(payload.get("confidence") or 0.5)
+    rewritten = str(payload.get("rewritten_question") or "").strip() or question
     return IntentResult(
         intent=intent,
         classifier="llm",
         confidence=max(0.0, min(1.0, confidence)),
         reason=str(payload.get("reason") or "")[:200] or None,
+        rewritten_question=rewritten,
+        needs_context=bool(payload.get("needs_context")),
         strategy=_STRATEGIES[intent],
     )
 
@@ -196,21 +149,3 @@ def _extract_json_object(content: str) -> str:
     if start == -1 or end == -1 or end <= start:
         raise ValueError("no json object")
     return content[start : end + 1]
-
-
-def classify_intent(question: str) -> IntentResult:
-    """分类问题意图。规则优先；未命中走 LLM；LLM 失败兜底 resume_detail。"""
-    if INTENT_ROUTER_ENABLED:
-        rule_hit = _rule_classify(question)
-        if rule_hit is not None:
-            return rule_hit
-        llm_hit = _llm_classify(question)
-        if llm_hit is not None:
-            return llm_hit
-    return IntentResult(
-        intent=INTENT_RESUME_DETAIL,
-        classifier="fallback",
-        confidence=0.3,
-        reason="意图分类失败，回退简历细节类",
-        strategy=_STRATEGIES[INTENT_RESUME_DETAIL],
-    )

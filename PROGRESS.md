@@ -1,4 +1,36 @@
-# Resume-Agent 改造进度记录（2026-08-01 完成）
+# Resume-Agent 改造进度记录
+
+## ✅ 去硬编码重构：LLM 意图理解层 + 检索净化（2026-08-03，后端 256 + 前端 35 全绿 + A-H 8 组端到端评测通过）
+
+**需求**：多轮专项修改积累了大量针对当前简历材料写死的"取巧"逻辑，绕过 RAG 检索——关键词表判意图、身份快通道拼字符串、文件名强插项目枚举、词法子串伪造 rerank 分、邻块/兄弟文档词法补充。用户拍板：加 LLM 认知中间层替代硬编码，并彻查所有类似情况。
+
+**核心决策（用户拍板）**：① 知识库 13 篇文档内嵌"面试追问 FAQ"段全部删除；② 意图理解纯 LLM（删光关键词表，失败保守默认 resume_qa）；③ 意图粒度精简为 3 类（resume_qa/greeting/off_topic）；④ 证书"真实性/有效期"确定性快通道删除，统一走 RAG。
+
+**阶段 0 知识库净化**：13 篇文档删 `## .*FAQ` 段（技能专长 72 行八股问答在内）→ `upload_knowledge_base.py` 重建索引（16 文档，sha256 自动覆盖）→ 无 FAQ 基线评测：C 组八股（Kafka 不丢消息/B+ 树索引）从"精确"变 hedged/partial"根据现有知识库推测"合规标注，B 组技术追问（秒杀防超卖/Redis 预扣/Redisson 锁失效）仍 answered/sufficient（项目文档事实章节本身含答案）。
+
+**阶段 1 意图层**：
+- `intent_router_service.py` 整文件重写：7 类 → 3 类常量；删 `_RULE_ORDER`/`_RULE_TERMS`/`_rule_classify`/RetrievalStrategy 未消费字段；新增 `classify_and_resolve(question, previous_turn)`——一次 LLM 调用合并「3 类分类 + 追问补全」（输出 intent/confidence/reason/rewritten_question/needs_context），失败/坏 JSON 保守回退 resume_qa 原问；分类 prompt 不内嵌项目名单，寒暄+实质问题混合归 resume_qa，无法确定归 resume_qa
+- `conversation_memory_service.py` 瘦身：删 `_INTERPOLATION_MARKERS`/`_needs_disambiguation`/`_llm_resolve`/`_DISAMBIGUATION_PROMPT`/`resolve_question`（消解职责移交意图路由），保留 recent_turns/record_turn/purge_expired 持久化
+- `document_identity_query_service.py` 整文件删除（+ rag_service import/调用块/qa_identity_answered 审计分支）
+- `rag_service.answer_question` 新流程：① classify_and_resolve（有上一轮才附上轮摘录）→ ② greeting/off_topic 礼貌转移（话术不变，触发源从规则表变 LLM）→ ③ resume_qa 全 RAG 主链 → ④ 单次自评生成
+- config `INTENT_ROUTER_MAX_TOKENS` 160→300（rewritten_question 需要）
+- 实测回归：`你好，介绍下你的项目` 走完整 RAG（旧规则整题转移寒暄）；`软考证书是真的吗还有效吗` 走 RAG+推测标注（旧快通道拼字符串）；寒暄/无关 LLM 触发转移正确；H 组追问链补全连贯（"那 Redis 呢？"正确补全）；H4"会打篮球吗？"由硬转移改进为合理推测回答
+
+**阶段 2 检索净化（最风险）**：
+- rag_service 删 A5 枚举强插（`_ensure_project_documents_covered` 12 短语+文件名直取）、A6 词法逃生通道（`_bounded_document_lexical_support_matches` 等 6 函数，字符子串伪造 rerank 0.88+ 注入）、A6b 邻块扩展整链（`_expand_neighbor_matches`/`_neighbor_candidates`/`_neighbor_relevance`/`_match_from_chunk` 等 5 函数）、A7 兄弟文档词法补充（`_recover_missing_aspects_from_sibling_documents`）；共删 22 个函数；`_normalize_exact_support_text` 删项目名别名表只留空白/标点归一化；`_prompt_aspect_coverage_terms` 删词法命中动词表；三处角色放行名单只留 `dynamic_table_evidence`（顺带清 formula_target_support 死角色）
+- retrieval_service：question_terms 70+ 简历领域词表 + `_expanded_domain_terms` 同义扩展表 → **通用分词器**（书名号/引号整体保留 + CJK 2-gram + 字母数字 token + 停用词表，零同义替换）；`_normalize_for_match` 只留空白折叠；`_should_enforce_diversity` 删除（多样性无条件生效）；删 `_is_comparison_question` 死码；**`_rank_key` 移除 direct_evidence 权重 3.0**（rerank 主导——测试暴露词表删除后 3.0 放大噪声，验证后拍板）
+- planner 枚举规则：prompt 增加"对象未知也要按对象逐个拆 aspect + 每 aspect 至少 1 条 document_style_statement 查询"；`plan_query_budget` 对枚举问句（对象名词+哪些/有什么/介绍下你的 X）放宽 max_aspects；`QueryPlan.enumerative` 标志贯通
+- 检索端枚举配套：枚举问句**全量 rerank**（70 候选不截断，否则秒杀/REV 被 fusion 截断挤出）、prompt 容量放宽（forced_minimum 补到 12）、补选门槛降为 RERANK_PROMPT_THRESHOLD*0.5（0.2 绝对门槛挡掉 rerank 0.05-0.19 的项目简介块）、终检 `_filter_prompt_relevance` 枚举放行
+- 环境修复：**tokenizers 0.20.3 → 0.22+**（transformers 4.57.6 要求 tokenizers>=0.22，FlagModel 导入失败导致 embedding 全 503）
+- 实测：列举类问题（"你参与过哪些项目"/"介绍一下你的项目经历"/"你做过哪些项目"）5 个项目全部列出（fallback=0 单次检索足够）；A/B/E 组复测正常；兜底链人工用例正常
+
+**阶段 3 Prompt 泛化 + 收尾**：prompt_builder CORE_RAG_RULES 第 5 条泛化（"把检索到的全部相关材料一并列出；只列检索到的内容，不得补充知识库外的项目"——去 `项目介绍_*.md` 文件名约定）；`_REWRITE_PROMPT` 示例改通用（去秒杀/乐观锁/Redisson/Lua）；删 `_infer_evidence_type`（fallback 一律"相关材料依据"）；`plan_query` 删 options 死参数
+
+**阶段 4 全量回归**：后端 pytest 256 全绿；前端 35 全绿 + tsc + build 通过；A-H 8 组端到端评测复跑（43 问 0 异常：answered 31/hedged 5/redirected 7，3 类意图分类全对，H 组 4 条追问链补全连贯，枚举列举 5 项目全列出）；tech-highlights.md/README/PROGRESS.md/模块 docstring 更新（"规则优先/锚定文档"描述全部失效）。**延迟审计**：43 问中 11 问 <6s、32 问 6-41s——未达 <6s 目标，但与无 FAQ 基线持平（基线微信支付回调 34.4s/缓存穿透 35.2s），属 DeepSeek API 延迟主导（每问 3 次 LLM 调用：意图+planner+生成），非本次改造引入（合并消解使每问 LLM 调用从 4 次减到 3 次）；可调项：`INTENT_ROUTER_MODEL` 独立指向更快小模型（config 已支持）
+
+**测试改造**：test_intent_router_service 整文件重写（≈17 个：3 类分类/混合归 resume_qa/LLM 失败 fallback/合并消解）；test_conversation_memory_service 删消解 5 个（持久化保留，intent 值改 resume_qa）；test_trust_enhancements 删 3 个（别名归一化/bounded lexical/身份快通道）；test_rag_api intent 断言 resume_detail→resume_qa（8 处）+ 邻块扩展 2 测试改为新行为断言；test_retrieval_service 排序断言适配 rerank 主导
+
+**遗留**：① 枚举问句 LLM planner 仍常拆 1 个宽泛 aspect（预算已放宽、检索端已配套，靠全量 rerank + prompt 容量覆盖列举）；② `.env` 的 RERANK_PROMPT_THRESHOLD=0.20 对宽泛问句偏严（枚举问句已自动降半，普通问句如觉召回不足可再校准）；③ scripts/eval_interview_set.py 新增评测脚本（A-H 8 组一键复跑）
 
 ## ✅ 架构改造：从"银行可信/精确"到"简历面试宽松推理"（2026-08-02，后端 288 + 前端 44 全绿 + 端到端实测通过）
 

@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, load_only
 
 from backend.app.core.config import (
+    CONVERSATION_MEMORY_MAX_TURNS,
     DOCUMENT_SNAPSHOT_CACHE_MAX_DOCUMENTS,
     DOCUMENT_SNAPSHOT_CACHE_TTL_SECONDS,
     FALLBACK_DIRECT_GENERATION_ENABLED,
@@ -42,9 +43,8 @@ from backend.app.schemas.qa import (
 )
 from backend.app.services.audit_service import record_event
 from backend.app.services.answer_generation_service import generate_answer
-from backend.app.services.conversation_memory_service import record_turn, resolve_question
-from backend.app.services.document_identity_query_service import answer_document_identity_question
-from backend.app.services.intent_router_service import classify_intent
+from backend.app.services.conversation_memory_service import record_turn, recent_turns
+from backend.app.services.intent_router_service import classify_and_resolve
 from backend.app.services.query_planner_service import (
     QueryAspect,
     QueryPlan,
@@ -134,6 +134,78 @@ class AspectRetrieval:
 
 
 @trace_operation("qa")
+def _chunks_by_document(
+    db: Session,
+    document_ids: set[str],
+    document_chunk_cache: dict[str, list[_DocumentChunkSnapshot]] | None = None,
+) -> dict[str, list[_DocumentChunkSnapshot]]:
+    if not document_ids:
+        return {}
+    cache = document_chunk_cache if document_chunk_cache is not None else {}
+    now = monotonic()
+    missing_ids = set(document_ids).difference(cache)
+    with _DOCUMENT_SNAPSHOT_CACHE_LOCK:
+        for document_id in list(missing_ids):
+            cached = _DOCUMENT_SNAPSHOT_CACHE.get(document_id)
+            if cached is None:
+                continue
+            cached_at, chunks = cached
+            if now - cached_at > DOCUMENT_SNAPSHOT_CACHE_TTL_SECONDS:
+                _DOCUMENT_SNAPSHOT_CACHE.pop(document_id, None)
+                continue
+            _DOCUMENT_SNAPSHOT_CACHE.move_to_end(document_id)
+            cache[document_id] = chunks
+            missing_ids.remove(document_id)
+    if missing_ids:
+        with measure("rag.document_snapshot_fetch"):
+            chunk_models = db.scalars(
+                select(DocumentChunk)
+                .options(
+                    load_only(
+                        DocumentChunk.id,
+                        DocumentChunk.chunk_id,
+                        DocumentChunk.document_id,
+                        DocumentChunk.text,
+                        DocumentChunk.embedding_text,
+                        DocumentChunk.chunk_metadata,
+                        DocumentChunk.index_status,
+                        DocumentChunk.source_file,
+                        DocumentChunk.page_number,
+                        DocumentChunk.section_title,
+                    )
+                )
+                .where(DocumentChunk.document_id.in_(missing_ids))
+                .order_by(DocumentChunk.document_id.asc(), DocumentChunk.id.asc())
+            ).all()
+        chunks = [
+            _DocumentChunkSnapshot(
+                id=chunk.id,
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                embedding_text=chunk.embedding_text,
+                chunk_metadata=chunk.chunk_metadata,
+                index_status=chunk.index_status,
+                source_file=chunk.source_file,
+                page_number=chunk.page_number,
+                section_title=chunk.section_title,
+            )
+            for chunk in chunk_models
+        ]
+        for document_id in missing_ids:
+            cache[document_id] = []
+        for chunk in chunks:
+            cache.setdefault(chunk.document_id, []).append(chunk)
+        with _DOCUMENT_SNAPSHOT_CACHE_LOCK:
+            for document_id in missing_ids:
+                _DOCUMENT_SNAPSHOT_CACHE[document_id] = (now, cache.get(document_id, []))
+                _DOCUMENT_SNAPSHOT_CACHE.move_to_end(document_id)
+            while len(_DOCUMENT_SNAPSHOT_CACHE) > DOCUMENT_SNAPSHOT_CACHE_MAX_DOCUMENTS:
+                _DOCUMENT_SNAPSHOT_CACHE.popitem(last=False)
+    return {document_id: cache.get(document_id, []) for document_id in document_ids}
+
+
+
 def answer_question(
     db: Session,
     question: str,
@@ -150,20 +222,23 @@ def answer_question(
         return QAResponse(answer=None, answer_mode="failed", generation_status="skipped", context_package=None)
     original_question = cleaned_question
 
-    # 身份快通道（证书真实性/有效期类问题，保留确定性回答）
-    identity_response = answer_document_identity_question(db, cleaned_question)
-    if identity_response is not None:
-        _save_qa_log(db, original_question, identity_response)
-        _log_qa_audit(db, "qa_identity_answered", original_question, identity_response)
-        return identity_response
-
-    # ① 意图分类（规则优先 + LLM 兜底）
+    # ① 意图分类 + 追问补全（一次 LLM 调用双职责；失败保守回退 resume_qa 原问）
     intent_started_at = perf_counter()
     _report_progress(
         progress_reporter,
         {"stage": "intent", "status": "running", "title": "正在识别问题意图", "detail": "正在判断问题类型并选择回答策略……"},
     )
-    intent_result = classify_intent(cleaned_question)
+    memory_turns = recent_turns(db, session_id, limit=CONVERSATION_MEMORY_MAX_TURNS) if session_id else []
+    previous_turn = memory_turns[-1] if memory_turns else None
+    intent_result = classify_and_resolve(cleaned_question, previous_turn)
+    resolved_question = cleaned_question
+    if (
+        intent_result.needs_context
+        and intent_result.rewritten_question
+        and intent_result.rewritten_question != cleaned_question
+    ):
+        resolved_question = intent_result.rewritten_question
+    used_memory = resolved_question != cleaned_question
     _report_progress(
         progress_reporter,
         {
@@ -177,17 +252,18 @@ def answer_question(
                 "classifier": intent_result.classifier,
                 "confidence": intent_result.confidence,
                 "reason": intent_result.reason,
+                "rewritten_question": intent_result.rewritten_question,
+                "used_memory": used_memory,
             },
         },
     )
 
-    # ② 多轮追问记忆（指代消解）
+    # ② 多轮追问记忆（消解已在意图调用中完成，此处仅汇报上下文使用情况）
     memory_started_at = perf_counter()
     _report_progress(
         progress_reporter,
         {"stage": "memory", "status": "running", "title": "正在结合上下文理解追问", "detail": "正在检查追问是否依赖上一轮对话……"},
     )
-    resolved_question, used_memory, _memory_turns = resolve_question(db, session_id, cleaned_question)
     _report_progress(
         progress_reporter,
         {
@@ -419,7 +495,7 @@ def build_context_package(
             original_question=question, aspects=(aspect,), planner="rewrite"
         )
     else:
-        query_plan = plan_query(question, options=options, cancellation_checker=cancellation_checker)
+        query_plan = plan_query(question, cancellation_checker=cancellation_checker)
     planning_elapsed_ms = _elapsed_ms(planning_started_at)
     _report_progress(
         progress_reporter,
@@ -509,10 +585,6 @@ def build_context_package(
             },
         },
     )
-    # 列举类问题（"介绍你的项目/哪些项目/项目经历"）文档级覆盖补全：
-    # 向量检索可能只命中部分项目文档，把缺失的《项目介绍_*.md》文档 chunk 补进上下文，
-    # 保证 LLM 能列出全部项目（技术亮点：枚举召回兜底）
-    context_chunks, _project_covered_added = _ensure_project_documents_covered(db, question, context_chunks)
     diagnostics = _aggregate_aspect_diagnostics(aspect_retrievals)
     retrieval_summary = _build_retrieval_summary(
         question,
@@ -552,73 +624,6 @@ def build_context_package(
         retrieval_summary=retrieval_summary,
         context_chunks=context_chunks,
         llm_prompt=prompt,
-    )
-
-
-_PROJECT_DOC_PREFIX = "项目介绍_"
-_ENUMERATION_PATTERNS = (
-    "哪些项目", "项目经历", "做过哪些", "项目有哪些", "介绍你的项目", "介绍下你的项目",
-    "所有项目", "参与过哪些", "项目都有", "做过什么项目", "有什么项目", "介绍一下你的项目",
-)
-
-
-def _is_enumeration_question(question: str) -> bool:
-    normalized = re.sub(r"\s+", "", str(question or ""))
-    return any(pattern in normalized for pattern in _ENUMERATION_PATTERNS)
-
-
-def _ensure_project_documents_covered(
-    db: Session,
-    question: str,
-    context_chunks: list[RetrievalResult],
-) -> tuple[list[RetrievalResult], list[RetrievalResult]]:
-    """列举类问题：确保每个项目文档的"开头简介块"都进入上下文。
-
-    向量检索对"介绍你的项目"这类宽泛问题常只召回部分项目文档（且召回的
-    可能是 FAQ/选型等非简介块），导致 LLM 只能列出被检索到的项目。
-    此处对每个《项目介绍_*.md》文档取头部 2 块（文档开头=项目简介），
-    若不在上下文中则直接补入（chunk_id 去重）。
-    """
-    if not _is_enumeration_question(question):
-        return context_chunks, []
-    existing_ids = {chunk.chunk_id for chunk in context_chunks}
-    project_docs = db.scalars(
-        select(Document).where(
-            Document.status == "indexed",
-            Document.filename.like(f"{_PROJECT_DOC_PREFIX}%"),
-        )
-    ).all()
-    added: list[RetrievalResult] = []
-    for doc in project_docs:
-        chunks = db.scalars(
-            select(DocumentChunk)
-            .where(DocumentChunk.document_id == doc.document_id)
-            .order_by(DocumentChunk.id.asc())
-            .limit(2)
-        ).all()
-        for chunk in chunks[:2]:
-            if chunk.chunk_id in existing_ids:
-                continue
-            existing_ids.add(chunk.chunk_id)
-            added.append(_project_chunk_to_result(doc, chunk))
-    if not added:
-        return context_chunks, []
-    merged = list(context_chunks) + added
-    _renumber_context_chunks(merged)
-    return merged, added
-
-
-def _project_chunk_to_result(document: Document, chunk: DocumentChunk) -> RetrievalResult:
-    return RetrievalResult(
-        chunk_id=chunk.chunk_id,
-        rank=0,
-        score=0.5,
-        source_doc=document.filename,
-        section_title=chunk.section_title or None,
-        section_path=[],
-        text=chunk.text,
-        citation_label=f"[{document.filename}]",
-        metadata={"evidence_role": "project_enumeration_cover", "rerank_score": 0.5},
     )
 
 
@@ -704,12 +709,7 @@ def _retrieve_aspects(
             aspect,
             progress_reporter=progress_reporter,
             document_chunk_cache=document_chunk_cache,
-        )
-        matches = _expand_neighbor_matches(
-            db,
-            aspect.question,
-            matches,
-            document_chunk_cache=document_chunk_cache,
+            enumerative=query_plan.enumerative,
         )
         candidates = _to_retrieval_results(matches)
         for candidate in candidates:
@@ -753,11 +753,6 @@ def _retrieve_aspects(
                 },
             },
         )
-    _recover_missing_aspects_from_sibling_documents(
-        db,
-        aspect_retrievals,
-        document_chunk_cache=document_chunk_cache,
-    )
     retrieval_elapsed_ms = _elapsed_ms(retrieval_started_at)
     retrieved_aspect_count = sum(1 for item in aspect_retrievals if item.retrieval_covered)
     candidate_count = sum(len(item.candidates) for item in aspect_retrievals)
@@ -783,111 +778,31 @@ def _retrieve_aspects(
     return aspect_retrievals
 
 
-def _recover_missing_aspects_from_sibling_documents(
-    db: Session,
-    aspect_retrievals: list[AspectRetrieval],
-    *,
-    document_chunk_cache: dict[str, list[DocumentChunk]],
-) -> None:
-    """Supplement a sub-question inside documents found for its siblings.
+def _document_style_evidence_score(candidate: Any, aspect: QueryAspect) -> float:
+    statements = [
+        statement.strip()
+        for search_query in aspect.search_queries
+        if search_query.query_type == "document_style_statement"
+        for statement in search_query.query.splitlines()
+        if statement.strip()
+    ]
+    if not statements:
+        return 0.0
+    evidence_text = "\n".join(
+        part
+        for part in (
+            candidate.filename,
+            candidate.section_title or "",
+            candidate.embedding_text or "",
+            candidate.text,
+        )
+        if part
+    )
+    return max(
+        evidence_coverage(question_terms(statement), evidence_text)
+        for statement in statements
+    )
 
-    Cross-document questions often identify a source through one sub-question
-    while a short definition sub-question has no metadata of its own.  A weak
-    but non-empty retrieval is not proof that the needed clause was found, so
-    this pass also supplements already-covered aspects when a sibling document
-    contains stronger direct lexical support.  It searches only documents
-    already retrieved for the same request; it never scans the corpus or
-    evaluator answers.
-    """
-
-    if len(aspect_retrievals) < 2:
-        return
-    documents_by_aspect: list[list[str]] = []
-    for retrieval in aspect_retrievals:
-        documents_by_aspect.append(
-            list(
-                dict.fromkeys(
-                    str(candidate.metadata.get("document_id") or "")
-                    for candidate in retrieval.candidates
-                    if candidate.metadata.get("document_id")
-                )
-            )[:4]
-        )
-    # Round-robin selection prevents the first broad aspect from consuming the
-    # whole bounded scope before later, more source-specific aspects contribute.
-    request_document_ids: list[str] = []
-    for rank in range(4):
-        for document_ids in documents_by_aspect:
-            if rank < len(document_ids) and document_ids[rank] not in request_document_ids:
-                request_document_ids.append(document_ids[rank])
-            if len(request_document_ids) >= 12:
-                break
-        if len(request_document_ids) >= 12:
-            break
-    if not request_document_ids:
-        return
-    for retrieval, own_document_ids in zip(aspect_retrievals, documents_by_aspect, strict=True):
-        sibling_document_ids = set(request_document_ids) - set(own_document_ids)
-        if not sibling_document_ids:
-            continue
-        matches = _bounded_document_lexical_support_matches(
-            db,
-            retrieval.aspect,
-            [],
-            document_ids=sibling_document_ids,
-            document_chunk_cache=document_chunk_cache,
-        )
-        if not matches:
-            continue
-        matches = _expand_neighbor_matches(
-            db,
-            retrieval.aspect.question,
-            matches,
-            document_chunk_cache=document_chunk_cache,
-        )
-        candidates = _to_retrieval_results(matches)
-        for candidate in candidates:
-            candidate.metadata["aspect_id"] = retrieval.aspect.aspect_id
-            candidate.metadata["aspect_question"] = retrieval.aspect.question
-            candidate.metadata["aspect_search_queries"] = _search_query_debug_list(
-                retrieval.aspect
-            )
-            candidate.metadata["expected_evidence_type"] = retrieval.aspect.expected_evidence_type
-            candidate.metadata["evidence_need"] = retrieval.aspect.evidence_need
-            candidate.metadata.setdefault(
-                "prompt_matched_aspects", [retrieval.aspect.aspect_id]
-            )
-        valid_candidates, citation_validation = _validate_context_chunks(db, candidates)
-        if not valid_candidates:
-            continue
-        recovered_chunk_ids = {candidate.chunk_id for candidate in valid_candidates}
-        retrieval.candidates = valid_candidates + [
-            candidate
-            for candidate in retrieval.candidates
-            if candidate.chunk_id not in recovered_chunk_ids
-        ]
-        retrieval.citation_validation = {
-            "checked_chunks": int(retrieval.citation_validation.get("checked_chunks") or 0)
-            + int(citation_validation.get("checked_chunks") or 0),
-            "valid_chunks": int(retrieval.citation_validation.get("valid_chunks") or 0)
-            + int(citation_validation.get("valid_chunks") or 0),
-            "invalid_chunks": int(retrieval.citation_validation.get("invalid_chunks") or 0)
-            + int(citation_validation.get("invalid_chunks") or 0),
-            "invalid_chunk_ids": [
-                *retrieval.citation_validation.get("invalid_chunk_ids", []),
-                *citation_validation.get("invalid_chunk_ids", []),
-            ],
-        }
-        retrieval.retrieval_covered = True
-        retrieval.diagnostics.append(
-            {
-                "query_type": "sibling_document_lexical_recovery",
-                "search_query": retrieval.aspect.question,
-                "document_scope_count": len(sibling_document_ids),
-                "match_count": len(valid_candidates),
-                "recovery_mode": "supplemented" if own_document_ids else "recovered",
-            }
-        )
 
 
 def _retrieve_aspect_matches(
@@ -895,6 +810,8 @@ def _retrieve_aspect_matches(
     aspect: QueryAspect,
     progress_reporter: ProgressReporter | None = None,
     document_chunk_cache: dict[str, list[DocumentChunk]] | None = None,
+    *,
+    enumerative: bool = False,
 ) -> tuple[list[RetrievalMatch], list[dict[str, Any]]]:
     if retrieve_citations is not _DEFAULT_RETRIEVE_CITATIONS:
         return _retrieve_aspect_matches_legacy_hook(db, aspect, progress_reporter)
@@ -951,7 +868,7 @@ def _retrieve_aspect_matches(
     # ``candidates`` is already ordered by weighted RRF above.  Re-sorting it
     # by one raw vector score here would undo multi-query fusion and starve
     # exact option/statement hits in long documents before cross-encoding.
-    effective_rerank_limit = _effective_rerank_candidate_limit(candidates)
+    effective_rerank_limit = _effective_rerank_candidate_limit(candidates, enumerative=enumerative)
     rerank_input = limit_rerank_candidates(
         candidates,
         preserve_order=True,
@@ -1004,33 +921,6 @@ def _retrieve_aspect_matches(
         match.metadata["fusion_method"] = ASPECT_QUERY_FUSION_METHOD
         match.metadata["expected_evidence_type"] = aspect.expected_evidence_type
         match.metadata["evidence_need"] = aspect.evidence_need
-
-    lexical_scope_document_ids: set[str] = set()
-    lexical_scope_document_ids.update(
-        _candidate_document_id(item.candidate)
-        for item in reranked[:24]
-        if _candidate_document_id(item.candidate)
-    )
-    # Keep the clause-recovery pass inside documents already recalled by
-    # dense/sparse/hybrid retrieval.  Missing aspects are recovered by the
-    # generic planner split and their own hybrid queries; lexical support only
-    # repairs within-document clause ranking and must not become a second
-    # unbounded retriever.
-    lexical_support_matches = _bounded_document_lexical_support_matches(
-        db,
-        aspect,
-        matches,
-        document_ids=lexical_scope_document_ids,
-        document_chunk_cache=document_chunk_cache,
-    )
-    if lexical_support_matches:
-        best_fusion = max(fusion_scores.values(), default=0.0)
-        for offset, supplement in enumerate(lexical_support_matches, start=1):
-            fusion_scores[supplement.citation.chunk_id] = best_fusion + 0.01 - offset * 0.0001
-        existing_chunk_ids = {match.citation.chunk_id for match in lexical_support_matches}
-        matches = lexical_support_matches + [
-            match for match in matches if match.citation.chunk_id not in existing_chunk_ids
-        ]
 
     for item in diagnostics_by_query:
         chunk_ids_for_query = {
@@ -1277,342 +1167,18 @@ def _rerank_query_for_aspect(aspect: QueryAspect) -> str:
     return "\n".join([aspect.question, *evidence_queries])
 
 
-def _effective_rerank_candidate_limit(candidates: list[Any]) -> int:
+def _effective_rerank_candidate_limit(candidates: list[Any], *, enumerative: bool = False) -> int:
+    if enumerative:
+        # 枚举问句（多对象列举）：候选截断会把部分对象的材料挤出 rerank，
+        # 全量参与重排，保证每个被列举对象都有机会进入 prompt
+        return len(candidates)
     if len(candidates) <= CONSTRAINED_RERANK_CANDIDATE_LIMIT:
         return len(candidates)
     return max(CONSTRAINED_RERANK_CANDIDATE_LIMIT, min(len(candidates), MCQ_RERANK_CANDIDATE_LIMIT))
 
-
-def _document_style_evidence_score(candidate: Any, aspect: QueryAspect) -> float:
-    statements = [
-        statement.strip()
-        for search_query in aspect.search_queries
-        if search_query.query_type == "document_style_statement"
-        for statement in search_query.query.splitlines()
-        if statement.strip()
-    ]
-    if not statements:
-        return 0.0
-    evidence_text = "\n".join(
-        part
-        for part in (
-            candidate.filename,
-            candidate.section_title or "",
-            candidate.embedding_text or "",
-            candidate.text,
-        )
-        if part
-    )
-    return max(
-        evidence_coverage(question_terms(statement), evidence_text)
-        for statement in statements
-    )
-
-
-def _direct_exact_support_match(
-    chunk: Any,
-    document_chunks: list[Any],
-    aspect: QueryAspect,
-    anchor: str,
-    support_score: float,
-) -> RetrievalMatch:
-    previous_chunk_id, next_chunk_id = _adjacent_chunk_ids(chunk, document_chunks)
-    section_number = _section_number(chunk.section_title)
-    text = _clean_chunk_text(chunk.text, chunk.section_title)
-    normalized_score = min(0.99, 0.88 + min(support_score, 2.0) * 0.05)
-    return RetrievalMatch(
-        citation=Citation(
-            document_id=chunk.document_id,
-            chunk_id=chunk.chunk_id,
-            filename=chunk.source_file or "",
-            section_title=chunk.section_title,
-            section_path=_inferred_section_path(chunk, document_chunks),
-            section_number=section_number,
-            parent_section_number=_parent_section_number(section_number),
-            previous_chunk_id=previous_chunk_id,
-            next_chunk_id=next_chunk_id,
-            page_number=chunk.page_number,
-            excerpt=text,
-            score=normalized_score,
-            rerank_score=normalized_score,
-            chunk_type=_chunk_type(chunk.text),
-            evidence_role="exact_anchor_support",
-        ),
-        score=normalized_score,
-        rerank_score=normalized_score,
-        coverage_score=evidence_coverage(
-            question_terms(aspect.question),
-            f"{chunk.section_title or ''}\n{chunk.embedding_text or ''}\n{text}",
-        ),
-        evidence_role="exact_anchor_support",
-        evidence_text=text,
-        metadata={
-            **_chunk_metadata(chunk),
-            "aspect_id": aspect.aspect_id,
-            "aspect_question": aspect.question,
-            "aspect_search_queries": _search_query_debug_list(aspect),
-            "expected_evidence_type": aspect.expected_evidence_type,
-            "evidence_need": aspect.evidence_need,
-            "evidence_role": "exact_anchor_support",
-            "exact_support_anchor": anchor,
-            "exact_support_score": round(support_score, 4),
-            "fusion_method": "bounded_document_exact_anchor",
-        },
-    )
-
-
-def _bounded_document_lexical_support_matches(
-    db: Session,
-    aspect: QueryAspect,
-    matches: list[RetrievalMatch],
-    *,
-    document_ids: set[str],
-    document_chunk_cache: dict[str, list[DocumentChunk]] | None = None,
-) -> list[RetrievalMatch]:
-    """Recover strongly overlapping clauses inside metadata-resolved documents.
-
-    This is intentionally bounded by document identity.  It is a generic
-    safeguard for long materials where a title filter resolves correctly
-    but vector retrieval misses one clause of a compound question.  It never
-    searches evaluator answers and does not broaden an explicit document
-    scope to the full corpus.
-    """
-
-    if not hasattr(db, "scalars"):
-        return []
-    scope_document_ids = set(document_ids) or {
-        match.citation.document_id for match in matches[:24] if match.citation.document_id
-    }
-    if not scope_document_ids:
-        return []
-    phrases = _bounded_lexical_phrases(aspect)
-    if not phrases:
-        return []
-    required_numeric_terms = _bounded_required_numeric_terms(aspect)
-    chunks_by_document = _chunks_by_document(
-        db,
-        scope_document_ids,
-        document_chunk_cache=document_chunk_cache,
-    )
-    existing_ids = {match.citation.chunk_id for match in matches}
-    supplements: list[tuple[float, int, RetrievalMatch]] = []
-    seen_ids: set[str] = set()
-    for phrase in phrases:
-        normalized_phrase = _normalize_exact_support_text(phrase)
-        if len(normalized_phrase) < 6:
-            continue
-        best: tuple[float, Any, list[Any]] | None = None
-        for document_chunks in chunks_by_document.values():
-            for chunk in document_chunks:
-                if chunk.index_status != "indexed":
-                    continue
-                searchable = "\n".join(
-                    part
-                    for part in (
-                        chunk.section_title or "",
-                        chunk.text or chunk.embedding_text or "",
-                    )
-                    if part
-                )
-                normalized_searchable = _normalize_exact_support_text(searchable)
-                if required_numeric_terms and not all(
-                    _normalize_exact_support_text(term) in normalized_searchable
-                    for term in required_numeric_terms
-                ):
-                    continue
-                recall = _exact_support_recall(phrase, searchable)
-                exact = normalized_phrase in normalized_searchable
-                definition = bool(
-                    exact
-                    and any(
-                        marker in normalized_searchable
-                        for marker in (
-                            f"本办法所称{normalized_phrase}",
-                            f"所称{normalized_phrase}",
-                            f"{normalized_phrase}是指",
-                            f"{normalized_phrase}是以",
-                        )
-                    )
-                )
-                critical = _critical_lexical_terms(phrase)
-                critical_hits = sum(
-                    _normalize_exact_support_text(term) in normalized_searchable for term in critical
-                )
-                critical_ratio = critical_hits / len(critical) if critical else 0.0
-                qualifies = exact or recall >= 0.72 or (recall >= 0.58 and critical_ratio >= 0.75)
-                if not qualifies:
-                    continue
-                score = (
-                    recall
-                    + (0.35 if exact else 0.0)
-                    + (1.0 if definition else 0.0)
-                    + critical_ratio * 0.2
-                )
-                if best is None or score > best[0]:
-                    best = (score, chunk, document_chunks)
-        if best is None:
-            continue
-        score, chunk, document_chunks = best
-        if chunk.chunk_id in seen_ids:
-            continue
-        # Existing direct matches do not need to be duplicated, unless the
-        # bounded pass found an exact clause that should be promoted ahead of
-        # a low-ranked vector result.
-        seen_ids.add(chunk.chunk_id)
-        supplement = _direct_exact_support_match(chunk, document_chunks, aspect, phrase, score)
-        supplement.citation.evidence_role = "bounded_lexical_support"
-        supplement.evidence_role = "bounded_lexical_support"
-        supplement.metadata["evidence_role"] = "bounded_lexical_support"
-        supplement.metadata["fusion_method"] = "bounded_document_lexical_support"
-        supplement.metadata["lexical_support_phrase"] = phrase
-        supplement.metadata["promoted_existing_match"] = chunk.chunk_id in existing_ids
-        supplements.append((score, len(normalized_phrase), supplement))
-    supplements.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [item[2] for item in supplements[:6]]
-def _bounded_lexical_phrases(aspect: QueryAspect) -> list[str]:
-    candidates = [
-        search_query.query
-        for search_query in aspect.search_queries
-        if search_query.query_type not in {"document_title", "metadata_filter"}
-    ]
-    candidates.append(aspect.question)
-    candidates.extend(
-        keyword
-        for keyword in aspect.keywords
-        if 4 <= len(_normalize_exact_support_text(keyword)) <= 40
-        and keyword not in {"定义", "概念", "含义", "说明文档", "相关规定"}
-    )
-    phrases: list[str] = []
-    for candidate in candidates:
-        text = re.sub(r"《[^》]{2,80}》", " ", str(candidate or ""))
-        text = re.sub(r"^[A-DＡ-Ｄ][、.．：:]\s*", "", text.strip(), flags=re.IGNORECASE)
-        spaced_terms = [
-            re.sub(
-                r"^(?:请|根据|依据|结合|说明|判断|概括|比较|计算|回答|指出)+",
-                "",
-                term.strip(" ，,：:"),
-            ).strip(" ，,：:")
-            for term in re.split(r"\s+", text)
-            if term.strip()
-        ]
-        spaced_terms = [
-            term
-            for term in spaced_terms
-            if 2 <= len(_normalize_exact_support_text(term)) <= 20
-            and term not in {"说明", "判断", "比较", "计算", "回答", "指出"}
-            and not term.endswith("版")
-            and "示例" not in term
-        ]
-        if len(spaced_terms) >= 2:
-            for window in (4, 3, 2):
-                for start in range(0, max(0, len(spaced_terms) - window + 1)):
-                    phrase = "".join(spaced_terms[start : start + window])
-                    normalized_phrase = _normalize_exact_support_text(phrase)
-                    if 6 <= len(normalized_phrase) <= 60:
-                        phrases.append(phrase)
-        for term in spaced_terms:
-            normalized_term = _normalize_exact_support_text(term)
-            if 6 <= len(normalized_term) <= 40:
-                phrases.append(term)
-        # Document-style queries can leave an unknown argument inside an
-        # otherwise exact predicate, e.g. ``与哪些主体开展有效沟通``.  That
-        # interrogative slot is absent from the source clause, so also retain
-        # its evidence-shaped predicate tail.  The caller still constrains the
-        # scan to resolved/candidate documents; this is not a corpus shortcut.
-        interrogative_tail = re.search(
-            r"(?:哪些|什么|何种|何类)(?:主体|对象|机构|人员|部门|条件|要求|方式|措施)?(?P<tail>[\u4e00-\u9fff]{6,40})",
-            text,
-        )
-        if interrogative_tail:
-            tail = interrogative_tail.group("tail").strip()
-            if 6 <= len(_normalize_exact_support_text(tail)) <= 40:
-                phrases.append(tail)
-        # Threshold questions often express the unknown as ``X 相对 Y 的门槛``
-        # while the source uses a definition such as ``X 是指……超过 Y Z%``.
-        # Preserve both relation anchors, plus bounded suffixes of a long left
-        # noun phrase, so an already-resolved sibling document can recover the
-        # defining clause without knowing the missing numeric answer.
-        for relation in re.finditer(
-            r"(?P<left>[\u4e00-\u9fff]{4,40})相对(?P<right>[\u4e00-\u9fff]{4,30}?)(?:的)?(?:门槛|阈值|比例|限额)",
-            text,
-        ):
-            left = relation.group("left")
-            right = relation.group("right")
-            phrases.extend((left, right))
-            if len(left) > 8:
-                phrases.extend((left[-8:], left[-6:]))
-        parts = re.split(r"[；;。？?]|以及|并且|并同时|同时|分别", text)
-        for part in parts:
-            cleaned = re.sub(
-                r"^(?:请|根据|依据|结合|说明|判断|概括|比较|计算|回答|指出)+",
-                "",
-                part.strip(" ，,：:"),
-            )
-            cleaned = re.sub(
-                r"(?:是什么|有哪些|如何规定|是否正确|是否相符|请说明|请回答)$",
-                "",
-                cleaned,
-            ).strip(" ，,：:")
-            normalized = _normalize_exact_support_text(cleaned)
-            if 6 <= len(normalized) <= 120:
-                phrases.append(cleaned)
-    return list(dict.fromkeys(phrases))[:12]
-
-
-def _bounded_required_numeric_terms(aspect: QueryAspect) -> list[str]:
-    texts = [aspect.question, *(query.query for query in aspect.search_queries)]
-    terms: list[str] = []
-    for text in texts:
-        terms.extend(re.findall(r"\d+(?:\.\d+)?%", str(text or "")))
-    return list(dict.fromkeys(terms))
-def _critical_lexical_terms(text: str) -> list[str]:
-    terms = re.findall(r"\d+(?:\.\d+)?%|\d+(?:\.\d+)?(?:年|个月|日|万元|亿元|倍)", text)
-    terms.extend(
-        match.group(0)
-        for match in re.finditer(
-            r"[\u4e00-\u9fff]{2,12}(?:不得|应当|必须|可以|属于|包括|不低于|不高于|不超过|至少)",
-            text,
-        )
-    )
-    return list(dict.fromkeys(term for term in terms if len(_normalize_exact_support_text(term)) >= 2))
-def _candidate_document_id(candidate: Any) -> str:
-    direct = getattr(candidate, "document_id", None)
-    if direct:
-        return str(direct)
-    metadata = getattr(candidate, "metadata", None)
-    if isinstance(metadata, dict):
-        value = metadata.get("document_id")
-        if value:
-            return str(value)
-    return ""
-
-
 def _normalize_exact_support_text(value: str) -> str:
     without_breaks = re.sub(r"<br\s*/?>", "", str(value or ""), flags=re.IGNORECASE)
-    normalized = re.sub(r"[\s\"'“”‘’=：:；;，,。()（）]+", "", without_breaks).lower()
-    for source, target in (
-        ("XDU EchoGuide 项目", "XDU EchoGuide"),
-        ("ResumeMind 简历问答助手", "ResumeMind"),
-        ("REV 密码算法项目", "REV 密码算法"),
-        ("REV 密码算法项目", "REV 密码算法"),
-        ("高并发电商秒杀平台", "秒杀平台"),
-        ("外卖平台项目", "外卖平台"),
-    ):
-        normalized = normalized.replace(source, target)
-    return normalized
-def _exact_support_recall(expected: str, actual: str) -> float:
-    expected_text = _normalize_exact_support_text(expected)
-    actual_text = _normalize_exact_support_text(actual)
-    if not expected_text:
-        return 0.0
-    if expected_text in actual_text:
-        return 1.0
-    if len(expected_text) == 1:
-        return 1.0 if expected_text in actual_text else 0.0
-    bigrams = [expected_text[index : index + 2] for index in range(len(expected_text) - 1)]
-    return sum(bigram in actual_text for bigram in bigrams) / len(bigrams)
-
-
+    return re.sub(r"[\s\"'“”‘’=：:；;，,。()（）]+", "", without_breaks).lower()
 def _to_retrieval_results(matches: list[RetrievalMatch]) -> list[RetrievalResult]:
     results: list[RetrievalResult] = []
     seen_evidence: set[str] = set()
@@ -1871,6 +1437,14 @@ def _select_prompt_chunks(
             aspect_retrieval.selected_chunk_ids.append(chosen.chunk_id)
             added_for_queries += 1
 
+    # 枚举类问句（"哪些项目/有什么技能"）：宽泛问句下 rerank 分数整体偏低
+    #（项目简介块常在 0.05-0.2 区间），0.2 绝对门槛会把被列举对象的材料
+    # 全部挡在 prompt 外。枚举时把补选门槛降到绝对下限 RERANK_PROMPT_THRESHOLD 的一半。
+    prompt_score_bar = (
+        RERANK_PROMPT_THRESHOLD * 0.5
+        if query_plan.enumerative
+        else None
+    )
     for aspect_retrieval in aspect_retrievals:
         if len(selected) >= MAX_PROMPT_CHUNKS:
             break
@@ -1880,32 +1454,48 @@ def _select_prompt_chunks(
                 break
             if chunk.chunk_id in aspect_retrieval.selected_chunk_ids:
                 continue
-            if not _passes_prompt_score(chunk, top_score):
+            if prompt_score_bar is not None:
+                if _prompt_score(chunk) < prompt_score_bar:
+                    continue
+            elif not _passes_prompt_score(chunk, top_score):
                 continue
             if _is_duplicate_or_redundant(chunk, selected):
                 continue
-            if not (_chunk_matches_query_aspect(chunk, aspect_retrieval.aspect) or _is_structural_support(chunk, selected, question)):
+            if not (
+                query_plan.enumerative
+                or _chunk_matches_query_aspect(chunk, aspect_retrieval.aspect)
+                or _is_structural_support(chunk, selected, question)
+            ):
                 continue
             chunk.metadata["prompt_selection_reason"] = "generic"
             _mark_chunk_for_aspect(chunk, aspect_retrieval.aspect)
             selected.append(chunk)
             aspect_retrieval.selected_chunk_ids.append(chunk.chunk_id)
 
-    if FORCE_MIN_CHUNKS and len(selected) < MIN_PROMPT_CHUNKS:
+    # 枚举类问句（"哪些项目/有什么技能"）：多对象列举需要更多证据块，
+    # 把最小补选目标提到容量上限，让全部被列举对象的材料都能进 prompt
+    target_min_chunks = MAX_PROMPT_CHUNKS if query_plan.enumerative else MIN_PROMPT_CHUNKS
+    if FORCE_MIN_CHUNKS and len(selected) < target_min_chunks:
         for aspect_retrieval in aspect_retrievals:
             top_score = max((_prompt_score(chunk) for chunk in aspect_retrieval.candidates), default=0.0)
             for chunk in aspect_retrieval.candidates:
-                if len(selected) >= min(MIN_PROMPT_CHUNKS, MAX_PROMPT_CHUNKS):
+                if len(selected) >= min(target_min_chunks, MAX_PROMPT_CHUNKS):
                     break
                 if _is_duplicate_or_redundant(chunk, selected):
                     continue
                 # The minimum is a lower-bound preference, not permission to
                 # inject unrelated evidence. Apply the same score and aspect
                 # relevance gate used by ordinary prompt selection.
-                if not _passes_prompt_score(chunk, top_score):
+                if prompt_score_bar is not None:
+                    if _prompt_score(chunk) < prompt_score_bar:
+                        continue
+                elif not _passes_prompt_score(chunk, top_score):
                     continue
                 if not (
-                    _chunk_matches_query_aspect(chunk, aspect_retrieval.aspect)
+                    # 枚举问句：rerank 分数已是相关度信号，被列举对象的材料块
+                    # 未必与问句有词法重叠，跳过 aspect 词法匹配门槛
+                    query_plan.enumerative
+                    or _chunk_matches_query_aspect(chunk, aspect_retrieval.aspect)
                     or _is_structural_support(chunk, selected, question)
                 ):
                     continue
@@ -1955,20 +1545,20 @@ def _filter_prompt_relevance(
     selected: list[RetrievalResult],
     query_plan: QueryPlan,
 ) -> list[RetrievalResult]:
-    """Apply a final trust gate after all quota and neighbour passes."""
+    """Apply a final trust gate after all quota and prompt passes."""
 
-    always_keep_roles = {
-        "exact_anchor_support",
-        "bounded_lexical_support",
-        "formula_target_support",
-    }
     relevant: list[RetrievalResult] = []
     for chunk in selected:
         selection_reason = chunk.metadata.get("prompt_selection_reason")
         if selection_reason not in {"core", "generic", "forced_minimum"}:
             relevant.append(chunk)
             continue
-        if chunk.metadata.get("dynamic_table_evidence") or chunk.metadata.get("evidence_role") in always_keep_roles:
+        if chunk.metadata.get("dynamic_table_evidence"):
+            relevant.append(chunk)
+            continue
+        if query_plan.enumerative:
+            # 枚举问句：generic/forced_minimum 块已通过 rerank 门槛与补选，
+            # 宽泛 aspect 下词法匹配不可靠，终检放行（材料即被列举对象）
             relevant.append(chunk)
             continue
         if any(_chunk_matches_query_aspect(chunk, aspect) for aspect in query_plan.aspects):
@@ -2035,11 +1625,7 @@ def _sync_aspect_coverage_from_prompt(
 
 
 def _prompt_chunk_covers_aspect(chunk: RetrievalResult, aspect: QueryAspect) -> bool:
-    if chunk.metadata.get("dynamic_table_evidence") or chunk.metadata.get("evidence_role") in {
-        "exact_anchor_support",
-        "bounded_lexical_support",
-        "formula_target_support",
-    }:
+    if chunk.metadata.get("dynamic_table_evidence"):
         return _chunk_matches_query_aspect(chunk, aspect) or _aspect_lexical_score(chunk, aspect) > 0
 
     text = _chunk_match_text(chunk)
@@ -2053,11 +1639,7 @@ def _prompt_chunk_covers_aspect(chunk: RetrievalResult, aspect: QueryAspect) -> 
 
     terms = _prompt_aspect_coverage_terms(aspect)
     hits = [term for term in terms if term and term in text]
-    if len(set(hits)) >= 3:
-        return True
-    if len(set(hits)) >= 2 and _has_normative_or_definition_marker(text):
-        return True
-    return False
+    return len(set(hits)) >= 3
 
 
 def _prompt_aspect_coverage_terms(aspect: QueryAspect) -> list[str]:
@@ -2095,56 +1677,7 @@ def _prompt_aspect_coverage_terms(aspect: QueryAspect) -> list[str]:
             term = _normalize_exact_support_text(raw)
             if 2 <= len(term) <= 18 and term not in stop_terms:
                 terms.append(term)
-            if len(term) >= 6:
-                terms.extend(_split_compound_coverage_term(term))
-        for match in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:全过程|开发|部署|上线|负责|参与|荣获|获得|一等奖|奖学金|软考|设计|实现)", str(candidate or "")):
-            term = _normalize_exact_support_text(match.group(0))
-            if 2 <= len(term) <= 18:
-                terms.append(term)
     return list(dict.fromkeys(term for term in terms if term not in stop_terms))[:24]
-
-
-def _split_compound_coverage_term(term: str) -> list[str]:
-    pieces: list[str] = []
-    for marker in (
-        "全过程",
-        "开发",
-        "部署",
-        "上线",
-        "负责",
-        "参与",
-        "荣获",
-        "获得",
-        "一等奖",
-        "奖学金",
-        "软考",
-        "设计",
-        "实现",
-    ):
-        if marker in term:
-            pieces.append(marker)
-    return pieces
-
-
-def _has_normative_or_definition_marker(text: str) -> bool:
-    return any(
-        marker in text
-        for marker in (
-            "应当",
-            "不得",
-            "必须",
-            "可以",
-            "应",
-            "包括",
-            "是指",
-            "所称",
-            "具有",
-            "负责",
-            "暂定为",
-            "频率",
-            "按照",
-        )
-    )
 
 
 def _empty_prompt_selection() -> dict[str, Any]:
@@ -2339,11 +1872,6 @@ def _mark_chunk_for_aspect(chunk: RetrievalResult, aspect: QueryAspect) -> None:
 
 def _chunk_matches_query_aspect(chunk: RetrievalResult, aspect: QueryAspect) -> bool:
     if chunk.metadata.get("fusion_method") == "query_plan_rrf" and not re.search(r"[\u4e00-\u9fff]", aspect.question):
-        return True
-    if chunk.metadata.get("evidence_role") in {
-        "exact_anchor_support",
-        "bounded_lexical_support",
-    }:
         return True
     if not aspect.keywords:
         return True
@@ -2549,264 +2077,6 @@ def _section_path(citation: Citation) -> list[str]:
 def _normalize_for_dedupe(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
-
-def _expand_neighbor_matches(
-    db: Session,
-    question: str,
-    matches: list[RetrievalMatch],
-    document_chunk_cache: dict[str, list[DocumentChunk]] | None = None,
-) -> list[RetrievalMatch]:
-    if not matches:
-        return []
-
-    document_ids = {match.citation.document_id for match in matches}
-    chunks_by_document = _chunks_by_document(
-        db,
-        document_ids,
-        document_chunk_cache=document_chunk_cache,
-    )
-    selected: list[RetrievalMatch] = []
-    selected_chunk_ids: set[str] = set()
-
-    for match in matches:
-        if match.metadata.get("dynamic_table_evidence") or match.citation.chunk_type in {"table_cell", "table_calculation"}:
-            selected.append(match)
-            selected_chunk_ids.add(match.citation.chunk_id)
-            continue
-        if match.citation.chunk_id in selected_chunk_ids:
-            continue
-        selected.append(match)
-        selected_chunk_ids.add(match.citation.chunk_id)
-
-        document_chunks = chunks_by_document.get(match.citation.document_id, [])
-        added_neighbors = 0
-        for chunk, reason in _neighbor_candidates(match.citation.chunk_id, document_chunks, question):
-            if chunk.chunk_id in selected_chunk_ids:
-                continue
-            selected.append(_match_from_chunk(chunk, match, reason, document_chunks, question))
-            selected_chunk_ids.add(chunk.chunk_id)
-            added_neighbors += 1
-            if added_neighbors >= 2:
-                break
-
-    return selected[: max(MAX_PROMPT_CHUNKS * 3, MAX_PROMPT_CHUNKS)]
-
-
-def _chunks_by_document(
-    db: Session,
-    document_ids: set[str],
-    document_chunk_cache: dict[str, list[_DocumentChunkSnapshot]] | None = None,
-) -> dict[str, list[_DocumentChunkSnapshot]]:
-    if not document_ids:
-        return {}
-    cache = document_chunk_cache if document_chunk_cache is not None else {}
-    now = monotonic()
-    missing_ids = set(document_ids).difference(cache)
-    with _DOCUMENT_SNAPSHOT_CACHE_LOCK:
-        for document_id in list(missing_ids):
-            cached = _DOCUMENT_SNAPSHOT_CACHE.get(document_id)
-            if cached is None:
-                continue
-            cached_at, chunks = cached
-            if now - cached_at > DOCUMENT_SNAPSHOT_CACHE_TTL_SECONDS:
-                _DOCUMENT_SNAPSHOT_CACHE.pop(document_id, None)
-                continue
-            _DOCUMENT_SNAPSHOT_CACHE.move_to_end(document_id)
-            cache[document_id] = chunks
-            missing_ids.remove(document_id)
-    if missing_ids:
-        with measure("rag.document_snapshot_fetch"):
-            chunk_models = db.scalars(
-                select(DocumentChunk)
-                .options(
-                    load_only(
-                        DocumentChunk.id,
-                        DocumentChunk.chunk_id,
-                        DocumentChunk.document_id,
-                        DocumentChunk.text,
-                        DocumentChunk.embedding_text,
-                        DocumentChunk.chunk_metadata,
-                        DocumentChunk.index_status,
-                        DocumentChunk.source_file,
-                        DocumentChunk.page_number,
-                        DocumentChunk.section_title,
-                    )
-                )
-                .where(DocumentChunk.document_id.in_(missing_ids))
-                .order_by(DocumentChunk.document_id.asc(), DocumentChunk.id.asc())
-            ).all()
-        chunks = [
-            _DocumentChunkSnapshot(
-                id=chunk.id,
-                chunk_id=chunk.chunk_id,
-                document_id=chunk.document_id,
-                text=chunk.text,
-                embedding_text=chunk.embedding_text,
-                chunk_metadata=chunk.chunk_metadata,
-                index_status=chunk.index_status,
-                source_file=chunk.source_file,
-                page_number=chunk.page_number,
-                section_title=chunk.section_title,
-            )
-            for chunk in chunk_models
-        ]
-        for document_id in missing_ids:
-            cache[document_id] = []
-        for chunk in chunks:
-            cache.setdefault(chunk.document_id, []).append(chunk)
-        with _DOCUMENT_SNAPSHOT_CACHE_LOCK:
-            for document_id in missing_ids:
-                _DOCUMENT_SNAPSHOT_CACHE[document_id] = (now, cache.get(document_id, []))
-                _DOCUMENT_SNAPSHOT_CACHE.move_to_end(document_id)
-            while len(_DOCUMENT_SNAPSHOT_CACHE) > DOCUMENT_SNAPSHOT_CACHE_MAX_DOCUMENTS:
-                _DOCUMENT_SNAPSHOT_CACHE.popitem(last=False)
-    return {document_id: cache.get(document_id, []) for document_id in document_ids}
-
-
-def _neighbor_candidates(
-    anchor_chunk_id: str,
-    chunks: list[DocumentChunk],
-    question: str,
-) -> list[tuple[DocumentChunk, str]]:
-    by_chunk_id = {chunk.chunk_id: chunk for chunk in chunks}
-    anchor = by_chunk_id.get(anchor_chunk_id)
-    if anchor is None:
-        return []
-
-    anchor_section_number = _section_number(anchor.section_title)
-    candidates: list[tuple[DocumentChunk, str]] = []
-    if anchor_section_number and "." not in anchor_section_number:
-        child_prefix = f"{anchor_section_number}."
-        candidates.extend(
-            (chunk, "child_section")
-            for chunk in chunks
-            if (_section_number(chunk.section_title) or "").startswith(child_prefix)
-        )
-    if anchor_section_number and "." in anchor_section_number:
-        parent_number = _parent_section_number(anchor_section_number)
-        candidates.extend(
-            (chunk, "parent_section")
-            for chunk in chunks
-            if parent_number and _section_number(chunk.section_title) == parent_number
-        )
-
-    anchor_index = chunks.index(anchor)
-    if anchor_index > 0:
-        candidates.append((chunks[anchor_index - 1], "previous_chunk"))
-    if anchor_index + 1 < len(chunks):
-        candidates.append((chunks[anchor_index + 1], "next_chunk"))
-
-    scored = [
-        (chunk, reason, _neighbor_relevance(question, chunk, reason))
-        for chunk, reason in candidates
-        if chunk.chunk_id != anchor_chunk_id
-    ]
-    scored = [item for item in scored if item[2] > 0 or item[1] in {"child_section", "parent_section"}]
-    scored.sort(key=lambda item: (item[2], item[1] in {"child_section", "parent_section"}), reverse=True)
-
-    deduped: list[tuple[DocumentChunk, str]] = []
-    seen: set[str] = set()
-    for chunk, reason, _score in scored:
-        if chunk.chunk_id in seen:
-            continue
-        seen.add(chunk.chunk_id)
-        deduped.append((chunk, reason))
-    return deduped
-
-
-def _neighbor_relevance(question: str, chunk: DocumentChunk, reason: str) -> float:
-    text = "\n".join(part for part in [chunk.section_title or "", chunk.embedding_text or "", chunk.text] if part.strip())
-    score = evidence_coverage(question_terms(question), text)
-    if reason == "child_section" and _question_prefers_child_section(question):
-        score += 0.2
-    if reason in {"previous_chunk", "next_chunk"}:
-        score -= 0.05
-    return score
-
-
-def _question_prefers_child_section(question: str) -> bool:
-    normalized = re.sub(r"\s+", "", question)
-    # 简历场景：追问细节类问题倾向子章节（项目详情/技能分项/获奖说明）
-    return any(term in normalized for term in ["详情", "细节", "具体", "分别", "分项", "详细", "哪些"])
-
-
-def _match_from_chunk(
-    chunk: DocumentChunk,
-    anchor: RetrievalMatch,
-    reason: str,
-    document_chunks: list[DocumentChunk],
-    question: str,
-) -> RetrievalMatch:
-    previous_chunk_id, next_chunk_id = _adjacent_chunk_ids(chunk, document_chunks)
-    section_number = _section_number(chunk.section_title)
-    parent_section_number = _parent_section_number(section_number)
-    text = _clean_chunk_text(chunk.text, chunk.section_title)
-    coverage = evidence_coverage(question_terms(question), f"{chunk.section_title or ''}\n{chunk.embedding_text or ''}\n{text}")
-    return RetrievalMatch(
-        citation=Citation(
-            document_id=chunk.document_id,
-            chunk_id=chunk.chunk_id,
-            filename=chunk.source_file,
-            section_title=chunk.section_title,
-            section_path=_inferred_section_path(chunk, document_chunks),
-            section_number=section_number,
-            parent_section_number=parent_section_number,
-            previous_chunk_id=previous_chunk_id,
-            next_chunk_id=next_chunk_id,
-            page_number=chunk.page_number,
-            excerpt=text,
-            score=anchor.score,
-            rerank_score=max(anchor.rerank_score - 0.05, 0.0),
-            chunk_type=_chunk_type(chunk.text),
-            evidence_role="expanded_context",
-        ),
-        score=anchor.score,
-        rerank_score=max(anchor.rerank_score - 0.05, 0.0),
-        coverage_score=coverage,
-        evidence_role="expanded_context",
-        evidence_text=text,
-        metadata={
-            **_chunk_metadata(chunk),
-            "expansion_reason": reason,
-            "expanded_from_chunk_id": anchor.citation.chunk_id,
-        },
-    )
-
-
-def _adjacent_chunk_ids(chunk: DocumentChunk, chunks: list[DocumentChunk]) -> tuple[str | None, str | None]:
-    index = chunks.index(chunk)
-    previous_chunk_id = chunks[index - 1].chunk_id if index > 0 else None
-    next_chunk_id = chunks[index + 1].chunk_id if index + 1 < len(chunks) else None
-    return previous_chunk_id, next_chunk_id
-
-
-def _chunk_metadata(chunk: DocumentChunk) -> dict[str, Any]:
-    if not chunk.chunk_metadata:
-        return {}
-    try:
-        value = json.loads(chunk.chunk_metadata)
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _inferred_section_path(chunk: DocumentChunk, chunks: list[DocumentChunk]) -> list[str]:
-    section_number = _section_number(chunk.section_title)
-    parent_section_number = _parent_section_number(section_number)
-    path: list[str] = []
-    if parent_section_number:
-        parent = next((item for item in chunks if _section_number(item.section_title) == parent_section_number), None)
-        if parent and parent.section_title:
-            path.append(parent.section_title)
-    if chunk.section_title:
-        path.append(chunk.section_title)
-    return path
-
-
-def _chunk_type(text: str) -> str:
-    stripped = text.lstrip()
-    table_prefixes = ("表格：", "表格摘要：", "表格行证据：", "琛ㄦ牸锛?", "琛ㄦ牸琛岃瘉鎹細")
-    return "table" if stripped.startswith(table_prefixes) or "\n|" in text else "paragraph"
 
 
 def _section_number(section_title: str | None) -> str | None:

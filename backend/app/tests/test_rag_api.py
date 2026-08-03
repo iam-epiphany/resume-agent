@@ -1300,7 +1300,7 @@ def test_qa_returns_context_package_when_knowledge_matches(monkeypatch) -> None:
     assert body["answer"]
     assert body["answer_mode"] == "hedged"  # LLM 关闭 → 摘录兜底，按推测标注
     assert body["evidence_sufficiency"] == "partial"
-    assert body["intent"] == "resume_detail"
+    assert body["intent"] == "resume_qa"
     assert "综合成绩" in body["answer"]
     assert body["context_package"]["is_final_answer"] is False
     assert body["context_package"]["mode"] == "rag_context"
@@ -1552,7 +1552,8 @@ def test_qa_retrieve_returns_llm_context_package_and_cleans_repeated_title(monke
     assert "根据知识库引用，可归纳为" not in json.dumps(body, ensure_ascii=False)
 
 
-def test_qa_retrieve_expands_from_parent_section_to_relevant_child(monkeypatch, fake_indexing_services) -> None:
+def test_qa_retrieve_no_longer_expands_neighbor_child_section(monkeypatch, fake_indexing_services) -> None:
+    # 邻块扩展（A6b）已删除：命中父章节不再自动补入子章节 chunk
     reset_database()
     upload_response = client.post(
         "/api/documents/upload",
@@ -1614,7 +1615,10 @@ def test_qa_retrieve_expands_from_parent_section_to_relevant_child(monkeypatch, 
     assert response.status_code == 200
     body = response.json()
     assert body["is_final_answer"] is False
-    assert body["retrieval_summary"]["has_sufficient_context"] is True
+    # 邻块扩展已删除：aspect_2（"加权折算保留依据"）的内容仅在 3.1 子章节，
+    # 不再被自动补入 → 该 aspect 有候选但 prompt 终检未覆盖，
+    # has_sufficient_context=False（触发兜底链，符合预期）
+    assert body["retrieval_summary"]["has_sufficient_context"] is False
     assert body["retrieval_summary"]["missing_aspects"] == []
     assert [
         aspect["aspect_id"]
@@ -1627,10 +1631,8 @@ def test_qa_retrieve_expands_from_parent_section_to_relevant_child(monkeypatch, 
     assert any("综合成绩差异" in query and "排查" in query for query in retrieval_calls)
     assert any("加权折算" in query and "依据" in query for query in retrieval_calls)
     assert len(retrieval_calls) >= 4
-    assert all(
-        aspect["covered"]
-        for aspect in body["retrieval_summary"]["aspect_retrievals"]
-    )
+    assert body["retrieval_summary"]["aspect_retrievals"][0]["covered"] is True
+    assert body["retrieval_summary"]["aspect_retrievals"][1]["covered"] is False
     assert all(
         diagnostic["query_type"] in {"semantic_question", "document_style_statement", "keyword_anchor"}
         for aspect in body["retrieval_summary"]["aspect_retrievals"]
@@ -1638,15 +1640,14 @@ def test_qa_retrieve_expands_from_parent_section_to_relevant_child(monkeypatch, 
     )
     section_titles = [chunk["section_title"] for chunk in body["context_chunks"]]
     assert "3. 综合成绩与校验关系" in section_titles
-    assert "3.1 综合成绩差异处理" in section_titles
+    assert "3.1 综合成绩差异处理" not in section_titles
     assert "加权折算、四舍五入、科目映射和重复汇总" in body["llm_prompt"]
-    assert "权重日期、折算规则和原分成绩来源" in body["llm_prompt"]
-    child_chunk = next(chunk for chunk in body["context_chunks"] if chunk["section_title"] == "3.1 综合成绩差异处理")
-    assert child_chunk["metadata"]["evidence_role"] == "expanded_context"
-    assert child_chunk["metadata"]["expansion_reason"] == "child_section"
+    assert "权重日期、折算规则和原分成绩来源" not in body["llm_prompt"]
 
 
 def test_qa_retrieve_does_not_force_unrelated_prompt_chunk(monkeypatch, fake_indexing_services) -> None:
+    # 邻块扩展（A6b）已删除：不再自动补入子章节，无关章节仍被 prompt 终检过滤
+
     reset_database()
     upload_response = client.post(
         "/api/documents/upload",
@@ -1725,11 +1726,11 @@ def test_qa_retrieve_does_not_force_unrelated_prompt_chunk(monkeypatch, fake_ind
     assert response.status_code == 200
     body = response.json()
     section_titles = [chunk["section_title"] for chunk in body["context_chunks"]]
-    assert section_titles == ["3. 综合成绩与校验关系", "3.1 综合成绩差异处理"]
-    assert body["retrieval_summary"]["used_chunks"] == 2
+    assert section_titles == ["3. 综合成绩与校验关系"]
+    assert body["retrieval_summary"]["used_chunks"] == 1
     assert body["retrieval_summary"]["top_k"] == 12
     assert body["retrieval_summary"]["prompt_filtered_count"] == 1
-    assert body["retrieval_summary"]["prompt_selection"]["final_prompt_chunks"] == 2
+    assert body["retrieval_summary"]["prompt_selection"]["final_prompt_chunks"] == 1
     assert "4. 项目经历与竞赛奖项" not in body["llm_prompt"]
 
 
@@ -1783,7 +1784,7 @@ def test_qa_fails_gracefully_when_no_knowledge_matches(monkeypatch) -> None:
     assert body["answer_mode"] == "failed"
     assert "知识库中还没有相关记录" in body["answer"]
     assert body["generation_status"] == "skipped"
-    assert body["intent"] == "resume_detail"
+    assert body["intent"] == "resume_qa"
     assert body["context_package"]["retrieval_summary"]["used_chunks"] == 0
     assert body["context_package"]["retrieval_summary"]["has_sufficient_context"] is False
 
@@ -1962,7 +1963,7 @@ def test_qa_task_persists_progress_and_final_answer(monkeypatch) -> None:
             answer="综合成绩应等于各科目分项成绩之和。",
             answer_mode="answered",
             evidence_sufficiency="sufficient",
-            intent="resume_detail",
+            intent="resume_qa",
             generation_status="completed",
         )
 
@@ -2028,7 +2029,7 @@ def test_qa_task_stream_snapshot_contains_verified_preview_and_cancel_clears_it(
             answer="综合成绩应等于各科目分项成绩之和。",
             answer_mode="answered",
             evidence_sufficiency="sufficient",
-            intent="resume_detail",
+            intent="resume_qa",
             generation_status="completed",
         )
 
@@ -2081,7 +2082,7 @@ def test_running_qa_task_can_be_cancelled_without_saving_late_answer(monkeypatch
             answer="这条迟到的回答不应被保存。",
             answer_mode="answered",
             evidence_sufficiency="sufficient",
-            intent="resume_detail",
+            intent="resume_qa",
             generation_status="completed",
         )
 
@@ -2132,7 +2133,7 @@ def test_qa_task_creation_is_idempotent_by_client_request_id(monkeypatch) -> Non
             answer="依据已核验。",
             answer_mode="answered",
             evidence_sufficiency="sufficient",
-            intent="resume_detail",
+            intent="resume_qa",
             generation_status="completed",
         )
 
@@ -2236,7 +2237,7 @@ def test_audit_logs_record_upload_and_qa(monkeypatch) -> None:
     assert qa_details_json["question"] == question
     assert qa_details_json["answer"] == qa_detail["answer"]
     assert qa_details_json["used_chunks"] == 1
-    assert qa_details_json["intent"] == "resume_detail"
+    assert qa_details_json["intent"] == "resume_qa"
 
 
 def test_audit_logs_aggregate_repeated_warning_events() -> None:

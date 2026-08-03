@@ -546,18 +546,14 @@ def _annotate(item: RerankedChunk, terms: list[str], question: str) -> _Annotate
     )
 
 
-def _rank_key(item: _AnnotatedChunk) -> tuple[float, float, float]:
-    role_weight = {
-        "direct_evidence": 3.0,
-        "related_context": 1.0,
-    }.get(item.evidence_role, 0.0)
-    return (role_weight, item.coverage_score, item.rerank_score)
+def _rank_key(item: _AnnotatedChunk) -> tuple[float, float]:
+    # rerank 已是主信号；词表删除后 coverage 的 direct 权重只会放大噪声
+    return (item.rerank_score, item.coverage_score)
 
 
 def _select_final_chunks(items: list[_AnnotatedChunk], question: str, limit: int) -> list[_AnnotatedChunk]:
-    if _should_enforce_diversity(question):
-        return _limit_document_repetition(items, limit=limit)
-    return items[:limit]
+    del question  # 多样性无条件生效（不再按问题词判断）
+    return _limit_document_repetition(items, limit=limit)
 
 
 def _limit_document_repetition(items: list[_AnnotatedChunk], limit: int) -> list[_AnnotatedChunk]:
@@ -572,11 +568,6 @@ def _limit_document_repetition(items: list[_AnnotatedChunk], limit: int) -> list
         if len(selected) >= limit:
             break
     return selected
-
-
-def _should_enforce_diversity(question: str) -> bool:
-    normalized = _normalize_for_match(question)
-    return any(term in normalized for term in ["综合", "总结", "对比", "比较", "区别", "关系", "不同"])
 
 
 def _to_citation(item: _AnnotatedChunk) -> Citation:
@@ -614,71 +605,41 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
+# 通用分词停用词（疑问/虚词类 2-gram，防止干扰覆盖率计算；不含领域词——领域差异交给 rerank 语义排序）
+_STOP_TERMS = frozenset(
+    "怎么 什么 如何 为何 哪些 哪个 为什么 是否 可以 请问 还有 以及 因为 所以 但是 没有 "
+    "就是 不是 都是 这个 那个 我们 你们 他们 一下 一个 一些 什么 怎样 各自 分别 请问 "
+    "说明 介绍 讲讲 说说 介绍 简单 具体 详细 大概 大约 目前 现在 之前 之后 已经 正在".split()
+)
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
 def question_terms(question: str) -> list[str]:
+    """通用分词：书名号/引号整体保留 + CJK 2-gram + 字母数字 token。
+
+    不依赖任何简历领域词表或同义扩展（硬编码已全部移除）：任意领域变体
+    都能被 CJK 2-gram 捕获，语义精确排序交给 rerank 完成。
+    """
     normalized = _normalize_for_match(question)
-    domain_phrases = [
-        # 简历场景领域词：教育背景 / 项目经历 / 技能 / 荣誉证书 / 求职意向
-        "项目介绍",
-        "项目经历",
-        "项目背景",
-        "项目职责",
-        "项目成果",
-        "技术栈",
-        "开发语言",
-        "参与情况",
-        "负责内容",
-        "掌握程度",
-        "熟悉程度",
-        "专业方向",
-        "主修课程",
-        "核心课程",
-        "研究方向",
-        "毕业时间",
-        "入学时间",
-        "就读",
-        "学位",
-        "绩点",
-        "排名",
-        "综合成绩",
-        "课程成绩",
-        "证书编号",
-        "证书名称",
-        "取得时间",
-        "获得条件",
-        "荣誉奖项",
-        "奖学金",
-        "三好学生",
-        "获奖记录",
-        "评优记录",
-        "竞赛",
-        "蓝桥杯",
-        "软考",
-        "四级",
-        "六级",
-        "实习时长",
-        "实习单位",
-        "实习经历",
-        "社团",
-        "学生工作",
-        "论文",
-        "课题",
-        "团队",
-        "分工",
-        "任职能力",
-        "个人特质",
-        "自我评价",
-        "求职意向",
-        "期望薪资",
-        "工作地点",
-        "到岗时间",
-        "职业规划",
-    ]
-    terms = [phrase for phrase in domain_phrases if phrase in normalized]
-    terms.extend(_expanded_domain_terms(normalized))
-    terms.extend(token for token in re.findall(r"[A-Za-z0-9_]{2,}", normalized))
-    if not terms:
-        terms.extend(_fallback_chinese_terms(normalized))
-    return list(dict.fromkeys(terms))
+    terms: list[str] = []
+    # 书名号/引号锚点整体保留（如《高并发电商秒杀平台》）
+    terms.extend(re.findall(r"[《「“\"]([^》」”\"]{2,24})", normalized))
+    # 字母数字 token
+    terms.extend(re.findall(r"[A-Za-z0-9_]{2,}", normalized))
+    # 剩余中文序列做 2-gram
+    stripped = re.sub(r"[《「“\"》」”\"]", "", normalized)
+    stripped = re.sub(r"[A-Za-z0-9_]+", " ", stripped)
+    for sequence in re.findall(r"[一-鿿]{2,}", stripped):
+        if len(sequence) == 2:
+            terms.append(sequence)
+        else:
+            terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
+    return list(
+        dict.fromkeys(term for term in terms if term not in _STOP_TERMS)
+    )
 
 
 def evidence_coverage(terms: list[str], text: str) -> float:
@@ -692,61 +653,6 @@ def evidence_coverage(terms: list[str], text: str) -> float:
 def _evidence_role(candidate: VectorSearchResult, question: str, coverage: float) -> str:
     del candidate, question
     return "direct_evidence" if coverage >= DIRECT_EVIDENCE_COVERAGE else "related_context"
-
-
-def _is_comparison_question(question: str) -> bool:
-    normalized = _normalize_for_match(question)
-    return any(term in normalized for term in ["区别", "差异", "关系", "等同", "不同", "比较", "与", "和"])
-
-
-def _normalize_for_match(text: str) -> str:
-    normalized = re.sub(r"\s+", "", text)
-    replacements = {
-        "同一个": "同一",
-        "怎样": "怎么",
-        "如何": "怎么",
-        "应该": "",
-        "应当": "",
-        "怎么": "",
-        "如何": "",
-        "什么": "",
-    }
-    for old, new in replacements.items():
-        normalized = normalized.replace(old, new)
-    return normalized
-
-
-def _fallback_chinese_terms(text: str) -> list[str]:
-    stop_words = ["应该", "应当", "怎么", "如何", "什么", "是否", "可以", "进行", "统计"]
-    terms: list[str] = []
-    for sequence in re.findall(r"[\u4e00-\u9fff]{2,}", text):
-        cleaned = sequence
-        for word in stop_words:
-            cleaned = cleaned.replace(word, "")
-        if 2 <= len(cleaned) <= 8:
-            terms.append(cleaned)
-        elif len(cleaned) > 8:
-            terms.extend(cleaned[index : index + 4] for index in range(0, len(cleaned) - 3, 4))
-    return terms
-
-
-def _expanded_domain_terms(normalized_question: str) -> list[str]:
-    expansions: list[str] = []
-    if "获奖" in normalized_question:
-        expansions.extend(["获奖", "获奖记录", "获奖时间", "获奖等级", "奖项名称"])
-    if "荣誉" in normalized_question:
-        expansions.extend(["荣誉", "荣誉奖项", "奖学金", "评优", "荣誉称号"])
-    if "技能" in normalized_question:
-        expansions.extend(["技能", "技能专长", "掌握程度", "熟练程度"])
-    if any(term in normalized_question for term in ["区别", "差异", "关系", "等同", "不同", "比较"]):
-        expansions.extend(["区别", "差异", "关系", "等同"])
-    if "项目" in normalized_question:
-        expansions.extend(["项目", "项目经历", "项目背景", "技术栈", "项目成果"])
-    if "证书" in normalized_question or "资格" in normalized_question:
-        expansions.extend(["证书", "证书编号", "证书名称", "发证机构"])
-    if "教育" in normalized_question and "专业" in normalized_question:
-        expansions.extend(["教育背景", "学校", "专业", "学位", "毕业"])
-    return expansions
 
 
 def _candidate_evidence_text(candidate: VectorSearchResult) -> str:

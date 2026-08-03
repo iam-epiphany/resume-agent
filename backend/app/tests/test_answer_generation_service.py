@@ -12,8 +12,8 @@ from backend.app.services.answer_generation_service import (
 from backend.app.services.intent_router_service import (
     INTENT_GREETING,
     INTENT_OFF_TOPIC,
-    INTENT_PROJECT_DEEP_DIVE,
-    INTENT_RESUME_DETAIL,
+    INTENT_RESUME_QA,
+    INTENT_RESUME_QA,
 )
 
 
@@ -89,7 +89,7 @@ def test_off_topic_intent_redirects_without_llm(monkeypatch) -> None:
 def test_sufficient_evidence_returns_answered_without_prefix(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="证书有效期至2025年12月31日。", evidence_sufficiency="sufficient")
 
-    result = generate_answer("证书有效期是什么？", [_chunk()], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("证书有效期是什么？", [_chunk()], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "answered"
     assert result.evidence_sufficiency == "sufficient"
@@ -100,7 +100,7 @@ def test_sufficient_evidence_returns_answered_without_prefix(monkeypatch) -> Non
 def test_partial_sufficiency_forces_hedge_prefix(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="可能参与了秒杀项目的核心开发。", evidence_sufficiency="partial")
 
-    result = generate_answer("秒杀项目你做了什么？", [_chunk()], intent=INTENT_PROJECT_DEEP_DIVE)
+    result = generate_answer("秒杀项目你做了什么？", [_chunk()], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
@@ -111,7 +111,7 @@ def test_partial_sufficiency_forces_hedge_prefix(monkeypatch) -> None:
 def test_insufficient_evidence_is_hedged_with_prefix(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="简历中未明确提及薪资预期。", evidence_sufficiency="insufficient")
 
-    result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.answer.startswith("根据现有知识库推测，")
@@ -124,7 +124,7 @@ def test_llm_provided_hedge_prefix_is_not_duplicated(monkeypatch) -> None:
         evidence_sufficiency="partial",
     )
 
-    result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.answer.count("根据现有知识库推测") == 1
@@ -134,7 +134,7 @@ def test_llm_provided_hedge_prefix_is_not_duplicated(monkeypatch) -> None:
 def test_missing_sufficiency_defaults_to_hedged(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="推测性回答。", evidence_sufficiency=None)
 
-    result = generate_answer("这个问题没有明确依据", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("这个问题没有明确依据", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
@@ -144,7 +144,7 @@ def test_missing_sufficiency_defaults_to_hedged(monkeypatch) -> None:
 def test_invalid_sufficiency_value_defaults_to_hedged(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="推测性回答。", evidence_sufficiency="unknown")
 
-    result = generate_answer("这个问题没有明确依据", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("这个问题没有明确依据", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
@@ -156,7 +156,7 @@ def test_llm_answer_is_returned_directly_without_validation_gate(monkeypatch) ->
     result = generate_answer(
         "请概述《技能专长.md》的主要内容。",
         [_chunk(text="技能专长包括Python开发与Java开发等技能。")],
-        intent=INTENT_RESUME_DETAIL,
+        intent=INTENT_RESUME_QA,
     )
 
     assert result.answer_mode == "answered"
@@ -170,7 +170,7 @@ def test_llm_answer_is_returned_directly_without_validation_gate(monkeypatch) ->
 
 def test_api_unavailable_uses_extractive_fallback(monkeypatch) -> None:
     monkeypatch.setattr(answer_generation_service, "ANSWER_GENERATION_API_KEY", None)
-    result = generate_answer("证书有效期是什么？", [_chunk()], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("证书有效期是什么？", [_chunk()], intent=INTENT_RESUME_QA)
 
     assert result.degraded is True
     assert result.answer_mode == "hedged"
@@ -183,7 +183,7 @@ def test_api_unavailable_uses_extractive_fallback(monkeypatch) -> None:
 def test_empty_context_with_llm_disabled_returns_failed_fallback(monkeypatch) -> None:
     monkeypatch.setattr(answer_generation_service, "ANSWER_GENERATION_API_KEY", None)
 
-    result = generate_answer("不存在的问题", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("不存在的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "failed"
     assert result.answer == FALLBACK_NO_CONTEXT
@@ -199,7 +199,7 @@ def test_empty_context_with_llm_exception_returns_failed_fallback(monkeypatch) -
     monkeypatch.setattr(answer_generation_service, "ANSWER_GENERATION_API_KEY", "test-key")
     monkeypatch.setattr(answer_generation_service, "_call_llm", failing_call)
 
-    result = generate_answer("不存在的问题", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("不存在的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "failed"
     assert result.answer == FALLBACK_NO_CONTEXT
@@ -216,7 +216,7 @@ def test_llm_exception_with_context_uses_extractive_fallback(monkeypatch) -> Non
     result = generate_answer(
         "证书有效期是什么？",
         [_chunk(text="证书有效期至2025年12月31日。")],
-        intent=INTENT_RESUME_DETAIL,
+        intent=INTENT_RESUME_QA,
     )
 
     assert result.answer_mode == "hedged"
@@ -228,7 +228,7 @@ def test_llm_exception_with_context_uses_extractive_fallback(monkeypatch) -> Non
 def test_llm_returns_empty_answer_falls_back_to_extract(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="")
 
-    result = generate_answer("证书有效期是什么？", [_chunk()], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("证书有效期是什么？", [_chunk()], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.degraded is True

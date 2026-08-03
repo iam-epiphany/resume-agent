@@ -166,7 +166,9 @@ def test_retrieve_citations_ranks_by_rerank_score_after_lenient_gate(monkeypatch
         "DOC-TEST-0001-CHUNK-0005",
         "DOC-TEST-0001-CHUNK-0003",
     ]
-    assert matches[0].evidence_role == "direct_evidence"
+    # 通用分词器下：paragraph 文本与问题 bigram 覆盖高 → direct；table 覆盖低 → related
+    assert matches[1].evidence_role == "direct_evidence"
+    assert matches[0].evidence_role == "related_context"
     assert all(match.citation.evidence_role != "table_context" for match in matches)
 
 

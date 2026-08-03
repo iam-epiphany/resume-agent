@@ -23,7 +23,7 @@ from backend.app.services.answer_generation_service import (
 from backend.app.services.intent_router_service import (
     INTENT_GREETING,
     INTENT_OFF_TOPIC,
-    INTENT_RESUME_DETAIL,
+    INTENT_RESUME_QA,
 )
 
 
@@ -65,7 +65,7 @@ def _mock_llm(monkeypatch, *, answer: str, evidence_sufficiency=None) -> None:
 def test_sufficient_maps_to_answered_without_prefix(monkeypatch) -> None:
     _mock_llm(monkeypatch, answer="证书有效期至2025年12月31日。", evidence_sufficiency="sufficient")
 
-    result = generate_answer("证书有效期是什么？", _chunk(), intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("证书有效期是什么？", _chunk(), intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "answered"
     assert result.evidence_sufficiency == "sufficient"
@@ -76,7 +76,7 @@ def test_sufficient_maps_to_answered_without_prefix(monkeypatch) -> None:
 def test_partial_and_insufficient_map_to_hedged_with_forced_prefix(monkeypatch, sufficiency) -> None:
     _mock_llm(monkeypatch, answer="推测性回答内容。", evidence_sufficiency=sufficiency)
 
-    result = generate_answer("某个没有直接依据的问题", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("某个没有直接依据的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == sufficiency
@@ -91,7 +91,7 @@ def test_llm_provided_prefix_is_kept_without_duplication(monkeypatch) -> None:
         evidence_sufficiency="insufficient",
     )
 
-    result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.answer.count(HEDGE_PREFIX) == 1
@@ -105,7 +105,7 @@ def test_llm_provided_prefix_without_comma_is_not_duplicated(monkeypatch) -> Non
         evidence_sufficiency="partial",
     )
 
-    result = generate_answer("薪资如何？", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("薪资如何？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.answer.count(HEDGE_PREFIX) == 1
@@ -114,7 +114,7 @@ def test_llm_provided_prefix_without_comma_is_not_duplicated(monkeypatch) -> Non
 def test_missing_sufficiency_maps_to_hedged_with_forced_prefix(monkeypatch) -> None:
     _mock_llm(monkeypatch, answer="没有给出自评的回答。", evidence_sufficiency=None)
 
-    result = generate_answer("未自评的问题", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("未自评的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
@@ -124,7 +124,7 @@ def test_missing_sufficiency_maps_to_hedged_with_forced_prefix(monkeypatch) -> N
 def test_invalid_sufficiency_maps_to_hedged(monkeypatch) -> None:
     _mock_llm(monkeypatch, answer="非法自评值的回答。", evidence_sufficiency="unknown")
 
-    result = generate_answer("非法自评的问题", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("非法自评的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
@@ -173,7 +173,7 @@ def test_off_topic_maps_to_redirected_with_template_text(monkeypatch) -> None:
 def test_empty_chunks_with_llm_disabled_maps_to_failed(monkeypatch) -> None:
     monkeypatch.setattr(answer_generation_service, "ANSWER_GENERATION_API_KEY", None)
 
-    result = generate_answer("知识库中没有的问题", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("知识库中没有的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "failed"
     assert result.answer == FALLBACK_NO_CONTEXT
@@ -189,7 +189,7 @@ def test_empty_chunks_with_llm_exception_maps_to_failed(monkeypatch) -> None:
     monkeypatch.setattr(answer_generation_service, "ANSWER_GENERATION_API_KEY", "test-key")
     monkeypatch.setattr(answer_generation_service, "_call_llm", failing_call)
 
-    result = generate_answer("知识库中没有的问题", [], intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("知识库中没有的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "failed"
     assert result.answer == FALLBACK_NO_CONTEXT
@@ -199,7 +199,7 @@ def test_empty_chunks_with_llm_exception_maps_to_failed(monkeypatch) -> None:
 def test_empty_answer_from_llm_with_chunks_maps_to_hedged_extract(monkeypatch) -> None:
     _mock_llm(monkeypatch, answer="")
 
-    result = generate_answer("证书有效期是什么？", _chunk(), intent=INTENT_RESUME_DETAIL)
+    result = generate_answer("证书有效期是什么？", _chunk(), intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.degraded is True

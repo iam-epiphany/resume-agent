@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
-"""意图路由服务测试：规则命中 / LLM 兜底 / 失败回退 / 策略映射。"""
+"""意图路由服务测试：纯 LLM 3 类分类 / 混合问题归 resume_qa / 失败回退 / 合并追问补全。"""
 
 import pytest
 
 from backend.app.services import intent_router_service
 from backend.app.services.intent_router_service import (
+    ALL_INTENTS,
     INTENT_GREETING,
-    INTENT_HR_QUALITY,
     INTENT_OFF_TOPIC,
-    INTENT_PROJECT_DEEP_DIVE,
-    INTENT_RESUME_DETAIL,
-    INTENT_SELF_INTRO,
-    INTENT_TECH_QUIZ,
+    INTENT_RESUME_QA,
     _STRATEGIES,
-    classify_intent,
+    classify_and_resolve,
 )
 from backend.app.services.llm_client import ChatCompletionError
 
@@ -26,194 +23,228 @@ def _llm_mock(monkeypatch, content: str) -> None:
     )
 
 
+def _payload(intent: str, **overrides) -> dict:
+    base = {
+        "intent": intent,
+        "confidence": 0.85,
+        "reason": "测试",
+        "rewritten_question": "",
+        "needs_context": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def _llm_mock_json(monkeypatch, payload: dict) -> None:
+    import json
+
+    _llm_mock(monkeypatch, json.dumps(payload, ensure_ascii=False))
+
+
 # ---------------------------------------------------------------------------
-# 规则命中（零 LLM，classifier="rule"）
+# 3 类分类（classifier="llm"）
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    ("question", "expected"),
-    [
-        ("你好，能介绍一下自己吗？", INTENT_GREETING),
-        ("您好，请问在吗", INTENT_GREETING),
-        ("谢谢！", INTENT_GREETING),
-        ("早上好", INTENT_GREETING),
-    ],
+    "intent",
+    [INTENT_RESUME_QA, INTENT_GREETING, INTENT_OFF_TOPIC],
 )
-def test_rule_hits_greeting(question, expected) -> None:
-    result = classify_intent(question)
+def test_llm_classifies_each_of_three_intents(monkeypatch, intent) -> None:
+    _llm_mock_json(monkeypatch, _payload(intent, reason=f"{intent} 理由"))
 
-    assert result.intent == expected
-    assert result.classifier == "rule"
-    assert result.confidence == 0.9
-    assert result.reason is not None and "命中规则词" in result.reason
+    result = classify_and_resolve("某个面试问题")
 
-
-@pytest.mark.parametrize(
-    "question",
-    [
-        "今天天气怎么样",
-        "帮我写一首诗",
-        "现在几点了",
-        "彩票怎么买",
-        "讲个笑话",
-    ],
-)
-def test_rule_hits_off_topic(question) -> None:
-    result = classify_intent(question)
-
-    assert result.intent == INTENT_OFF_TOPIC
-    assert result.classifier == "rule"
-    assert result.confidence == 0.9
+    assert result.intent == intent
+    assert result.classifier == "llm"
+    assert result.confidence == 0.85
+    assert result.reason == f"{intent} 理由"
 
 
-@pytest.mark.parametrize(
-    "question",
-    [
-        "请做个自我介绍",
-        "介绍一下你自己",
-        "你是谁",
-        "简单介绍下你的情况",
-        "自我介绍一下吧",
-    ],
-)
-def test_rule_hits_self_intro(question) -> None:
-    result = classify_intent(question)
+def test_llm_classifies_resume_qa_for_project_question(monkeypatch) -> None:
+    _llm_mock_json(monkeypatch, _payload(INTENT_RESUME_QA))
 
-    assert result.intent == INTENT_SELF_INTRO
-    assert result.classifier == "rule"
+    result = classify_and_resolve("秒杀项目怎么解决超卖问题的？")
+
+    assert result.intent == INTENT_RESUME_QA
 
 
-@pytest.mark.parametrize(
-    "question",
-    [
-        "你的技术栈是什么",
-        "你在哪个学校上学",
-        "你的邮箱是什么",
-        "什么时候毕业",
-        "获过哪些奖项",
-        "你的绩点是多少",
-    ],
-)
-def test_rule_hits_resume_detail(question) -> None:
-    result = classify_intent(question)
+def test_llm_classifies_greeting(monkeypatch) -> None:
+    _llm_mock_json(monkeypatch, _payload(INTENT_GREETING))
 
-    assert result.intent == INTENT_RESUME_DETAIL
-    assert result.classifier == "rule"
-
-
-def test_rule_priority_greeting_wins_over_off_topic() -> None:
-    result = classify_intent("你好，今天天气怎么样")
+    result = classify_and_resolve("你好")
 
     assert result.intent == INTENT_GREETING
-    assert result.classifier == "rule"
+    assert result.strategy.polite_redirect is True
+
+
+def test_llm_classifies_off_topic(monkeypatch) -> None:
+    _llm_mock_json(monkeypatch, _payload(INTENT_OFF_TOPIC))
+
+    result = classify_and_resolve("你会做红烧肉吗")
+
+    assert result.intent == INTENT_OFF_TOPIC
+    assert result.strategy.polite_redirect is True
+
+
+def test_strategy_mapping_only_polite_redirect_remains() -> None:
+    assert _STRATEGIES[INTENT_RESUME_QA].polite_redirect is False
+    assert _STRATEGIES[INTENT_GREETING].polite_redirect is True
+    assert _STRATEGIES[INTENT_OFF_TOPIC].polite_redirect is True
 
 
 # ---------------------------------------------------------------------------
-# LLM 兜底（classifier="llm"）
+# LLM 返回异常/未知 → 保守回退 resume_qa（classifier="fallback"）
 # ---------------------------------------------------------------------------
 
-def test_llm_path_returns_classified_intent(monkeypatch) -> None:
-    _llm_mock(
-        monkeypatch,
-        '{"intent": "tech_quiz", "confidence": 0.82, "reason": "Java 原理类问题"}',
-    )
+def test_llm_returns_unknown_intent_falls_back_to_resume_qa(monkeypatch) -> None:
+    _llm_mock_json(monkeypatch, _payload("unknown_intent"))
 
-    result = classify_intent("Java的HashMap扩容机制是怎么工作的？")
+    result = classify_and_resolve("一个意图未知的问题")
 
-    assert result.intent == INTENT_TECH_QUIZ
-    assert result.classifier == "llm"
-    assert result.confidence == 0.82
-    assert result.reason == "Java 原理类问题"
-
-
-def test_llm_path_project_deep_dive(monkeypatch) -> None:
-    _llm_mock(
-        monkeypatch,
-        '{"intent": "project_deep_dive", "confidence": 0.9, "reason": "追问项目细节"}',
-    )
-
-    result = classify_intent("秒杀项目怎么解决超卖问题的？")
-
-    assert result.intent == INTENT_PROJECT_DEEP_DIVE
-    assert result.classifier == "llm"
-    assert result.strategy.rewrite is True
-
-
-def test_llm_path_hr_quality(monkeypatch) -> None:
-    _llm_mock(
-        monkeypatch,
-        '{"intent": "hr_quality", "confidence": 0.7, "reason": "职业规划"}',
-    )
-
-    result = classify_intent("你的职业规划是什么？")
-
-    assert result.intent == INTENT_HR_QUALITY
-    assert result.classifier == "llm"
-
-
-def test_llm_returns_unknown_intent_falls_back(monkeypatch) -> None:
-    _llm_mock(monkeypatch, '{"intent": "unknown_intent", "confidence": 0.9}')
-
-    result = classify_intent("一个规则未命中的问题")
-
-    assert result.intent == INTENT_RESUME_DETAIL
+    assert result.intent == INTENT_RESUME_QA
     assert result.classifier == "fallback"
+    assert result.confidence == 0.3
+    assert result.rewritten_question == "一个意图未知的问题"
 
 
-# ---------------------------------------------------------------------------
-# LLM 失败 → 兜底 resume_detail（classifier="fallback"）
-# ---------------------------------------------------------------------------
-
-def test_llm_failure_falls_back_to_resume_detail(monkeypatch) -> None:
+def test_llm_failure_falls_back_to_resume_qa_with_original_question(monkeypatch) -> None:
     def failing_llm(config, messages, **kwargs):
         raise ChatCompletionError("LLM API key is not configured")
 
     monkeypatch.setattr(intent_router_service, "chat_completion_content", failing_llm)
 
-    result = classify_intent("这个问题的意图完全无法用规则判断")
+    result = classify_and_resolve("这个问题的意图完全无法判断")
 
-    assert result.intent == INTENT_RESUME_DETAIL
+    assert result.intent == INTENT_RESUME_QA
     assert result.classifier == "fallback"
     assert result.confidence == 0.3
-    assert result.reason == "意图分类失败，回退简历细节类"
+    assert result.rewritten_question == "这个问题的意图完全无法判断"
+    assert result.needs_context is False
 
 
-def test_llm_invalid_json_falls_back_to_resume_detail(monkeypatch) -> None:
+def test_llm_invalid_json_falls_back_to_resume_qa(monkeypatch) -> None:
     _llm_mock(monkeypatch, "这不是一个 JSON")
 
-    result = classify_intent("规则无法判断的问题")
+    result = classify_and_resolve("规则无法判断的问题")
 
-    assert result.intent == INTENT_RESUME_DETAIL
+    assert result.intent == INTENT_RESUME_QA
     assert result.classifier == "fallback"
 
 
+def test_router_disabled_falls_back_to_resume_qa(monkeypatch) -> None:
+    monkeypatch.setattr(intent_router_service, "INTENT_ROUTER_ENABLED", False)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("路由关闭时不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", fail_if_called)
+
+    result = classify_and_resolve("你好，介绍一下你的项目")
+
+    assert result.intent == INTENT_RESUME_QA
+    assert result.classifier == "fallback"
+    assert result.rewritten_question == "你好，介绍一下你的项目"
+
+
 # ---------------------------------------------------------------------------
-# 策略映射
+# 合并追问补全（带上一轮 / 无上一轮 / 新话题）
 # ---------------------------------------------------------------------------
 
-def test_strategy_mapping_polite_redirect_for_greeting_and_off_topic() -> None:
-    greeting_strategy = _STRATEGIES[INTENT_GREETING]
-    off_topic_strategy = _STRATEGIES[INTENT_OFF_TOPIC]
+def test_resolve_completes_followup_with_previous_turn(monkeypatch) -> None:
+    previous = {
+        "question": "介绍一下你的秒杀项目",
+        "answer_excerpt": "秒杀项目使用 Redis 预扣库存。",
+    }
+    _llm_mock_json(
+        monkeypatch,
+        _payload(
+            INTENT_RESUME_QA,
+            rewritten_question="秒杀项目中如何解决超卖问题？",
+            needs_context=True,
+        ),
+    )
 
-    assert greeting_strategy.polite_redirect is True
-    assert greeting_strategy.direct_generation_allowed is False
-    assert off_topic_strategy.polite_redirect is True
-    assert off_topic_strategy.direct_generation_allowed is False
+    result = classify_and_resolve("那怎么解决超卖的？", previous)
+
+    assert result.intent == INTENT_RESUME_QA
+    assert result.rewritten_question == "秒杀项目中如何解决超卖问题？"
+    assert result.needs_context is True
 
 
-def test_strategy_mapping_rewrite_for_deep_dive_and_tech_quiz() -> None:
-    assert _STRATEGIES[INTENT_PROJECT_DEEP_DIVE].rewrite is True
-    assert _STRATEGIES[INTENT_TECH_QUIZ].rewrite is True
-    assert _STRATEGIES[INTENT_RESUME_DETAIL].rewrite is False
+def test_resolve_keeps_original_when_new_topic(monkeypatch) -> None:
+    previous = {
+        "question": "介绍一下你的秒杀项目",
+        "answer_excerpt": "秒杀项目使用 Redis 预扣库存。",
+    }
+    _llm_mock_json(
+        monkeypatch,
+        _payload(
+            INTENT_RESUME_QA,
+            rewritten_question="你的技术栈是什么？",
+            needs_context=False,
+        ),
+    )
+
+    result = classify_and_resolve("你的技术栈是什么？", previous)
+
+    assert result.needs_context is False
+    assert result.rewritten_question == "你的技术栈是什么？"
 
 
-def test_strategy_anchored_for_self_intro_and_hr_quality() -> None:
-    assert _STRATEGIES[INTENT_SELF_INTRO].anchor_documents == ("自我介绍", "简历文字版")
-    assert "求职动机与职业规划" in _STRATEGIES[INTENT_HR_QUALITY].anchor_documents
+def test_resolve_without_previous_turn_passes_question(monkeypatch) -> None:
+    _llm_mock_json(
+        monkeypatch,
+        _payload(INTENT_RESUME_QA, rewritten_question="你的技术栈是什么？", needs_context=False),
+    )
+
+    result = classify_and_resolve("你的技术栈是什么？", None)
+
+    assert result.rewritten_question == "你的技术栈是什么？"
+    assert result.needs_context is False
 
 
-def test_classify_result_carries_retrieval_strategy() -> None:
-    result = classify_intent("请做个自我介绍")
+def test_resolve_uses_original_question_when_rewrite_empty(monkeypatch) -> None:
+    _llm_mock_json(
+        monkeypatch,
+        _payload(INTENT_RESUME_QA, rewritten_question="", needs_context=False),
+    )
 
-    assert result.strategy.anchor_documents == ("自我介绍", "简历文字版")
-    assert result.strategy.polite_redirect is False
+    result = classify_and_resolve("介绍一下你的项目")
+
+    assert result.rewritten_question == "介绍一下你的项目"
+
+
+def test_resolve_failure_keeps_original_question(monkeypatch) -> None:
+    def failing_llm(config, messages, **kwargs):
+        raise ChatCompletionError("LLM API key is not configured")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", failing_llm)
+    previous = {"question": "秒杀项目怎么设计的？", "answer_excerpt": "使用 Redis 预扣库存。"}
+
+    result = classify_and_resolve("那怎么解决超卖的？", previous)
+
+    assert result.rewritten_question == "那怎么解决超卖的？"
+    assert result.needs_context is False
+    assert result.intent == INTENT_RESUME_QA
+
+
+# ---------------------------------------------------------------------------
+# 混合/边界：寒暄+实质问题归 resume_qa（由 LLM 判定；验证 prompt 语义被遵守）
+# ---------------------------------------------------------------------------
+
+def test_llm_json_escaped_output_is_parsed(monkeypatch) -> None:
+    _llm_mock(
+        monkeypatch,
+        '前置说明 {"intent": "resume_qa", "confidence": 0.9, '
+        '"reason": "项目问题", "rewritten_question": "介绍一下你的秒杀项目", '
+        '"needs_context": false} 后置说明',
+    )
+
+    result = classify_and_resolve("介绍一下你的秒杀项目")
+
+    assert result.intent == INTENT_RESUME_QA
+    assert result.rewritten_question == "介绍一下你的秒杀项目"
+
+
+def test_all_intents_are_exactly_three() -> None:
+    assert set(ALL_INTENTS) == {INTENT_RESUME_QA, INTENT_GREETING, INTENT_OFF_TOPIC}
