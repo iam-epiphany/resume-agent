@@ -1,13 +1,16 @@
-"""公开就绪状态：供前台（匿名）轮询，只暴露 ready + 一句中文 message，不泄露内部细节。
+"""公开就绪状态：供前台（匿名）轮询，只暴露 ready + 一句中文 message + 负载分级，
+不泄露内部细节。
 
 与后台 /health/rag 的区别：不返回模型路径、设备、性能等内部信息，且不做 LibreOffice、
-warmup 等重检查，保证轮询足够轻量。
+warmup 等重检查，保证轮询足够轻量。负载分级（load 字段）见 load_status_service.py，
+信号全部来自内存/DB 快照，不引入额外开销。
 """
 
 from sqlalchemy import func, select, text
 
 from backend.app.core import config
 from backend.app.models.document import Document
+from backend.app.services.load_status_service import load_status_snapshot
 from backend.app.services.model_path_resolver import (
     ModelPathResolutionError,
     resolve_embedding_model_local_path,
@@ -15,8 +18,8 @@ from backend.app.services.model_path_resolver import (
 )
 
 
-def public_qa_status() -> dict[str, str | bool]:
-    """返回 {ready, message}；message 为面向普通访客的中文一句说明。"""
+def public_qa_status() -> dict[str, str | bool | dict]:
+    """返回 {ready, message, load}；message 为面向普通访客的中文一句说明。"""
     errors: list[str] = []
 
     if not _sqlite_ready():
@@ -34,7 +37,13 @@ def public_qa_status() -> dict[str, str | bool]:
 
     if errors:
         return {"ready": False, "message": "，".join(errors) + "，请稍后再试。"}
-    return {"ready": True, "message": "系统已就绪，可以开始提问。"}
+    result: dict[str, str | bool | dict] = {"ready": True, "message": "系统已就绪，可以开始提问。"}
+    try:
+        result["load"] = load_status_snapshot()
+    except Exception:
+        # 负载采集失败不阻塞状态接口：降级为绿（无压力信号），下次轮询再试
+        result["load"] = {"level": "green", "signals": None}
+    return result
 
 
 def _sqlite_ready() -> bool:

@@ -22,7 +22,7 @@ docker compose version
 
 ## 2. 系统调优（关键：防 OOM）
 
-2C4G 上应用常驻约 2.5GB，建议开 **2GB swap**，防止内存峰值触发 OOM kill：
+2C4G 上应用常驻约 2.2GB（embedding 已换 bge-small-zh-v1.5；2026-08-12 起问答双 worker 并行，实测进程峰值约 1.3GB、容器内预计 2-2.4GB），建议开 **2GB swap**，防止内存峰值触发 OOM kill：
 
 ```bash
 sudo fallocate -l 2G /swapfile
@@ -64,6 +64,9 @@ RESUME_PERFORMANCE_MODE=cpu_low_resource
 RESUME_OFFLINE_MODE=false            # 首次在线下载模型；下载完成后可改 true
 HF_ENDPOINT=https://hf-mirror.com      # 国内下载镜像
 TORCH_NUM_THREADS=2
+RERANK_INPUT_MODE=compact
+RERANK_CANDIDATE_LIMIT=12
+RERANK_TOP_K=12
 
 # 前台/后台权限分离（必填）：管理员密码，进入后台（知识库管理/系统状态）使用
 ADMIN_PASSWORD=改成强密码
@@ -95,7 +98,7 @@ docker compose logs -f app
 
 ## 6. 模型下载与预热
 
-首次启动会自动从 HuggingFace（hf-mirror 镜像）下载两个模型（约 1.5GB），下载到 `data/model_cache/`。模型默认后台自动预热（`MODEL_WARMUP_POLICY=background`），也可登录后手动触发：
+首次启动会自动从 HuggingFace（hf-mirror 镜像）下载两个模型（embedding bge-small-zh-v1.5 约 100MB + reranker bge-reranker-base 约 1.1GB，合计约 1.2GB），下载到 `data/model_cache/`。模型默认后台自动预热（`MODEL_WARMUP_POLICY=background`），也可登录后手动触发：
 
 ```bash
 # 1. 登录拿 token
@@ -116,13 +119,16 @@ curl http://127.0.0.1:8000/api/health
 
 > 就绪状态（模型/向量库/文档数）属后台信息：登录后在前台侧栏系统状态面板查看；访客前台轮询轻量 `/api/qa/status`。容器 healthy 不等于模型就绪，模型就绪以系统状态面板为准。
 
-> 若下载过慢或失败：也可在本地下载模型后 scp 到服务器 `data/models/bge-base-zh-v1.5/` 和 `data/models/bge-reranker-base/`（含 config.json、tokenizer 文件、*.safetensors），再把 `RESUME_OFFLINE_MODE` 设为 `true` 完全离线运行。
+> 若下载过慢或失败：也可在本地下载模型后 scp 到服务器 `data/models/bge-small-zh-v1.5/` 和 `data/models/bge-reranker-base/`（含 config.json、tokenizer 文件、*.safetensors），再把 `RESUME_OFFLINE_MODE` 设为 `true` 完全离线运行。
 
 ## 7. 上传知识库
 
 在服务器上（或本地指向公网地址）运行上传脚本，扫描 `docs/` 下的个人材料：
 
 ```bash
+# 先做静态与运行库审计；首次部署没有 app.db 时会跳过运行库核对
+python3 scripts/audit_knowledge_base.py
+
 # 服务器本地执行（需要服务器上有 docs/ 内容，或本地执行后指向公网地址）
 # 管理员密码默认从环境变量 ADMIN_PASSWORD 读取，也可用 --admin-password 显式传入
 python3 scripts/upload_knowledge_base.py
@@ -132,6 +138,8 @@ python scripts/upload_knowledge_base.py --base-url http://你的域名:8000 --ad
 ```
 
 脚本会自动：扫描 → 上传 → 等待索引完成 → 打印向量数。图片（荣誉 jpg）无法解析，需先转 PDF。
+
+不要从开发机复制 `data/qdrant/` 到服务器：个人知识库重建很快，而历史 segment/WAL 可能达到数 GB。只同步 `docs/` 与可选的 `data/models/`，然后在服务器重新上传建库。若旧环境已同时索引简历 PDF 和 `简历文字版.md`，先删除 PDF 文档，只保留文字版口径基线。
 
 ## 8. 公网访问
 
@@ -223,7 +231,7 @@ docker stats
 free -h
 
 # 调参（修改 .env 后 docker compose up -d 生效，无需重新构建镜像）
-# MIN_RERANK_SCORE / RERANK_PROMPT_THRESHOLD：证据过滤阈值，回答过严/过松时调整
+# RERANK_PROMPT_THRESHOLD / MIN_CORE_RERANK_SCORE：证据过滤阈值，回答过严/过松时调整
 ```
 
 ## 11. 常见问题

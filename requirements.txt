@@ -12,8 +12,6 @@ python-dotenv==1.2.2
 python-multipart==0.0.20
 SQLAlchemy==2.0.45
 python-docx==1.2.0
-openpyxl==3.1.5
-xlrd==2.0.1
 pypdf==6.4.2
 reportlab==4.4.9
 pillow==12.2.0
@@ -28,7 +26,12 @@ typing_extensions==4.16.0
 uvicorn==0.50.0
 flatbuffers==25.12.19
 networkx==3.6.1
+ml_dtypes==0.5.4
 numpy==2.5.1
+onnx==1.22.0
+onnxruntime==1.28.0
+optimum==2.1.0
+optimum-onnx==0.1.0
 protobuf==7.35.1
 PyYAML==6.0.3
 PyJWT==2.10.1

@@ -48,6 +48,10 @@ from backend.app.services.audit_service import record_event
 from backend.app.services.answer_generation_service import generate_answer
 from backend.app.services.conversation_memory_service import record_turn, recent_turns
 from backend.app.services.intent_router_service import classify_and_resolve
+from backend.app.services.llm_client import (
+    llm_call_count as _request_llm_call_count,
+    reset_llm_call_count as _reset_llm_call_count,
+)
 from backend.app.services.query_planner_service import (
     QueryAspect,
     QueryPlan,
@@ -57,7 +61,6 @@ from backend.app.services.query_planner_service import (
     rewrite_search_queries,
 )
 from backend.app.services.prompt_builder import RAGPromptBuilder
-from backend.app.services.question_preprocessing_service import preprocess_qa_request
 from backend.app.services.retrieval_service import (
     RetrievalDiagnostics,
     RetrievalMatch,
@@ -75,6 +78,7 @@ from backend.app.services.retrieval_service import (
 from backend.app.services.embedding_service import EmbeddingServiceError
 from backend.app.services.model_device_service import get_model_device_info
 from backend.app.services.performance_metrics import measure, trace_operation
+from backend.app.services import qa_cache_service
 from backend.app.services.rerank_service import RerankServiceError, rerank_candidates
 from backend.app.services.vector_store_service import VectorSearchResult, VectorStoreError
 
@@ -226,6 +230,29 @@ def answer_question(
         return QAResponse(answer=None, answer_mode="failed", generation_status="skipped", context_package=None)
     original_question = cleaned_question
 
+    # 请求级 LLM 调用计数清零：统计本问真实发起的 API 请求数（llm_client 层计数）
+    _reset_llm_call_count()
+
+    # 问答答案缓存（独立问题才查；追问链依赖前文，禁止缓存）：
+    # 命中直接返回完整答案（含证据上下文），零 LLM 调用、秒回
+    if session_id is None:
+        cached_response = qa_cache_service.lookup(db, cleaned_question)
+        if cached_response is not None:
+            cached_response.llm_call_count = 0
+            cached_response.cached = True
+            _report_progress(
+                progress_reporter,
+                {
+                    "stage": "cache",
+                    "status": "completed",
+                    "title": "命中缓存，直接返回答案",
+                    "detail": "该问题已有缓存答案，跳过检索与生成。",
+                    "summary": {"cached": True},
+                },
+            )
+            _save_qa_log(db, original_question, cached_response)
+            return cached_response
+
     # ① 意图分类 + 追问补全（一次 LLM 调用双职责；失败保守回退 resume_qa 原问）
     intent_started_at = perf_counter()
     _report_progress(
@@ -289,6 +316,7 @@ def answer_question(
             intent=intent_result.intent,
             resolved_question=(resolved_question if used_memory else None),
             generation_status=generated.generation_status,
+            llm_call_count=_request_llm_call_count(),
         )
         _record_turn_if_needed(db, session_id, original_question, resolved_question, intent_result.intent, response)
         _save_qa_log(db, original_question, response)
@@ -431,6 +459,7 @@ def answer_question(
         cancellation_checker=cancellation_checker,
         preview_reporter=report_preview,
         no_evidence=(fallback_level == 3),
+        known_entities=_known_resume_entities(db),
     )
     _report_progress(
         progress_reporter,
@@ -448,6 +477,9 @@ def answer_question(
         },
     )
 
+    # 真实 LLM 调用计数：由 llm_client 请求层统计（意图/规划/改写/生成所有模块的
+    # 真实 API 请求数，含超时/失败后 fallback 的调用；fast path 跳过 LLM 时不计）
+    llm_call_count = _request_llm_call_count()
     response = QAResponse(
         answer=generated.answer,
         answer_mode=generated.answer_mode,
@@ -459,10 +491,18 @@ def answer_question(
         context_package=package,
         degraded=generated.degraded,
         generation_status=generated.generation_status,
+        llm_call_count=llm_call_count,
     )
     _record_turn_if_needed(db, session_id, original_question, resolved_question, intent_result.intent, response)
     _save_qa_log(db, original_question, response)
     _log_qa_audit(db, "qa_answered", original_question, response)
+    # 写答案缓存：仅独立问题的 answered+sufficient 答案（推测/拒答/失败不缓存）
+    if (
+        session_id is None
+        and response.answer_mode == "answered"
+        and response.evidence_sufficiency == "sufficient"
+    ):
+        qa_cache_service.store(db, original_question, response)
     return response
 
 
@@ -508,8 +548,7 @@ def retrieve_context_package(
     cleaned_question = question.strip()
     if not cleaned_question:
         return _empty_context_package("")
-    preprocessed = preprocess_qa_request(cleaned_question, options)
-    return build_context_package(db, preprocessed.question, options=preprocessed.options)
+    return build_context_package(db, cleaned_question)
 
 
 def _plan_and_retrieve(
@@ -751,10 +790,12 @@ def _evidence_grade(context_chunks: list[RetrievalResult]) -> str:
     return "strong"
 
 
-def _document_catalog_entries(db: Session, limit: int = 60) -> list[tuple[str, str]]:
-    """运行时读取知识库文档清单 [(filename, title)]，供 planner 结构化使用。
+def _document_catalog_entries(db: Session, limit: int = 60) -> list[tuple[str, str, str]]:
+    """运行时读取知识库文档清单 [(filename, title, material_topic)]，供 planner 结构化使用。
 
     动态数据（每次从 Document 表读取），非硬编码：文档增删后自动反映。
+    material_topic 是简历领域类别（项目经历/技能掌握/竞赛奖项/证书资格/教育背景…），
+    供枚举检索按类别确定对象文档集合（文件名 pattern 仅作旧数据兼容 fallback）。
     """
     try:
         documents = db.scalars(
@@ -765,7 +806,14 @@ def _document_catalog_entries(db: Session, limit: int = 60) -> list[tuple[str, s
         ).all()
     except Exception:
         return []
-    return [(document.filename, (document.title or "").strip()) for document in documents]
+    return [
+        (
+            document.filename,
+            (document.title or "").strip(),
+            (document.material_topic or "").strip(),
+        )
+        for document in documents
+    ]
 
 
 def _document_catalog_summary(db: Session, limit: int = 60) -> str:
@@ -775,7 +823,7 @@ def _document_catalog_summary(db: Session, limit: int = 60) -> str:
     仅作 LLM 检索规划的提示上下文，不参与任何分数计算。
     """
     lines: list[str] = []
-    for filename, title in _document_catalog_entries(db, limit=limit):
+    for filename, title, _material_topic in _document_catalog_entries(db, limit=limit):
         if title and title != filename:
             lines.append(f"- {filename}（{title}）")
         else:
@@ -821,6 +869,75 @@ def _indexed_document_ids(db: Session) -> set[str]:
             )
         ).all()
     )
+
+
+def _anchor_document_ids(db: Session, anchor_documents: tuple[str, ...]) -> set[str]:
+    """把 aspect 锚定的对象文档名解析为 document_id 集合（用于检索过滤）。
+
+    仅解析已索引的文档；解析不到时返回空集（调用方不设过滤，退化为全库检索）。
+    """
+    if not anchor_documents:
+        return set()
+    try:
+        rows = db.execute(
+            select(Document.document_id, Document.filename).where(
+                Document.status.in_(["indexed", "table_indexed"]),
+                Document.filename.in_(list(anchor_documents)),
+            )
+        ).all()
+    except Exception:
+        return set()
+    return {document_id for document_id, _filename in rows}
+
+
+def _known_resume_entities(db: Session, limit: int = 60) -> list[str]:
+    """从知识库文档提取简历领域已知实体（学校/项目/奖项/证书/技术栈等）。
+
+    用于 grounding 硬事实校验：答案中出现但检索证据中缺失的已知实体被标记为
+    未核实。实体来源：文档标题、material_topic、颁发机构、文件名去前缀后的对象名。
+    全部动态读取 Document 表（非硬编码）。
+    """
+    try:
+        documents = db.scalars(
+            select(Document)
+            .where(Document.status == "indexed")
+            .order_by(Document.filename.asc())
+            .limit(limit)
+        ).all()
+    except Exception:
+        return []
+    entities: list[str] = []
+    seen: set[str] = set()
+    for document in documents:
+        candidates = [
+            (document.title or "").strip(),
+            (document.issuing_authority or "").strip(),
+            (document.material_topic or "").strip(),
+            _object_name_from_filename(document.filename),
+        ]
+        for candidate in candidates:
+            if not candidate or len(candidate) < 2:
+                continue
+            key = candidate.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append(candidate)
+    return entities
+
+
+def _object_name_from_filename(filename: str) -> str:
+    """从对象文档文件名提取对象名（"项目介绍_高并发电商秒杀平台.md" → "高并发电商秒杀平台"）。"""
+    name = filename or ""
+    for prefix in ("项目介绍_", "技能", "奖项", "荣誉", "证书"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    for suffix in (".md", ".txt", ".pdf", ".docx", ".doc"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.strip()
 
 
 def _keyword_recall_candidates(
@@ -1334,11 +1451,20 @@ def _retrieve_aspect_matches(
         }
         for search_query in aspect.search_queries
     ]
+    # 简历领域结构：确定性枚举/补集路径的 aspect 锚定了对象文档（如"项目介绍_高并发秒杀平台.md"），
+    # 把对象文档名解析为 document_id 集合作为 Qdrant 检索过滤——列举对象不依赖 embedding 相似度，
+    # 直接从对象文档召回（与关键词精确召回互补：dense 侧限定范围、应用层注入锚点）。
+    metadata_filter = None
+    if aspect.anchor_documents:
+        anchor_ids = _anchor_document_ids(db, aspect.anchor_documents)
+        if anchor_ids:
+            metadata_filter = {"document_ids": sorted(anchor_ids)}
     try:
         candidates, query_hits_by_chunk_id, diagnostics_by_query = collect_candidates_with_query_hits(
             search_queries,
             query_metadata=query_metadata,
             diagnostics=diagnostics,
+            metadata_filter=metadata_filter,
         )
     except (EmbeddingServiceError, VectorStoreError) as exc:
         raise RetrievalServiceUnavailable(str(exc)) from exc
@@ -1721,6 +1847,7 @@ def _to_retrieval_results(matches: list[RetrievalMatch]) -> list[RetrievalResult
                 citation_label=f"[{rank}]",
                 metadata={
                     "document_id": citation.document_id,
+                    "filename": citation.filename,
                     "page_number": citation.page_number,
                     "chunk_type": citation.chunk_type,
                     "evidence_role": match.evidence_role,
@@ -1833,10 +1960,13 @@ def _select_prompt_chunks(
     }
 
     def _doc_key(chunk: RetrievalResult) -> str:
-        return str(chunk.metadata.get("document_id") or "") or chunk.source_doc
+        # 统一用文档文件名作为文档身份标识（与 excluded_documents / anchor_documents 一致；
+        # document_id 是内部主键，filename 才是 planner/选择层共用的领域标识）。
+        # source_doc 恒为 citation.filename，是选择层可用的文件名。
+        return str(chunk.metadata.get("filename") or "") or chunk.source_doc
 
     def _doc_priority(doc_key: str) -> int:
-        # 对象文档（非排除）最高 → 其他文档 → 被排除对象文档（仅对照）
+        # 对象文档（非排除）最高 → 其他文档 → 被排除对象文档（仅对照，最终不入选）
         if doc_key in object_docs:
             return 0 if doc_key not in excluded_docs else 2
         return 1
@@ -1879,6 +2009,10 @@ def _select_prompt_chunks(
     def _select(chunk: RetrievalResult, aspect: AspectRetrieval) -> None:
         nonlocal in_phase_one
         if len(selected) >= target or chunk.chunk_id in selected_ids:
+            return
+        # 补集问句硬排除：被排除对象文档的 chunk 绝不进入最终 prompt
+        # （"除了这三个项目还有哪些"——已介绍的项目不得重复进回答依据）
+        if excluded_docs and _doc_key(chunk) in excluded_docs:
             return
         if _is_duplicate_or_redundant(chunk, selected):
             return
@@ -1932,6 +2066,8 @@ def _select_prompt_chunks(
             if len(selected) >= target:
                 break
             if chunk.chunk_id in selected_ids or not _passes_fill_bar(chunk):
+                continue
+            if excluded_docs and _doc_key(chunk) in excluded_docs:
                 continue
             if _is_duplicate_or_redundant(chunk, selected):
                 continue

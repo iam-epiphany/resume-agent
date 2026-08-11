@@ -1,5 +1,19 @@
 # Resume-Agent 改造进度记录
 
+## ✅ 访客问答访问码闸 + 全局预算保险丝（2026-08-04，后端 301 测试全绿 + 前端 35 全绿）
+
+**需求（用户拍板）**：简历分享给面试官后，如何让面试官正常使用问答、又防止陌生人/脚本恶意消耗 DeepSeek 额度。只实施访问码闸（Wbz_123，一天 JWT 存 cookie）；预算超限时前端弹窗提醒。
+
+**改动**：
+- **访问码闸（后端）**：`security.py` 新增访客 JWT（独立 sub=qa_visitor，与管理员 token 互不通用）、常量时间校验访问码；`api/qa.py` 新增 `POST /api/qa/access`（校验码→签发 24h httpOnly cookie）与 `GET /api/qa/access/status`；`require_qa_access` 依赖覆盖全部问答端点（ask/tasks/stream/retrieve），管理员 token 旁路；`QA_ACCESS_CODE` 为空 = 闸门关闭（开发/测试默认），部署时 .env 设置
+- **全局预算保险丝**：`QA_GLOBAL_DAILY_LIMIT`（默认 300）跨 IP 统计当日 qa_logs；剩余 ≤ max(30, 15%) 时响应带 `X-QA-Budget-Warning` 头 + 前端弹窗"今日预算即将超限"（每会话一次）；用尽后新问答 429"今日问答预算已用完，请明天再试"（防换 IP 刷爆）
+- **前端**：RagPage 挂载时拉取访问闸状态 + 每 60s 轮询预算；未授权显示访问码门（输入框 + 校验 + 错误提示），授权后正常问答；预算提醒横幅可关闭
+- **配置**：.env 写入 `QA_ACCESS_CODE=Wbz_123`、`QA_GLOBAL_DAILY_LIMIT=300`、`COOKIE_SECURE=false`（HTTPS 部署时置 true）
+
+**测试**：新增 `test_qa_access.py`（10 用例：闸门默认关闭/未授权 401/错误码 403/正确码签发 cookie/管理员旁路/状态端点/预算告警头/预算用尽 429/任务创建告警头/当日计数只算今天）；隔离方案——独立 SQLite 引擎 + patch 各模块 SessionLocal 引用（Depends 在路由注册时已捕获 get_db，patch 模块属性无效）；全量 301 通过
+
+**遗留**：①docker 容器仍运行旧代码，需 `docker compose up -d --build`；②DeepSeek 平台侧仍建议设置余额预警（系统内预算与平台预算互为双保险）
+
 ## ✅ 检索规划确定性化 + 多路召回 + 配额式选择 + 生成纪律（2026-08-03，后端 291 测试全绿 + 真实系统复测通过）
 
 **需求（用户拍板）**：追问"除了这三个还有哪些项目"答错（把已介绍的 REV/ReguMate 又答一遍、声称"知识库没有详细记录"），根因是四层系统缺陷叠加：规划层靠 LLM 猜（臆测排除名单）、召回层只有 dense 单路（列举对象 rank 40+）、选择层多 pass 特判（词法门挤掉 0.61 分对象块）、生成层无纪律（前缀重复/断言缺失/直生自由发挥）。要求**系统级改造而非个案补丁**。
@@ -259,3 +273,158 @@
 - 旧 regumate 容器（D:\Agent-Project\ReguMate Agent）已禁用自启，但用户本地还有旧栈可能占用 8000/6333（可选清理）
 - 简历 PDF 解析有文本重复问题（"河南大学奖学金"重复出现），后续可优化简历 PDF 质量
 - 知识库素材：docs/ 下有 简历/蓝桥杯说明/软考说明/5 份项目介绍（文件名唯一）
+
+## ✅ 全面工程修复：安全/配置一致性/历史遗留清理/fast path/grounding/评测（2026-08-08，后端 314 + 前端 35 全绿）
+
+**需求**：面向 2C4G 部署，解决安全、配置/文档不一致、ReguMate/监管历史遗留、RAG 调用链延迟、grounding 可靠性、评测体系与工程清理 10 项问题。
+
+**P1 安全与配置**
+- 创建 `.env.example`（脱敏模板：所有密钥置空 + 中文注释），`.gitignore` 移除 `.env.example` 忽略（模板应入库）；确认 `.env` 从未被 git 跟踪（index 无记录）
+- 清理 `.env`/`docker-compose.yml` 已删除功能的残留配置：`SEMANTIC_GROUNDING_*`（grounding 校验链 2026-08-02 已删）、`RESUME_ALLOW_UNREADY`、`MAX_SPREADSHEET_LOGICAL_CELLS`；保留 `MAX_OOXML_*`（docx zip 防护活功能）
+- README/tech-highlights 修正：测试数 256→314/前端 44→35；`RESUME_OFFLINE_MODE` 默认 true；`MIN_CORE_RERANK_SCORE` 0.20；删除死配置 `MIN_RERANK_SCORE`/`STRONG_SEMANTIC_RERANK_SCORE`（config 零消费）；README 增交付检查清单；tech-highlights 更新 fast path/grounding/hybrid 真实描述
+
+**P1 历史遗留清理（ReguMate/监管→简历）**
+- 删死服务：`loader_evaluation.py`、`qdrant_admin_service.py`（仅测试引用）、`question_preprocessing_service.py`（MCQ 选项提取器，主链不用）
+- 删死函数：`parse_document_text`/`CsvDocumentLoader`/`parse_document_with_loader`、`build_chunks`/`_split_*`、`save_original_document`（非 stream）/xls/csv 分支、`convert_with_libreoffice`（非 detailed）、`_chunk_type` GBK 乱码表格前缀
+- vector_store payload 删 25 个无数据流银行/表格字段（sheet_name/year/month/quarter/table_id/business_domain/version_status/article_number 等）+ 索引/过滤/`_period_value`；**保留**简历化活字段（issuing_authority 颁发机构/document_number 证书编号/material_topic 内容主题/external_doc_id/source_url 等）
+- Document 模型/DB/schemas 删 `business_domain/source_column/effective_date/version_status/supersedes_document_id/version_label` 列与 `VersionStatus` 类型（repealed/superseded/draft）；`_query_anchor_boost` 删监管文号正则；rerank compact 删表格标签；url-import 删 xls/csv；requirements 删 openpyxl/xlrd
+- 前端：删 `HealthResponse`/`LLMContextPackage` 银行字段/`Citation.version_status`/`listQaAuditLogs`/`TableChunkMeta`/表格证据渲染/表格角色；styles.css 删 658 行死样式；测试素材（资产合计/报表.xlsx/NFRA/bge-m3）全部简历化
+
+**P2-A fast path（普通问题 LLM 3→1 次）**
+- 意图层确定性旁路（`INTENT_FAST_PATH_ENABLED`）：无上一轮时整句问候词表→greeting、简历锚点→resume_qa，跳过 LLM；有上一轮仍走 LLM 消解
+- 规划层确定性旁路（`PLANNER_FAST_PATH_ENABLED`）：非枚举/非补集/无复合结构问题直接 `_fallback_aspects` 单/少方面，跳过 LLM；枚举/补集/复杂问题保留完整链路
+- 效果：普通独立问题 intent(1)+planner(1)+generation(1)=3 → 1 次 LLM；追问/枚举/复杂维持原链路；两开关可关回退
+
+**P2-B grounding 确定性硬事实校验（`GROUNDING_VERIFY_ENABLED`）**
+- 新 `grounding_verification_service.py`（零 LLM 纯规则）：从答案抽数字/年份/日期/书名号专名，与检索证据归一化匹配；LLM 自评 sufficient 但硬事实缺失 → 强制 hedged + 记录缺失项到 `extra`；`llm_call_count` 随 QAResponse 透出供评测
+
+**P2-C Resume 领域检索**
+- `_retrieve_aspect_matches`：aspect 锚定的对象文档名（anchor_documents）解析为 document_id 集合，作为 Qdrant metadata_filter 传入——枚举对象不依赖 embedding 相似度；解析失败退化为全库检索（安全）
+
+**P2-D hybrid 命名澄清**
+- `hybrid_search` 注释说明真实实现：dense 单路 + 应用层关键词补充 + rerank（无 Qdrant sparse），函数名保留避免 churn；README/tech-highlights 同步
+
+**P2-E 评测体系**
+- `eval_interview_set.py` 扩展为评测框架：结构化问题集（期望事实/禁止事实）、延迟 p50/p95、单问 LLM 调用次数、期望事实命中率、禁止内容检测、JSON 报告；`docs-guide/evaluation.md` 使用说明
+
+**验证**：后端 314 全绿（新增 fast path 9 + grounding 8 + anchor 2）；前端 35 全绿 + build 通过；复扫 `regumate/资产合计/报表.xlsx/NFRA/SEMANTIC_GROUNDING/spreadsheet` 零残留（docs/ 知识库素材与 PROGRESS 历史记录除外）
+
+**遗留**：① 评测脚本需真实 DeepSeek + 本地模型（单测全 mock 不覆盖 E2E）；② rag_service 2690 行未拆分（职责混杂确认存在，但测试耦合深、收益低，仅清理死代码）；③ fast path 效果需在真实 2C4G 上用 eval 脚本验证延迟/LLM 次数；④ `.env` 含真实密钥仅本机，交付前必须用 `.env.example` 重建
+
+## ✅ 二轮工程修复：Fast Path 上下文判断/complement 硬排除/material_topic 检索/实体 grounding/真实 LLM 计数/评测修复（2026-08-08，后端 357 + 前端 35 全绿）
+
+**需求**：解决 8 项代码逻辑问题——Fast Path 有历史即失效、complement 排除不生效、material_topic 未参与检索、grounding 实体校验缺失、LLM 计数靠推测、评测 forbidden 统计 bug、测试 monkeypatch 隔离、历史残留。
+
+**1. Fast Path 上下文判断（intent/planner）**
+- 新增 `context_dependency.py`：`needs_context_resolution(question)` 判断问题是否真依赖上一轮（指代代词/序数/省略主语/衔接词）；`is_greeting_phrase` 只认整句问候
+- 核心修复：intent/planner fast path 从"无历史才走"改为"问题自足才走"——有历史但问题独立（Q1 项目 → Q2 HashMap）仍走 fast path 跳过 LLM；追问（"第二个项目""那 Redis 呢"）才走 LLM 消解
+- 修 `len<=2` 问候误判："爱好/籍贯/薪资/项目"等短词不再判 greeting（交 LLM）；锚点表单一事实源移到 context_dependency
+
+**2. complement/enumeration 硬排除**
+- 修复 `_doc_key` 返回 document_id 但 excluded_documents/anchor_documents 存 filename 的身份混用 → 统一 filename
+- `_select` 与阶段 3 兜底都加硬排除：被排除文档的 chunk 绝不进最终 prompt（即使 coverage 逻辑倾向选它）
+- 测试验证**最终 prompt**（非 QueryPlan）：`test_complement_question_excludes_documents_from_final_prompt`、`test_complement_exclusion_survives_force_min_chunks`
+
+**3. material_topic 驱动枚举检索**
+- catalog 从 `(filename, title)` 扩展为 `(filename, title, material_topic)`（动态读 Document 表）
+- `classify_object_docs` 优先按 material_topic 匹配对象文档（"你有哪些项目"→ 项目经历 文档集合），文件名 pattern 仅作旧数据 fallback；`CATEGORY_TO_MATERIAL_TOPIC` 对齐内部类别与简历领域值
+
+**4. Grounding Verifier 增强**
+- 列表编号误杀修复：`1. EchoGuide 2. ReguMate` 的编号不作为数字事实
+- 实体校验：`known_entities`（知识库 catalog 提取的学校/项目/奖项/证书/技术栈）——答案出现但证据缺失的已知实体 → hedged
+- normalization：全角数字/百分号转半角、日期格式统一
+
+**5. LLM 调用计数移到请求层**
+- `llm_client` 用 ContextVar 在真正 urlopen 前计数（`reset_llm_call_count`/`llm_call_count`）——统计真实 API 调用，含超时/失败后 fallback；fast path 跳过 LLM 时不计
+- `rag_service.answer_question` 开头 reset、末尾读取真实计数写入 `llm_call_count`；删除基于 pipeline 状态的推测函数
+
+**6. E2E Evaluation 修复**
+- forbidden 变量覆盖 bug：形参 `forbidden` 被命中列表覆盖导致 `0/0` 统计 → 分开命名，分母=期望检查数
+- expected fact 缺失超半数 → 记为失败（不再静默 exit 0）；新增 expected_documents 检索命中统计（Recall@文档）
+- 支持 `--data` JSONL 评测数据（group/question/expected_facts/forbidden_facts/expected_documents/session 多轮链）；`scripts/eval_cases.jsonl` 示例
+
+**7. 测试 monkeypatch 审计**
+- 审计确认：test_qa_access/test_auth/test_rag_api 均 patch 模块级绑定（`backend.app.api.qa.answer_question`、`qa_task_service.answer_question`），与 `from ... import` 绑定一致，patch 有效
+- 新增 `test_qa_api_answer_patch_isolates_real_rag`：证明 patch 后 QA API 走 fake、真实 RAG（模型链）零调用
+
+**8. 历史残留清理**
+- `requirements.in` 删 openpyxl/xlrd；Document 模型删 `effective_date`（生产零消费）
+- `document_url_import_service` 删 text/csv 死分支（content_type 集合已排除 csv）
+- **保留** `spreadsheet_cells DROP`：旧库（ReguMate 时代遗留表）幂等清理，模型已删、新库零开销；`document_manifest_service` 的 csv 导入是活功能（manifest 清单）
+
+**验证**：后端 357 全绿（净增 43）；前端 35 全绿 + tsc + build；评测脚本 py_compile + JSONL 加载验证通过
+
+**遗留**：① fast path 的 `needs_context_resolution` 规则需在真实问答观察（"为什么不用数据库锁"独立问会保守走 LLM，可接受）；② grounding 实体校验的阈值需真实校准（长实体/模糊措辞可能误报）；③ rag_service/planner 仍未拆分（用户本轮明确不做）；④ E2E 评测需真实 DeepSeek + 本地模型运行（本环境未实调，未假装通过）
+
+## ✅ Embedding 模型降档：bge-base-zh-v1.5 → bge-small-zh-v1.5（2026-08-11）
+
+**目标**：2C4G 部署（用户拟从 4C8G 降档）。评估结论：embedding 是唯一可降档项（base → small，391MB → 92MB）；reranker base 已是官方中文最小档，ONNX INT8 因 parity 门禁（Top-1 86.96% < 95%）维持禁用，未动。
+
+**改动**
+- `config.py`：默认 `EMBEDDING_MODEL_NAME=BAAI/bge-small-zh-v1.5`、`DEFAULT_EMBEDDING_MODEL_DIR=bge-small-zh-v1.5`、`EMBEDDING_DIMENSION=512`；`INDEX_VERSION` 改为环境变量可覆盖，默认 `bge-small-zh-dense-v6-resume`（SQLite/Qdrant 双端按版本过滤，换模型即失效旧索引）
+- `model_path_resolver.py`：hub 缓存名 → `models--BAAI--bge-small-zh-v1.5`
+- `docker-compose.yml` / `Dockerfile` / `download_models.py` / `check_offline_models.py` / `.env.example` / `deploy/*.env.example`：全部换 small
+- 旧 `data/models/bge-base-zh-v1.5/` 保留未删，环境变量可随时回退
+
+**A/B 评测（23 问黄金集，真实 DeepSeek + 本地模型，报告：docs-guide/embedding模型A-B评测报告.md）**
+- 三组对照控制"分块代码"混杂变量：① base+旧索引 49/51 事实 (96.1%)、19/20 文档 (95.0%)；② base+当前代码 45/46 (97.8%)、16/18 (88.9%)（2 问 API 超时未完成）；③ small+当前代码 **50/51 (98.0%)、18/20 (90.0%)**
+- ② vs ③ 唯一变量=模型：事实与文档召回实质持平，small 略优；B-9 由 hedged 转 answered（改善）；E-17 漏检 `证书说明.md` 是当前分块代码引入（② 同漏），与模型无关
+- 已知漏检（三组共有）：C-10 `技能专长.md`、E-17 `证书说明.md`——遗留待排查，独立于本次切换
+
+**验证**：后端 361 单测全绿（修 1 个 hub 缓存路径夹具 + 1 个预算时区 bug，见下）；索引重建 16 篇全绿（110 chunk，512 维，SQLite/Qdrant 对账一致）；本地服务 ready 全绿
+
+**顺带修复（预算熔断时区 bug，2026-08-12 00:10 发现）**：`_global_daily_qa_remaining` 用 `func.date(created_at)`（UTC 日期）对比 `date.today()`（本地日期），本地 00:00-08:00 窗口会漏计/多计"今日"预算。改为 `func.date(func.datetime(created_at, "localtime"))` 按本地日统计；单测 `test_budget_exhausted_returns_429` / `test_count_only_today_rows` 因此复绿
+
+## ✅ 系统压力指示灯（绿/黄/红）+ 繁忙提示横幅（2026-08-12）
+
+**需求**：2C4G 部署下向访客展示系统压力——压力小绿色；勉强可承受黄色；黄色时提醒当前与未来用户"人流量较多，回复可能较慢"。
+
+**容量结论（2C4G，实测校准）**：问答任务管线单 worker 串行 + 模型推理全局锁串行 → **1 人提问流畅（绿）、2 人勉强正常（黄，正是 QA_GLOBAL_CONCURRENCY=2 的设计档）、3 人及以上排队变慢（红）**；纯浏览访客（静态页+轻量轮询）不构成压力。硬上限：任务队列 16、IP 30 次/分、全局日预算。
+
+**后端**（全部信号来自内存/DB 快照，公开接口零额外成本）
+- `load_status_service.py`（新）：`classify_load(cpu_ratio, mem_ratio, in_flight)` 纯函数分级——CPU 比≥0.70 或 in_flight≥2 → 黄；≥0.90 或 in_flight≥3 → 红；内存仅作红色兜底（防 OOM）。CPU 取最近 30s 均值（rerank 突刺不误报），归一化到核数；in_flight = running + queued（qa_task_status_counts）
+- `config.py`：LOAD_YELLOW_CPU_RATIO / LOAD_RED_CPU_RATIO / LOAD_RED_MEM_RATIO / LOAD_YELLOW_INFLIGHT / LOAD_RED_INFLIGHT / LOAD_MEMORY_REFERENCE_BYTES 六项 env 可调
+- `readiness_service.public_qa_status()` 增加 `load: {level, signals}`；`schemas/qa.py` 新增 `QaPublicStatusResponse`（修复 FastAPI 按返回注解校验导致 500 的问题）
+- 降级：负载采集异常 → 绿，不阻塞状态接口
+
+**前端**
+- `readinessContext.tsx`：PublicQaStatus 增加 load 字段，context 暴露 `loadLevel`（30s 轮询复用，新访客挂载即见）
+- `RagPage.tsx`：标题栏负载指示点（复用 .status-dot：绿 ok/黄默认/红 error）+ 文案；黄色/红色弹"当前访问人数较多，系统负载较高，回复可能较慢，请耐心等待。"横幅（可关闭；回绿后再次转黄重新提醒，红色文案提示排队较久）
+- `styles.css`：.load-indicator / .load-banner（复用 --warning-soft/--danger-soft 变量）
+
+**验证**：后端 372 单测全绿（新增 11 个 classify_load 边界用例）；前端 41 测试全绿（新增 RagPage 6 个用例）+ tsc 通过；实测：2 并发任务 → yellow、1 任务 → green、全部完成 → green
+
+## ✅ 2C4G 容量提升：问答任务双 worker（2026-08-12，目标"2 稳 3 勉"）
+
+**结论**：不需要 4C8G。原任务队列单 worker 串行（每问 ~90% 时间是外部 DeepSeek API，本地推理仅 1-2s 且已有全局锁串行）——双 worker 后 2 人同时提问各自并行处理，第 3 人排队等待。
+
+**改动**
+- `config.py`：新增 `QA_TASK_WORKERS`（默认 2，1=回退单 worker）；负载阈值联动调整 `LOAD_YELLOW_INFLIGHT` 2→3、`LOAD_RED_INFLIGHT` 3→4（新语义：1-2 人绿、3 人黄、4+ 红）
+- `qa_task_service.start_qa_task_worker()`：启动 QA_TASK_WORKERS 个线程（带序号命名），`_STARTED`/恢复/去重逻辑不变——队列 `queue.Queue` 线程安全、`_PENDING` 有锁去重、SQLite 已是 WAL+busy_timeout、ByteLRUCache 有 RLock、模型推理由 MODEL_INFERENCE_LOCK 跨线程串行（并发安全项全部核实）
+- `docker-compose.yml`/`.env.example`/`deploy/2c4g.env.example`(2)/`deploy/4c8g.env.example`(3) 加 QA_TASK_WORKERS
+
+**实测（本地，真实 DeepSeek）**：3 任务同时提交 → 最大 running=2（并行）、in_flight=3（1 排队）；完成时刻 3.2s/4.6s（并行，对比单 worker 串行时第 2 个任务要等第 1 个）/25.8s（排队）；负载分级 3 并发时 yellow、2 并发 green；uvicorn 进程峰值 RSS 1.29GB（远低于 mem_limit 2800m，容器内预计 ~2-2.4GB，余量充足）
+
+**验证**：后端 374 单测全绿（新增 worker 启动数量/幂等 2 用例 + 负载阈值 3/4 边界更新）；前端不受影响
+
+**遗留**：① 容器内 RSS 以服务器后台资源面板复核；② 可选二期：重复问题回答缓存（面试高频问题可再降 30-50% LLM 调用）
+
+## ✅ 问答答案缓存：面试高频问题相似语义复用（2026-08-12）
+
+**需求**：用户输入问题后用向量找"相似语义"的缓存答案直接复用。核心难点：语义相似 ≠ 答案可复用（"介绍一下秒杀项目"与"秒杀怎么防超卖"语义相关但答案不同）→ 两层保守判定。
+
+**设计**
+- ① 精确匹配（最安全）：问题归一化（NFKC 全角→半角、去标点空白；**不去停用词**——"怎么/为什么/哪些/多少"是关键差异词）完全相等 → 命中
+- ② 语义匹配：问题 embedding 与缓存向量余弦 top-1 ≥ `QA_CACHE_SEMANTIC_THRESHOLD=0.93`（保守，宁缺毋滥）→ 命中
+- 只缓存独立问题（无 session）的 answered+sufficient 答案；hedged/redirected/failed 不写；追问链不查不写
+- 存储：SQLite 表 `qa_answer_cache`（重启不丢）+ 进程内 numpy 向量（300 条上限 LRU 按 updated_at 淘汰）；缓存键隐含 INDEX_VERSION+embedding+LLM 签名，换模型自然失效
+- 失效：知识库变更（上传/删除/重建索引）→ `document_indexing_service`/`document_lifecycle_service` 的 invalidate 挂点旁整体清空
+
+**接入**：`rag_service.answer_question` 开头查缓存（命中：llm_call_count=0、发 cache 进度事件、照常写 qa_logs 审计、响应 `cached=true`）；结尾写缓存。/ask 与任务路径全覆盖，前端零改动（progress stage 加 "cache"，前端仅透传不校验）。
+
+**验证**
+- 后端 388 单测全绿（新增 14 个：归一化/精确命中/语义命中/阈值 miss/签名失效/禁用/清空/LRU/覆盖写/命中分支零 LLM+审计）
+- 端到端实测（真实 DeepSeek）：第 1 问 13.5s llm_calls=2（写入缓存）→ **第 2 问同一问题 cached=true、llm_calls=0、0.0s 秒回**；同义改写未过 0.93 阈值（保守设计，精确命中已覆盖"面试官重复问同一问题"主场景）；不同问题正常全链路无误命中
+- 修测试坑：Windows 文件锁（临时文件库连接池未释放）→ 测试库改内存 StaticPool；fixture clear 指向测试库不碰真实 app.db
+
+**配置**：`QA_CACHE_ENABLED=true`、`QA_CACHE_SEMANTIC_THRESHOLD=0.93`、`QA_CACHE_MAX_ITEMS=300`

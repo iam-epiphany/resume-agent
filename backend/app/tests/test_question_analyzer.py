@@ -290,3 +290,48 @@ class TestDeterministicPlanning:
         assert len(plan.aspects) == 1
         assert plan.aspects[0].anchor_documents == ("项目介绍_外卖平台.md",)
         assert len(plan.aspects[0].search_queries) == 3
+
+
+# ---------------------------------------------------------------------------
+# material_topic 驱动检索（2026-08-08 二轮）：枚举问句按简历领域类别归类对象文档
+# ---------------------------------------------------------------------------
+
+CATALOG_WITH_TOPIC = [
+    ("项目介绍_高并发电商秒杀平台.md", "高并发电商秒杀平台", "项目经历"),
+    ("项目介绍_外卖平台.md", "外卖平台", "项目经历"),
+    ("项目介绍_REV密码算法.md", "REV 密码算法", "项目经历"),
+    ("项目介绍_ReguMate.md", "ReguMate-Agent", "项目经历"),
+    ("项目介绍_EchoGuide.md", "XDU EchoGuide", "项目经历"),
+    ("竞赛奖项.md", "", "竞赛奖项"),
+    ("证书说明.md", "", "证书资格"),
+    ("教育背景.md", "", "教育背景"),
+    ("技能专长.md", "", "技能掌握"),
+    # 文件名不含"项目介绍"但 material_topic 正确标注为项目经历（新知识库形态）
+    ("秒杀平台详情.md", "秒杀平台", "项目经历"),
+]
+
+
+def test_classify_object_docs_prefers_material_topic_over_filename() -> None:
+    """material_topic=项目经历 驱动归类：即使文件名不含"项目介绍"也能归入项目对象。"""
+    docs = classify_object_docs(CATALOG_WITH_TOPIC, "项目")
+
+    assert "秒杀平台详情.md" in docs
+    assert "项目介绍_高并发电商秒杀平台.md" in docs
+    assert "竞赛奖项.md" not in docs
+    assert "证书说明.md" not in docs
+
+
+def test_classify_object_docs_falls_back_to_filename_pattern_without_topic() -> None:
+    """旧数据（无 material_topic）回退文件名 pattern：项目类仍按"项目介绍_"匹配。"""
+    docs = classify_object_docs(CATALOG, "项目")
+
+    assert "项目介绍_高并发电商秒杀平台.md" in docs
+    assert "简历文字版.md" not in docs
+    assert "技能专长.md" not in docs
+
+
+def test_classify_object_docs_uses_topic_for_skill_documents() -> None:
+    docs = classify_object_docs(CATALOG_WITH_TOPIC, "技能")
+
+    assert "技能专长.md" in docs
+    assert "项目介绍_高并发电商秒杀平台.md" not in docs

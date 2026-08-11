@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 export interface ChatMessage {
   id: string;
@@ -85,21 +85,17 @@ function loadState(): StoredState {
   }
 }
 
+function createInitialState(): StoredState {
+  const loaded = loadState();
+  if (loaded.threads.length > 0) return loaded;
+  const thread = newThread();
+  return { threads: [thread], activeThreadId: thread.id };
+}
+
 export function ChatHistoryProvider({ children }: { children: ReactNode }) {
-  const initial = useRef<StoredState | null>(null);
-  if (initial.current === null) {
-    // 首次访问（sessionStorage 为空）也要保证存在一个可用对话线程，
-    // 否则提交问题时 updateActiveThread 找不到目标、消息无处显示。
-    const loaded = loadState();
-    if (loaded.threads.length === 0) {
-      const thread = newThread();
-      initial.current = { threads: [thread], activeThreadId: thread.id };
-    } else {
-      initial.current = loaded;
-    }
-  }
-  const [threads, setThreads] = useState<ChatThread[]>(initial.current.threads);
-  const [activeThreadId, setActiveThreadId] = useState<string | null>(initial.current.activeThreadId);
+  const [initial] = useState<StoredState>(createInitialState);
+  const [threads, setThreads] = useState<ChatThread[]>(initial.threads);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(initial.activeThreadId);
 
   // 会话级持久化（sessionStorage）：刷新保留，关闭页面即清除
   useEffect(() => {

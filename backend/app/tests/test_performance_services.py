@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import numpy as np
+
 from qdrant_client import models
 
 from backend.app.services import embedding_service, rerank_service, vector_store_service
@@ -89,6 +91,37 @@ def test_reranker_uses_cpu_profile_batch_and_reuses_scores(monkeypatch) -> None:
 
 def test_rerank_score_cache_can_be_invalidated_after_index_change() -> None:
     rerank_service._rerank_score_cache.cache_clear()
+
+
+def test_onnx_reranker_uses_session_logits_and_normalizes_scores(monkeypatch) -> None:
+    rerank_service._rerank_score_cache.cache_clear()
+
+    class FakeTokenizer:
+        def __call__(self, questions, texts, **_kwargs):
+            return {"input_ids": np.ones((len(questions), 2), dtype=np.int64)}
+
+    class FakeSession:
+        def get_inputs(self):
+            return [SimpleNamespace(name="input_ids")]
+
+        def run(self, _outputs, inputs):
+            assert "input_ids" in inputs
+            return [np.asarray([[0.0], [np.log(3.0)]])]
+
+    monkeypatch.setattr(rerank_service.config, "MODEL_BACKEND", "onnx")
+    monkeypatch.setattr(rerank_service, "selected_model_device", lambda: "cpu")
+    monkeypatch.setattr(
+        rerank_service,
+        "_get_onnx_reranker",
+        lambda: SimpleNamespace(tokenizer=FakeTokenizer(), session=FakeSession(), model_path="model.onnx"),
+    )
+    candidates = [_candidate("chunk-a"), _candidate("chunk-b")]
+
+    reranked = rerank_service.rerank_candidates(question="question", candidates=candidates, limit=2)
+
+    assert [item.candidate.chunk_id for item in reranked] == ["chunk-b", "chunk-a"]
+    assert [round(item.rerank_score, 2) for item in reranked] == [0.75, 0.5]
+    rerank_service._rerank_score_cache.cache_clear()
     cache = rerank_service._rerank_score_cache()
     cache.put("score-key", 0.75)
 
@@ -138,8 +171,8 @@ def test_vector_collection_readiness_runs_once(monkeypatch) -> None:
     vector_store_service.ensure_vector_collection()
 
     assert client.exists_calls == 1
-    # Core retrieval indexes plus provenance/version/article metadata indexes.
-    assert client.index_calls == 17
+    # Core retrieval indexes plus resume-material provenance metadata indexes.
+    assert client.index_calls == 13
     vector_store_service.reset_vector_collection_readiness()
 
 

@@ -7,6 +7,7 @@ from typing import Any, Callable
 from backend.app.services.performance_metrics import measure, timed
 
 from backend.app.core.config import (
+    PLANNER_FAST_PATH_ENABLED,
     QUERY_PLANNER_INCLUDE_THINKING,
     QUERY_PLANNER_API_KEY,
     QUERY_PLANNER_BASE_URL,
@@ -25,6 +26,7 @@ from backend.app.services.llm_client import (
     ChatCompletionError,
     chat_completion_content,
 )
+from backend.app.services.context_dependency import needs_context_resolution
 from backend.app.services.question_analyzer import (
     analyze_question,
     is_enumerative_question as _analyzer_is_enumerative_question,
@@ -183,6 +185,25 @@ def plan_query(
             excluded_documents=excluded_documents,
         )
 
+    # fast path（默认开启）：非枚举、非补集、**自足**（不依赖上一轮上下文）的
+    # 普通问题——直接确定性构造单/少方面检索计划，跳过 LLM 规划调用。
+    # 追问（指代消解）或需上下文理解的问题仍走 LLM 拆解。
+    # 多条件并列（"以及/并且/同时"等）或多疑问词的问题也走 LLM。
+    if (
+        PLANNER_FAST_PATH_ENABLED
+        and not needs_context_resolution(cleaned_question)
+        and _is_fast_path_plannable(cleaned_question)
+    ):
+        aspects = _fallback_aspects(cleaned_question, budget)
+        return QueryPlan(
+            original_question=cleaned_question,
+            aspects=tuple(aspects),
+            planner="fast_path",
+            fallback_used=False,
+            budget=budget.to_debug_dict(),
+            enumerative=enumerative,
+        )
+
     if QUERY_PLANNER_ENABLED and QUERY_PLANNER_API_KEY:
         try:
                 aspects, omitted_or_merged_items = _plan_with_llm(
@@ -225,13 +246,24 @@ def plan_query(
     )
 
 
-def _catalog_entries(catalog: str | list[tuple[str, str]] | None) -> list[tuple[str, str]]:
-    """把 catalog 规范化为 [(filename, title)]：兼容 "- 文件名（标题）" 字符串与结构化列表。"""
+def _catalog_entries(catalog: str | list | None) -> list[tuple[str, str, str]]:
+    """把 catalog 规范化为 [(filename, title, material_topic)]。
+
+    兼容三种输入：
+    - 结构化列表，元素为 (filename, title) 或 (filename, title, material_topic)
+    - "- 文件名（标题）" 字符串（material_topic 未知 → 空）
+    """
     if not catalog:
         return []
     if isinstance(catalog, list):
-        return [(str(filename), str(title)) for filename, title in catalog]
-    entries: list[tuple[str, str]] = []
+        entries: list[tuple[str, str, str]] = []
+        for entry in catalog:
+            filename = str(entry[0] or "")
+            title = str(entry[1] or "")
+            material_topic = str(entry[2] or "").strip() if len(entry) > 2 else ""
+            entries.append((filename, title, material_topic))
+        return entries
+    entries = []
     for line in str(catalog).splitlines():
         line = line.strip()
         if not line.startswith("- "):
@@ -239,9 +271,9 @@ def _catalog_entries(catalog: str | list[tuple[str, str]] | None) -> list[tuple[
         body = line[2:].strip()
         title_match = re.match(r"^(.*?)（(.*?)）$", body)
         if title_match:
-            entries.append((title_match.group(1).strip(), title_match.group(2).strip()))
+            entries.append((title_match.group(1).strip(), title_match.group(2).strip(), ""))
         else:
-            entries.append((body, ""))
+            entries.append((body, "", ""))
     return entries
 
 
@@ -966,6 +998,29 @@ def _split_question_parts(question: str) -> list[str]:
         for part in re.split(r"[？?。；;]|如果|若|以及|并且|同时|，且", question)
         if part.strip()
     ]
+
+
+def _is_fast_path_plannable(question: str) -> bool:
+    """普通独立问题 → 确定性单/少方面计划即可，无需 LLM 拆解。
+
+    仅当问题没有"并列条件/多问/复合追问"结构时才走 fast path：
+    - 无并列连接词（以及/并且/同时/还有/和……的区别等复合信号）
+    - 无多个问号/多个"什么/如何"疑问词
+    - 无显式条件列举（"如果…就…"）
+    - 不是显式请求多个对象的问题（交给枚举路径）
+    这类问题用原问 + 简单变体检索足够，LLM 拆解收益低而成本高（DeepSeek 延迟主导）。
+    """
+    if not question or len(question) > 80:
+        return False
+    if re.search(r"以及|并且|同时|还有|的区别|比较|对比|分别", question):
+        return False
+    if question.count("？") + question.count("?") > 1:
+        return False
+    if re.search(r"(什么|如何|怎么|为什么|哪).{0,12}(什么|如何|怎么|为什么|哪)", question):
+        return False
+    if re.search(r"如果.{0,10}(就|则)", question):
+        return False
+    return True
 
 
 def _dedupe_aspects(aspects: list[QueryAspect]) -> list[QueryAspect]:

@@ -43,7 +43,7 @@ const health: RagHealthResponse = {
   offline_mode: false,
   embedding_model_ready: true,
   reranker_model_ready: true,
-  embedding_model_path: "bge-m3",
+  embedding_model_path: "bge-base-zh-v1.5",
   reranker_model_path: "reranker",
   qdrant_ready: true,
   qdrant_collection: "resumemind_chunks",

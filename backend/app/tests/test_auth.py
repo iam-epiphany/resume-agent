@@ -192,7 +192,6 @@ def test_retrieve_endpoint_requires_admin() -> None:
 
 def test_ask_include_debug_does_not_leak_context_for_anonymous(monkeypatch) -> None:
     """匿名即使显式 include_debug=true 也不得拿到检索依据（调试参数只对管理员生效）。"""
-    from backend.app.services import rag_service
     from backend.app.schemas.qa import QAResponse
 
     def fake_answer_question(db, question, options=None, include_debug=False, **kwargs):
@@ -214,7 +213,7 @@ def test_ask_include_debug_does_not_leak_context_for_anonymous(monkeypatch) -> N
             generation_status="completed",
         )
 
-    monkeypatch.setattr(rag_service, "answer_question", fake_answer_question)
+    monkeypatch.setattr("backend.app.api.qa.answer_question", fake_answer_question)
 
     anonymous = client.post("/api/qa/ask", json={"question": "介绍一下你的项目经历", "include_debug": True})
     assert anonymous.status_code == 200
@@ -321,6 +320,17 @@ def test_qa_rate_limit_rejects_excess_requests(monkeypatch) -> None:
     assert response.headers.get("Retry-After") is not None
     assert response.headers.get("X-Request-ID") is not None
     assert response.json()["error"]["code"] == "too_many_requests"
+
+
+def test_qa_rate_limit_per_minute_zero_means_unlimited(monkeypatch) -> None:
+    """每分钟限流设为 0 = 不限制（仅保留每日上限，如 QA_GLOBAL_DAILY_LIMIT 全局预算）。"""
+    _clear_rate_limit_state()
+    monkeypatch.setattr(config, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(config, "QA_IP_RATE_LIMIT_PER_MINUTE", 0)
+    monkeypatch.setattr(config, "QA_IP_DAILY_LIMIT", 100000)
+
+    statuses = [client.get("/api/qa/tasks?limit=1").status_code for _ in range(5)]
+    assert all(status != 429 for status in statuses), f"0 = 不限分钟次数，实际 {statuses}"
 
 
 def test_qa_status_exempt_from_rate_limit(monkeypatch) -> None:

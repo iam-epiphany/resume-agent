@@ -154,11 +154,10 @@ def _validate_integrity(document: Document, record: dict[str, Any]) -> None:
 
 
 def _sanitize_record_for_import(record: dict[str, Any], *, document: Document | None = None) -> dict[str, Any]:
-    """Keep descriptive metadata and drop source-review bookkeeping.
+    """Keep descriptive metadata and drop legacy source-review bookkeeping.
 
-    Contest delivery no longer requires URL provenance.  If a manifest carries
-    URL fields they are treated like optional descriptive metadata, not as a
-    release gate or official-source assertion.
+    Manifest records may carry review/provenance fields from older tooling;
+    they are not part of resume knowledge base metadata, so drop them.
     """
 
     sanitized = dict(record)

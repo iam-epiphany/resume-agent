@@ -3,9 +3,26 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 
 import { apiFetch } from "../api/client";
 
+export type LoadLevel = "green" | "yellow" | "red";
+
+export interface LoadSignals {
+  cpu_ratio: number;
+  mem_ratio: number;
+  running: number;
+  queued: number;
+  in_flight: number;
+  cores: number;
+}
+
+export interface LoadStatus {
+  level: LoadLevel;
+  signals?: LoadSignals | null;
+}
+
 export interface PublicQaStatus {
   ready: boolean;
   message: string;
+  load?: LoadStatus;
 }
 
 interface ReadinessSnapshot extends PublicQaStatus {
@@ -15,6 +32,8 @@ interface ReadinessSnapshot extends PublicQaStatus {
 }
 
 interface ReadinessContextValue extends ReadinessSnapshot {
+  /** 系统负载分级：green=正常 / yellow=较繁忙 / red=繁忙；未取到时为 null */
+  loadLevel: LoadLevel | null;
   refresh: () => Promise<void>;
 }
 
@@ -37,6 +56,7 @@ export function ReadinessProvider({ children }: { children: ReactNode }) {
       setSnapshot({
         ready: status.ready,
         message: status.message,
+        load: status.load,
         isLoading: false,
         error: null,
         refreshedAt: new Date().toISOString(),
@@ -56,7 +76,10 @@ export function ReadinessProvider({ children }: { children: ReactNode }) {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const value = useMemo<ReadinessContextValue>(() => ({ ...snapshot, refresh }), [refresh, snapshot]);
+  const value = useMemo<ReadinessContextValue>(
+    () => ({ ...snapshot, loadLevel: snapshot.load?.level ?? null, refresh }),
+    [refresh, snapshot],
+  );
   return <ReadinessContext.Provider value={value}>{children}</ReadinessContext.Provider>;
 }
 

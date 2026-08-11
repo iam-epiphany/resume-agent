@@ -115,6 +115,51 @@ TOPIC_RULES = (
     ("项目经历", ("项目", "开发", "上线", "负责")),
 )
 
+MATERIAL_TOPICS = frozenset(
+    {
+        "项目经历",
+        "技能专长",
+        "教育背景",
+        "竞赛奖项",
+        "荣誉奖励",
+        "证书资格",
+        "求职意向",
+        "个人特质",
+        "自我介绍",
+        "综合简历",
+    }
+)
+
+# 文件名是个人知识库里最稳定的主题信号。正文经常同时提到项目、技能、证书和
+# 奖项，不能再用“全文首次命中”决定唯一主题。
+FILENAME_TOPIC_RULES = (
+    ("项目经历", ("项目介绍", "项目经历", "项目经验")),
+    ("技能专长", ("技能专长", "专业技能", "技术栈")),
+    ("教育背景", ("教育背景", "教育经历", "课程成绩")),
+    ("竞赛奖项", ("竞赛奖项", "竞赛经历", "获奖经历")),
+    ("荣誉奖励", ("个人荣誉", "荣誉奖励", "奖学金")),
+    ("证书资格", ("证书说明", "资格证书", "专业证书")),
+    ("求职意向", ("求职意向", "求职动机", "职业规划")),
+    ("个人特质", ("个人特质", "兴趣爱好", "性格特点")),
+    ("自我介绍", ("自我介绍",)),
+    ("综合简历", ("简历",)),
+)
+
+TOPIC_ALIASES = {
+    "项目": "项目经历",
+    "项目经验": "项目经历",
+    "技能": "技能专长",
+    "专业技能": "技能专长",
+    "教育": "教育背景",
+    "竞赛": "竞赛奖项",
+    "奖项": "竞赛奖项",
+    "荣誉": "荣誉奖励",
+    "证书": "证书资格",
+    "求职": "求职意向",
+    "兴趣爱好": "个人特质",
+    "简历": "综合简历",
+}
+
 class DocumentMetadataError(ValueError):
     pass
 
@@ -208,7 +253,12 @@ def infer_metadata_from_parsed(parsed: ParsedDocument, filename: str) -> dict[st
     )
     publication_date = _extract_labeled_date(header_text + " " + footer_text, ("发布日期", "公布日期", "发布于"))
     expiration_date = _extract_labeled_date(compact, ("失效日期", "废止日期", "有效期至"))
-    topic = _classify(compact + " " + filename, TOPIC_RULES)
+    topic = infer_material_topic(
+        text=compact,
+        filename=filename,
+        heading=_first_heading(parsed),
+        header_text=header_text,
+    )
     return {
         **dict(parsed.metadata or {}),
         "title": title,
@@ -219,6 +269,29 @@ def infer_metadata_from_parsed(parsed: ParsedDocument, filename: str) -> dict[st
         "material_topic": topic,
         "source_type": "uploaded_file",
     }
+
+
+def infer_material_topic(
+    *,
+    text: str,
+    filename: str,
+    heading: str | None = None,
+    header_text: str | None = None,
+) -> str | None:
+    """Infer one stable resume-domain topic without letting incidental terms win."""
+
+    explicit = _extract_labeled_material_topic(header_text or text[:2000])
+    if explicit:
+        return explicit
+
+    filename_topic = _classify(Path(filename).stem, FILENAME_TOPIC_RULES)
+    if filename_topic:
+        return filename_topic
+
+    heading_topic = _classify_by_score(heading or "", TOPIC_RULES)
+    if heading_topic:
+        return heading_topic
+    return _classify_by_score(text, TOPIC_RULES)
 
 
 def document_metadata_snapshot(document: Document, *, include_provenance: bool = True) -> dict[str, Any]:
@@ -385,6 +458,38 @@ def _first_heading(parsed: ParsedDocument) -> str | None:
 
 def _classify(text: str, rules: tuple[tuple[str, tuple[str, ...]], ...]) -> str | None:
     return next((label for label, terms in rules if any(term in text for term in terms)), None)
+
+
+def _classify_by_score(
+    text: str,
+    rules: tuple[tuple[str, tuple[str, ...]], ...],
+) -> str | None:
+    if not text:
+        return None
+    scores = {
+        label: sum(min(text.count(term), 3) for term in terms)
+        for label, terms in rules
+    }
+    best_score = max(scores.values(), default=0)
+    if best_score <= 0:
+        return None
+    winners = [label for label, score in scores.items() if score == best_score]
+    # 模糊正文宁可不分类，也不要制造一个会参与检索过滤的错误标签。
+    return winners[0] if len(winners) == 1 else None
+
+
+def _extract_labeled_material_topic(text: str) -> str | None:
+    match = re.search(
+        r"(?:材料主题|material[_ -]?topic)\s*[：:]\s*([^\n|>]{1,30})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    raw = match.group(1).strip().strip("`*_[]（）() ")
+    if raw in MATERIAL_TOPICS:
+        return raw
+    return TOPIC_ALIASES.get(raw)
 
 
 def _json_object(raw: str | None) -> dict[str, Any]:

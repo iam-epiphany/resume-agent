@@ -55,6 +55,22 @@ DOCUMENT_CATEGORY_PATTERNS: tuple[tuple[str, str], ...] = (
 # 文档名中的干扰词：这些文档不是"对象文档"（简历里虽有项目经历，但不是项目文档）
 NON_OBJECT_FILENAME_MARKERS = ("简历", "自我介绍", "求职", "个人特质")
 
+# 对象类别 → material_topic 值（与 document_metadata_service.TOPIC_RULES 产出对齐）。
+# detect_object_category 返回的 category 是内部简名（"项目/技能/奖项"），
+# 而入库的 material_topic 是简历领域全名（"项目经历/技能专长/竞赛奖项"），
+# 匹配对象文档时用此映射对齐。
+CATEGORY_TO_MATERIAL_TOPIC: dict[str, str] = {
+    "项目": "项目经历",
+    "技能": "技能专长",
+    "奖项": "竞赛奖项",
+    "荣誉": "荣誉奖励",
+    "证书": "证书资格",
+    "课程": "教育背景",
+    "教育": "教育背景",
+    "活动": "项目经历",
+    "经历": "项目经历",
+}
+
 # 指代代词："这三个/那三个/这三个项目/你刚才提到的三个项目" → 需要会话上下文解析。
 # 匹配"量词短语 + 可选对象名词"形态（含/不含"这/那"），显式实体名（"秒杀项目"）不命中。
 _PRONOMINAL_PATTERN = re.compile(
@@ -220,19 +236,36 @@ def detect_object_category(question: str) -> str | None:
     return None
 
 
-def classify_object_docs(catalog: list[tuple[str, str]] | None, category: str | None) -> tuple[str, ...]:
-    """按类别从文档清单中归类对象文档（如项目类 → 项目介绍_*.md）。"""
+def classify_object_docs(catalog: list[tuple[str, str] | tuple[str, str, str]] | None, category: str | None) -> tuple[str, ...]:
+    """按类别从文档清单中归类对象文档。
+
+    优先用 material_topic（简历领域类别，如"项目经历"）匹配——文档被正确分类时
+    这是最可靠的领域信号（"你有哪些项目"→ material_topic=项目经历 的文档集合）；
+    文件名/标题 pattern（"项目介绍_*.md"）仅作为旧数据兼容 fallback。
+
+    catalog 元素可为 (filename, title) 或 (filename, title, material_topic)。
+    """
     if not catalog or not category:
         return ()
+    expected_topic = CATEGORY_TO_MATERIAL_TOPIC.get(category, category)
     matched: list[str] = []
-    for filename, title in catalog:
+    fallback: list[str] = []
+    for entry in catalog:
+        filename = str(entry[0] or "")
+        title = str(entry[1] or "")
+        material_topic = str(entry[2] or "").strip() if len(entry) > 2 else ""
         if any(marker in filename for marker in NON_OBJECT_FILENAME_MARKERS):
             continue
-        haystack = f"{filename} {title or ''}"
+        # 主信号：material_topic 直接命中类别对应的简历领域值
+        if material_topic and material_topic == expected_topic:
+            matched.append(filename)
+            continue
+        # fallback：文件名/标题 pattern 命中（旧数据兼容）
+        haystack = f"{filename} {title}"
         if any(pattern in haystack for pattern, doc_category in DOCUMENT_CATEGORY_PATTERNS
                if doc_category == category):
-            matched.append(filename)
-    return tuple(matched)
+            fallback.append(filename)
+    return tuple(matched) if matched else tuple(fallback)
 
 
 def object_name_from_filename(filename: str) -> str:
@@ -275,7 +308,7 @@ def resolve_known_entities(
 def analyze_question(
     question: str,
     *,
-    catalog: list[tuple[str, str]] | None = None,
+    catalog: list[tuple[str, str] | tuple[str, str, str]] | None = None,
     memory_context: dict | None = None,
 ) -> QuestionAnalysis:
     """对提问做确定性分析，输出供规划/选择层使用的结构化结论。"""

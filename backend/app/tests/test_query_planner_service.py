@@ -188,6 +188,8 @@ def test_query_planner_llm_returns_structured_multi_view_queries(monkeypatch) ->
             ).encode("utf-8")
 
     monkeypatch.setattr(query_planner_service.urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    # 本用例专门验证 LLM 规划路径：显式关闭 fast path（fast path 行为另有专项用例）
+    monkeypatch.setattr(query_planner_service, "PLANNER_FAST_PATH_ENABLED", False)
 
     plan = plan_query("课程成绩差异应该优先检查哪些问题？")
 
@@ -279,6 +281,7 @@ def test_plan_query_omits_catalog_block_when_empty(monkeypatch) -> None:
         return FakeResponse()
 
     monkeypatch.setattr(query_planner_service.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(query_planner_service, "PLANNER_FAST_PATH_ENABLED", False)
 
     plan_query("介绍一下自己", catalog="")
     user_content = captured["body"]["messages"][-1]["content"]
@@ -350,3 +353,97 @@ def test_execution_constraint_is_not_converted_to_retrieval_aspect() -> None:
     )
 
     assert [aspect.aspect_id for aspect in aspects] == ["formula"]
+
+
+# ---------------------------------------------------------------------------
+# fast path：普通独立问题确定性规划（PLANNER_FAST_PATH_ENABLED 默认开启）
+# ---------------------------------------------------------------------------
+
+def test_fast_path_plannable_question_skips_llm(monkeypatch) -> None:
+    """普通独立问题：确定性单方面计划，不调用 LLM。"""
+    monkeypatch.setattr(query_planner_service, "QUERY_PLANNER_API_KEY", "test-key")
+
+    def assert_not_called(*args, **kwargs):
+        raise AssertionError("fast path 不应调用 LLM")
+
+    monkeypatch.setattr(query_planner_service.urllib.request, "urlopen", assert_not_called)
+
+    plan = plan_query("你的技术栈是什么")
+
+    assert plan.planner == "fast_path"
+    assert plan.fallback_used is False
+    assert len(plan.aspects) >= 1
+    assert plan.aspects[0].question == "你的技术栈是什么"
+
+
+def test_fast_path_skipped_for_complex_question(monkeypatch) -> None:
+    """含并列/比较词的问题不走 fast path，保留 LLM 拆解能力。"""
+    monkeypatch.setattr(query_planner_service, "QUERY_PLANNER_API_KEY", "test-key")
+    monkeypatch.setattr(query_planner_service, "PLANNER_FAST_PATH_ENABLED", True)
+    captured: dict = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            payload = {
+                "aspects": [
+                    {
+                        "aspect_id": "a1",
+                        "question": "区别",
+                        "evidence_need": "区别",
+                        "search_queries": [{"query": "区别", "query_type": "semantic_question", "rationale": "测试"}],
+                        "keywords": [],
+                    }
+                ]
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}, ensure_ascii=False).encode()
+
+    def fake_urlopen(request, *args, **kwargs):
+        captured["called"] = True
+        return FakeResponse()
+
+    monkeypatch.setattr(query_planner_service.urllib.request, "urlopen", fake_urlopen)
+
+    plan_query("HashMap 和 Redisson 的区别是什么")
+    assert captured.get("called") is True
+
+
+def test_fast_path_disabled_uses_llm(monkeypatch) -> None:
+    monkeypatch.setattr(query_planner_service, "PLANNER_FAST_PATH_ENABLED", False)
+    monkeypatch.setattr(query_planner_service, "QUERY_PLANNER_API_KEY", "test-key")
+    captured: dict = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            payload = {
+                "aspects": [
+                    {
+                        "aspect_id": "a1",
+                        "question": "你的技术栈是什么",
+                        "evidence_need": "技术栈",
+                        "search_queries": [{"query": "技术栈", "query_type": "semantic_question", "rationale": "测试"}],
+                        "keywords": [],
+                    }
+                ]
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}, ensure_ascii=False).encode()
+
+    def fake_urlopen(request, *args, **kwargs):
+        captured["called"] = True
+        return FakeResponse()
+
+    monkeypatch.setattr(query_planner_service.urllib.request, "urlopen", fake_urlopen)
+
+    plan_query("你的技术栈是什么")
+    assert captured.get("called") is True

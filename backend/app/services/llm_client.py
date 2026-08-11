@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import urllib.error
@@ -8,6 +9,27 @@ from typing import Any, Callable
 
 
 UrlOpen = Callable[..., Any]
+
+# 请求级 LLM 调用计数：每次真正向模型 API 发起请求（urlopen）前 +1。
+# 用 ContextVar 保证请求间隔离（并发/异步下互不干扰），任何模块（intent/planner/
+# rewrite/generation）通过 llm_client 调用都会被统计。调用方在请求结束时读取
+# 并写入响应（QAResponse.llm_call_count），供评测与观测——统计真实 API 调用，
+# 而非根据 pipeline 状态推测。
+_LLM_CALL_COUNT: ContextVar[int] = ContextVar("resumemind_llm_call_count", default=0)
+
+
+def llm_call_count() -> int:
+    """当前请求已发起的真实 LLM API 调用次数。"""
+    return _LLM_CALL_COUNT.get()
+
+
+def reset_llm_call_count() -> None:
+    """请求开始时清零计数（qa_task 在单问处理前调用）。"""
+    _LLM_CALL_COUNT.set(0)
+
+
+def _record_llm_call() -> None:
+    _LLM_CALL_COUNT.set(_LLM_CALL_COUNT.get() + 1)
 
 
 @dataclass(frozen=True)
@@ -45,6 +67,7 @@ def chat_completion_content(
         stream=False,
     )
     request = build_chat_request(config, payload)
+    _record_llm_call()  # 真正发起 API 请求前计数（无论成败，超时/失败也算一次真实调用）
     try:
         with (opener or urllib.request.urlopen)(request, timeout=config.timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
@@ -77,6 +100,7 @@ def open_chat_completion(
         stream=stream,
     )
     request = build_chat_request(config, payload)
+    _record_llm_call()  # 真正发起 API 请求前计数
     try:
         return (opener or urllib.request.urlopen)(request, timeout=config.timeout_seconds)
     except (OSError, TimeoutError, urllib.error.URLError) as exc:

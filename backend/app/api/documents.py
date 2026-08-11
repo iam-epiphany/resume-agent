@@ -693,8 +693,8 @@ def _to_detail(
 
 def _chunk_type(text: str) -> str:
     stripped = text.lstrip()
-    table_prefixes = ("表格：", "表格摘要：", "表格行证据：", "琛ㄦ牸锛?", "琛ㄦ牸琛岃瘉鎹細")
-    return "table" if stripped.startswith(table_prefixes) or "\n|" in text else "paragraph"
+    # 表格场景已移除，仅保留 markdown 表格（"\n|" 表格行）作为段落类型提示
+    return "table" if "\n|" in stripped else "paragraph"
 
 
 def _chunk_metadata(chunk: DocumentChunk) -> dict:

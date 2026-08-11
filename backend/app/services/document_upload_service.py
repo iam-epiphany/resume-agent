@@ -154,7 +154,6 @@ async def create_document_upload(
         storage_path=str(storage_path),
         title=Path(filename).stem.split("_", maxsplit=1)[-1],
         source_type="uploaded_file",
-        version_status="unknown",
         metadata_status="inferred",
         document_metadata=json.dumps({}, ensure_ascii=False),
         status="uploaded",

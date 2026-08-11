@@ -127,28 +127,12 @@ def upsert_chunk_embeddings(
                     "external_doc_id": chunk_metadata.get("external_doc_id"),
                     "issuing_authority": chunk_metadata.get("issuing_authority"),
                     "publication_date": chunk_metadata.get("publication_date"),
-                    "effective_date": chunk_metadata.get("effective_date"),
                     "expiration_date": chunk_metadata.get("expiration_date"),
                     "document_number": chunk_metadata.get("document_number"),
                     "material_topic": chunk_metadata.get("material_topic"),
-                    "business_domain": chunk_metadata.get("business_domain"),
                     "source_url": chunk_metadata.get("source_url"),
                     "attachment_url": chunk_metadata.get("attachment_url"),
-                    "version_status": chunk_metadata.get("version_status") or "unknown",
-                    "article_number": chunk_metadata.get("article_number") or chunk.section_number,
-                    "table_id": chunk_metadata.get("table_id"),
-                    "table_title": chunk_metadata.get("table_title"),
-                    "sheet_name": chunk_metadata.get("sheet_name"),
-                    "period": chunk_metadata.get("period"),
-                    "year": _period_value(chunk_metadata, "year"),
-                    "month": _period_value(chunk_metadata, "month"),
-                    "quarter": _period_value(chunk_metadata, "quarter"),
-                    "unit": chunk_metadata.get("unit"),
-                    "row_label": chunk_metadata.get("row_label"),
-                    "table_headers": chunk_metadata.get("table_headers") or chunk_metadata.get("headers"),
-                    "row_index": chunk_metadata.get("row_index"),
-                    "row_cells": chunk_metadata.get("row_cells"),
-                    "raw_table_preview": chunk_metadata.get("raw_table_preview"),
+                    "source_type": chunk_metadata.get("source_type"),
                     "index_version": INDEX_VERSION,
                 },
             )
@@ -265,6 +249,13 @@ def hybrid_search(
     limit: int,
     metadata_filter: dict[str, Any] | None = None,
 ) -> list[VectorSearchResult]:
+    """dense 向量检索（Qdrant 仅 dense 一路，无 sparse）。
+
+    "hybrid" 命名保留自早期实现：本项目实际是「dense 语义召回 + 应用层关键词
+    补充（rag_service 全量扫 chunk 快照）+ rerank 重排」的组合，关键词召回在
+    应用层完成，Qdrant 侧只有 dense 向量 + 可选 metadata 过滤。函数名保留以避免
+    无意义的调用方改动，注释与 README 已按真实实现描述。
+    """
     ensure_vector_collection()
     client, models = _qdrant()
     try:
@@ -347,20 +338,14 @@ def refresh_document_metadata_payload(document_id: str, metadata: dict[str, Any]
         "external_doc_id",
         "issuing_authority",
         "publication_date",
-        "effective_date",
         "expiration_date",
         "document_number",
         "material_topic",
-        "business_domain",
         "source_url",
         "attachment_url",
         "source_type",
-        "version_label",
-        "version_status",
-        "supersedes_document_id",
     }
     payload = {key: metadata.get(key) for key in allowed}
-    payload["version_status"] = payload.get("version_status") or "unknown"
     try:
         client.set_payload(
             collection_name=QDRANT_COLLECTION,
@@ -386,9 +371,9 @@ def _qdrant_client() -> Any:
         from qdrant_client import QdrantClient
     except ImportError as exc:
         raise VectorStoreError("缺少 qdrant-client 依赖，无法连接向量数据库") from exc
-    # Metadata-only updates on very large spreadsheet documents can touch
-    # thousands of points.  The client's short default timeout can expire even
-    # though Qdrant completes the operation, so use a bounded long timeout.
+    # Metadata-only updates on documents with many chunks can touch thousands
+    # of points.  The client's short default timeout can expire even though
+    # Qdrant completes the operation, so use a bounded long timeout.
     return QdrantClient(url=QDRANT_URL, timeout=60)
 
 
@@ -398,19 +383,15 @@ def _ensure_payload_indexes(client: Any, models: Any) -> None:
         "index_version": models.PayloadSchemaType.KEYWORD,
         "source_file": models.PayloadSchemaType.KEYWORD,
         "chunk_type": models.PayloadSchemaType.KEYWORD,
-        "sheet_name": models.PayloadSchemaType.KEYWORD,
-        "year": models.PayloadSchemaType.INTEGER,
-        "month": models.PayloadSchemaType.INTEGER,
-        "quarter": models.PayloadSchemaType.INTEGER,
         "external_doc_id": models.PayloadSchemaType.KEYWORD,
         "issuing_authority": models.PayloadSchemaType.KEYWORD,
         "publication_date": models.PayloadSchemaType.KEYWORD,
-        "effective_date": models.PayloadSchemaType.KEYWORD,
+        "expiration_date": models.PayloadSchemaType.KEYWORD,
         "document_number": models.PayloadSchemaType.KEYWORD,
         "material_topic": models.PayloadSchemaType.KEYWORD,
-        "business_domain": models.PayloadSchemaType.KEYWORD,
-        "version_status": models.PayloadSchemaType.KEYWORD,
-        "article_number": models.PayloadSchemaType.KEYWORD,
+        "source_url": models.PayloadSchemaType.KEYWORD,
+        "attachment_url": models.PayloadSchemaType.KEYWORD,
+        "source_type": models.PayloadSchemaType.KEYWORD,
     }
     try:
         collection_info = client.get_collection(QDRANT_COLLECTION)
@@ -463,13 +444,6 @@ def _retrieval_filter(models: Any, metadata_filter: dict[str, Any] | None) -> An
                 match=models.MatchAny(any=document_ids),
             )
         )
-    for key in ("article_number", "version_status", "year", "month", "quarter"):
-        value = filters.get(key)
-        if value in (None, "", []):
-            continue
-        conditions.append(
-            models.FieldCondition(key=key, match=models.MatchValue(value=value))
-        )
     return models.Filter(must=conditions)
 
 
@@ -496,19 +470,13 @@ def _to_search_result(point: Any) -> VectorSearchResult:
         "external_doc_id",
         "issuing_authority",
         "publication_date",
-        "effective_date",
         "expiration_date",
         "document_number",
         "material_topic",
-        "business_domain",
         "source_url",
         "attachment_url",
-        "version_status",
-        "article_number",
+        "source_type",
         "file_type",
-        "year",
-        "month",
-        "quarter",
     ):
         if payload.get(key) not in (None, "", []):
             metadata[key] = payload[key]
@@ -542,9 +510,3 @@ def _payload_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _period_value(metadata: dict[str, Any], key: str) -> Any:
-    direct = metadata.get(f"inferred_{key}")
-    if direct is not None:
-        return direct
-    period = metadata.get("period")
-    return period.get(key) if isinstance(period, dict) else None

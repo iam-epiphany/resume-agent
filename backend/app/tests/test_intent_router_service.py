@@ -248,3 +248,134 @@ def test_llm_json_escaped_output_is_parsed(monkeypatch) -> None:
 
 def test_all_intents_are_exactly_three() -> None:
     assert set(ALL_INTENTS) == {INTENT_RESUME_QA, INTENT_GREETING, INTENT_OFF_TOPIC}
+
+
+# ---------------------------------------------------------------------------
+# fast path：普通独立问题跳过 LLM（INTENT_FAST_PATH_ENABLED 默认开启）
+# ---------------------------------------------------------------------------
+
+def test_fast_path_greeting_phrase_skips_llm(monkeypatch) -> None:
+    called = {"llm": False}
+
+    def assert_not_called(config, messages, **kwargs):
+        called["llm"] = True
+        raise AssertionError("fast path 不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+
+    result = classify_and_resolve("你好")
+
+    assert result.intent == INTENT_GREETING
+    assert result.classifier == "fast_path"
+    assert called["llm"] is False
+
+
+def test_fast_path_resume_anchor_skips_llm(monkeypatch) -> None:
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("fast path 不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+
+    result = classify_and_resolve("介绍一下你的项目经历")
+
+    assert result.intent == INTENT_RESUME_QA
+    assert result.classifier == "fast_path"
+
+
+def test_fast_path_mixed_greeting_with_substance_returns_resume_qa(monkeypatch) -> None:
+    """"你好，介绍下你的项目" 不是整句问候、但含简历锚点——fast path 直接归 resume_qa（不误伤）。"""
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("含锚点的混合问题不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+
+    result = classify_and_resolve("你好，介绍下你的项目")
+
+    assert result.intent == INTENT_RESUME_QA
+    assert result.classifier == "fast_path"
+
+
+def test_fast_path_disabled_falls_back_to_llm(monkeypatch) -> None:
+    monkeypatch.setattr(intent_router_service, "INTENT_FAST_PATH_ENABLED", False)
+    _llm_mock_json(monkeypatch, _payload(INTENT_RESUME_QA, reason="禁用 fast path 走 LLM"))
+
+    result = classify_and_resolve("你好")
+
+    assert result.intent == INTENT_RESUME_QA
+    assert result.classifier == "llm"
+
+
+def test_fast_path_turn_followup_uses_llm_for_disambiguation(monkeypatch) -> None:
+    """有上一轮对话时 fast path 不生效，走 LLM 追问补全。"""
+    _llm_mock_json(monkeypatch, _payload(INTENT_RESUME_QA, rewritten_question="那 Redis 预扣是怎么防超卖的？", needs_context=True))
+    previous = {"question": "秒杀项目怎么设计的？", "answer_excerpt": "使用 Redis 预扣库存。"}
+
+    result = classify_and_resolve("那怎么解决超卖的？", previous)
+
+    assert result.classifier == "llm"
+    assert result.needs_context is True
+    assert "Redis 预扣" in result.rewritten_question
+
+
+def test_fast_path_unknown_question_goes_to_llm(monkeypatch) -> None:
+    """无锚点、非问候的问题 fast path 不拦截，交 LLM 判定（如 off_topic）。"""
+    _llm_mock_json(monkeypatch, _payload(INTENT_OFF_TOPIC))
+
+    result = classify_and_resolve("今天天气怎么样")
+
+    assert result.intent == INTENT_OFF_TOPIC
+    assert result.classifier == "llm"
+
+
+# ---------------------------------------------------------------------------
+# fast path 修复（2026-08-08 二轮）：有历史但问题独立仍走 fast path；短词不判 greeting
+# ---------------------------------------------------------------------------
+
+def test_fast_path_independent_question_skips_llm_even_with_history(monkeypatch) -> None:
+    """Q1 项目 → Q2 HashMap（独立问题）：有上一轮但当前问题自足 → 仍走 fast path。"""
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("独立问题即使有历史也不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+    previous = {"question": "你有哪些项目？", "answer_excerpt": "秒杀、外卖、REV。"}
+
+    result = classify_and_resolve("HashMap 为什么线程不安全", previous)
+
+    assert result.classifier == "fast_path"
+    assert result.intent == INTENT_RESUME_QA
+
+
+def test_fast_path_independent_greeting_skips_llm_even_with_history(monkeypatch) -> None:
+    """有上一轮但当前是问候 → 仍走 fast path greeting。"""
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("问候即使有历史也不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+    previous = {"question": "介绍一下你的项目", "answer_excerpt": "秒杀项目。"}
+
+    result = classify_and_resolve("谢谢", previous)
+
+    assert result.classifier == "fast_path"
+    assert result.intent == INTENT_GREETING
+
+
+def test_fast_path_dependent_followup_still_uses_llm(monkeypatch) -> None:
+    """真依赖上下文的追问（指代）即使有历史也走 LLM 消解。"""
+    _llm_mock_json(monkeypatch, _payload(INTENT_RESUME_QA, rewritten_question="第二个项目用了什么技术", needs_context=True))
+    previous = {"question": "你有哪些项目？", "answer_excerpt": "秒杀、外卖、REV。"}
+
+    result = classify_and_resolve("第二个项目用了什么技术？", previous)
+
+    assert result.classifier == "llm"
+    assert result.needs_context is True
+
+
+def test_short_word_not_classified_as_greeting(monkeypatch) -> None:
+    """"爱好/籍贯/薪资/项目"等短词不应判为 greeting（交给 LLM）。"""
+    for word in ("爱好", "籍贯", "薪资", "项目"):
+        _llm_mock_json(monkeypatch, _payload(INTENT_RESUME_QA, reason=f"短词 {word} 走 LLM"))
+
+        result = classify_and_resolve(word)
+
+        assert result.classifier == "llm", f"{word} 不应被判为 fast_path"
+        assert result.intent == INTENT_RESUME_QA

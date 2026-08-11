@@ -22,6 +22,18 @@ class QATaskCreateResponse(BaseModel):
     status: Literal["queued", "running", "completed", "failed", "cancelled"]
 
 
+class QaPublicStatusResponse(BaseModel):
+    """公开就绪状态（/api/qa/status）：ready + 中文 message + 负载分级。
+
+    load.level 为 green/yellow/red；signals 仅含数值信号（CPU/内存占比、并发与排队数），
+    不暴露模型路径、设备等内部信息。
+    """
+
+    ready: bool
+    message: str
+    load: dict[str, Any] | None = None
+
+
 class ApiError(BaseModel):
     code: str
     message: str
@@ -31,7 +43,7 @@ class ApiError(BaseModel):
 
 
 class RagProgressEvent(BaseModel):
-    stage: Literal["intent", "memory", "rewrite", "retrieval", "generation"]
+    stage: Literal["intent", "memory", "rewrite", "retrieval", "generation", "cache"]
     status: Literal["pending", "running", "completed", "skipped", "failed"]
     title: str
     detail: str
@@ -52,7 +64,6 @@ class Citation(BaseModel):
     issuing_authority: str | None = None
     publication_date: str | None = None
     document_number: str | None = None
-    version_status: str | None = None
     section_title: str | None = None
     section_path: list[str] = Field(default_factory=list)
     section_number: str | None = None
@@ -103,6 +114,10 @@ class QAResponse(BaseModel):
     context_package: LLMContextPackage | None = None
     degraded: bool = False
     generation_status: str = "completed"
+    # 本次请求的 LLM 调用次数（意图分类/规划/改写/生成合计），供评测与观测
+    llm_call_count: int = 1
+    # 答案是否直接命中问答缓存（无 LLM 调用、秒回；2026-08-12）
+    cached: bool = False
 
 
 class QAAnswerPreview(BaseModel):

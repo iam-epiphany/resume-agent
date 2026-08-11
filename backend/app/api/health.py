@@ -8,6 +8,7 @@ from backend.app.services.model_path_resolver import (
     ModelPathResolutionError,
     resolve_embedding_model_local_path,
     resolve_reranker_model_local_path,
+    resolve_reranker_onnx_model_local_path,
 )
 from backend.app.services.office_conversion import office_tool_status
 from backend.app.services.index_task_service import index_task_status_counts
@@ -84,9 +85,21 @@ def _rag_health() -> RagHealthResponse:
         default_path=config.DEFAULT_EMBEDDING_MODEL_DIR,
     )
     reranker_ready, reranker_path, reranker_error = _resolve_model_for_health(
-        resolver=resolve_reranker_model_local_path,
-        configured_path=config.RERANKER_MODEL_PATH,
-        default_path=config.DEFAULT_RERANKER_MODEL_DIR,
+        resolver=(
+            resolve_reranker_onnx_model_local_path
+            if config.MODEL_BACKEND == "onnx"
+            else resolve_reranker_model_local_path
+        ),
+        configured_path=(
+            config.RERANKER_ONNX_MODEL_PATH
+            if config.MODEL_BACKEND == "onnx"
+            else config.RERANKER_MODEL_PATH
+        ),
+        default_path=(
+            config.DEFAULT_RERANKER_ONNX_INT8_DIR
+            if config.MODEL_BACKEND == "onnx"
+            else config.DEFAULT_RERANKER_MODEL_DIR
+        ),
     )
     qdrant_ready, collection_ready, qdrant_error = _check_qdrant()
     sqlite_ready = _check_sqlite()

@@ -45,7 +45,7 @@ describe("SystemStatusProvider", () => {
       documents: [
         { document_id: "doc-1", filename: "材料一.pdf", status: "indexed" },
         { document_id: "doc-2", filename: "材料二.docx", status: "indexed" },
-        { document_id: "doc-3", filename: "报表.xlsx", status: "indexing" },
+        { document_id: "doc-3", filename: "简历_张三.pdf", status: "indexing" },
       ],
     } as DocumentListResponse);
 

@@ -28,26 +28,18 @@ DocumentStage = Literal[
     "failed",
 ]
 
-VersionStatus = Literal["unknown", "current", "future", "repealed", "superseded", "draft"]
-
 
 class DocumentMetadataInput(BaseModel):
     external_doc_id: str | None = Field(default=None, max_length=128)
     title: str | None = Field(default=None, max_length=500)
     issuing_authority: str | None = Field(default=None, max_length=255)
     publication_date: str | None = Field(default=None, max_length=10)
-    effective_date: str | None = Field(default=None, max_length=10)
     expiration_date: str | None = Field(default=None, max_length=10)
     document_number: str | None = Field(default=None, max_length=255)
     material_topic: str | None = Field(default=None, max_length=255)
-    business_domain: str | None = Field(default=None, max_length=255)
-    source_column: str | None = Field(default=None, max_length=255)
     source_url: str | None = Field(default=None, max_length=2000)
     attachment_url: str | None = Field(default=None, max_length=2000)
     source_type: str | None = Field(default=None, max_length=40)
-    version_label: str | None = Field(default=None, max_length=120)
-    version_status: VersionStatus | None = None
-    supersedes_document_id: str | None = Field(default=None, max_length=128)
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -24,8 +24,8 @@ def make_model_dir(path: Path) -> Path:
 def test_explicit_model_paths_have_priority(monkeypatch, tmp_path) -> None:
     embedding_path = make_model_dir(tmp_path / "explicit-embedding")
     reranker_path = make_model_dir(tmp_path / "explicit-reranker")
-    default_embedding = make_model_dir(tmp_path / "default" / "bge-m3")
-    default_reranker = make_model_dir(tmp_path / "default" / "bge-reranker-v2-m3")
+    default_embedding = make_model_dir(tmp_path / "default" / "bge-base-zh-v1.5")
+    default_reranker = make_model_dir(tmp_path / "default" / "bge-reranker-base")
 
     monkeypatch.setattr(config, "RESUME_OFFLINE_MODE", True)
     monkeypatch.setattr(config, "EMBEDDING_MODEL_PATH", str(embedding_path))
@@ -39,10 +39,10 @@ def test_explicit_model_paths_have_priority(monkeypatch, tmp_path) -> None:
 
 
 def test_default_model_dirs_are_used_before_hf_cache(monkeypatch, tmp_path) -> None:
-    default_embedding = make_model_dir(tmp_path / "data" / "models" / "bge-m3")
-    default_reranker = make_model_dir(tmp_path / "data" / "models" / "bge-reranker-v2-m3")
-    make_model_dir(tmp_path / "hf" / "models--BAAI--bge-m3" / "snapshots" / "rev1")
-    make_model_dir(tmp_path / "hf" / "models--BAAI--bge-reranker-v2-m3" / "snapshots" / "rev1")
+    default_embedding = make_model_dir(tmp_path / "data" / "models" / "bge-base-zh-v1.5")
+    default_reranker = make_model_dir(tmp_path / "data" / "models" / "bge-reranker-base")
+    make_model_dir(tmp_path / "hf" / "models--BAAI--bge-base-zh-v1.5" / "snapshots" / "rev1")
+    make_model_dir(tmp_path / "hf" / "models--BAAI--bge-reranker-base" / "snapshots" / "rev1")
 
     monkeypatch.setattr(config, "RESUME_OFFLINE_MODE", True)
     monkeypatch.setattr(config, "EMBEDDING_MODEL_PATH", None)
@@ -57,7 +57,7 @@ def test_default_model_dirs_are_used_before_hf_cache(monkeypatch, tmp_path) -> N
 
 def test_hf_hub_cache_snapshot_is_used_when_default_missing(monkeypatch, tmp_path) -> None:
     embedding_snapshot = make_model_dir(
-        tmp_path / "hf" / "models--BAAI--bge-base-zh-v1.5" / "snapshots" / "rev1"
+        tmp_path / "hf" / "models--BAAI--bge-small-zh-v1.5" / "snapshots" / "rev1"
     )
     reranker_snapshot = make_model_dir(
         tmp_path / "hf" / "models--BAAI--bge-reranker-base" / "snapshots" / "rev1"
@@ -66,7 +66,7 @@ def test_hf_hub_cache_snapshot_is_used_when_default_missing(monkeypatch, tmp_pat
     monkeypatch.setattr(config, "RESUME_OFFLINE_MODE", True)
     monkeypatch.setattr(config, "EMBEDDING_MODEL_PATH", None)
     monkeypatch.setattr(config, "RERANKER_MODEL_PATH", None)
-    monkeypatch.setattr(config, "DEFAULT_EMBEDDING_MODEL_DIR", tmp_path / "missing" / "bge-m3")
+    monkeypatch.setattr(config, "DEFAULT_EMBEDDING_MODEL_DIR", tmp_path / "missing" / "bge-base-zh-v1.5")
     monkeypatch.setattr(config, "DEFAULT_RERANKER_MODEL_DIR", tmp_path / "missing" / "reranker")
     monkeypatch.setattr(config, "HF_HUB_CACHE", tmp_path / "hf")
 
@@ -77,7 +77,7 @@ def test_hf_hub_cache_snapshot_is_used_when_default_missing(monkeypatch, tmp_pat
 def test_offline_mode_raises_chinese_error_when_model_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(config, "RESUME_OFFLINE_MODE", True)
     monkeypatch.setattr(config, "EMBEDDING_MODEL_PATH", None)
-    monkeypatch.setattr(config, "DEFAULT_EMBEDDING_MODEL_DIR", tmp_path / "data" / "models" / "bge-m3")
+    monkeypatch.setattr(config, "DEFAULT_EMBEDDING_MODEL_DIR", tmp_path / "data" / "models" / "bge-base-zh-v1.5")
     monkeypatch.setattr(config, "HF_HUB_CACHE", tmp_path / "missing-cache")
 
     with pytest.raises(ModelPathResolutionError) as exc_info:
@@ -92,7 +92,7 @@ def test_offline_mode_raises_chinese_error_when_model_missing(monkeypatch, tmp_p
 def test_online_fallback_allowed_only_when_offline_mode_disabled(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(config, "RESUME_OFFLINE_MODE", False)
     monkeypatch.setattr(config, "EMBEDDING_MODEL_PATH", None)
-    monkeypatch.setattr(config, "DEFAULT_EMBEDDING_MODEL_DIR", tmp_path / "missing" / "bge-m3")
+    monkeypatch.setattr(config, "DEFAULT_EMBEDDING_MODEL_DIR", tmp_path / "missing" / "bge-base-zh-v1.5")
     monkeypatch.setattr(config, "HF_HUB_CACHE", tmp_path / "missing-cache")
     monkeypatch.setattr(config, "EMBEDDING_MODEL_NAME", "BAAI/bge-base-zh-v1.5")
 

@@ -4,8 +4,9 @@ from time import perf_counter_ns
 from backend.app.services.performance_metrics import observe_timing
 
 
-# BGE-M3 and the reranker can share one GPU. Serializing their forward passes
-# prevents concurrent upload indexing and QA requests from exhausting VRAM.
+# The embedding model and the reranker share one device. Serializing their
+# forward passes prevents concurrent upload indexing and QA requests from
+# exhausting GPU/CPU memory.
 class InstrumentedRLock:
     def __init__(self) -> None:
         self._lock = RLock()

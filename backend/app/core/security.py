@@ -93,3 +93,72 @@ def is_admin_request(request: Request | None) -> bool:
     if not auth.lower().startswith("bearer "):
         return False
     return decode_access_token(auth[len("Bearer "):].strip()) is not None
+
+
+# ---- 访客问答访问码闸：看过简历的面试官凭访问码提问，签发短期 JWT 存 httpOnly cookie ----
+
+QA_ACCESS_COOKIE = "qa_access"
+_QA_ACCESS_SUB = "qa_visitor"
+
+
+def qa_access_enabled() -> bool:
+    """访问码闸开关：QA_ACCESS_CODE 为空 = 关闭（开发/测试默认）。"""
+    return bool(config.QA_ACCESS_CODE)
+
+
+def verify_qa_access_code(code: str) -> bool:
+    """校验访问码（常量时间比较，避免时序侧信道）。"""
+    if not config.QA_ACCESS_CODE:
+        return True
+    if not code:
+        return False
+    return hmac.compare_digest(
+        code.encode("utf-8"),
+        config.QA_ACCESS_CODE.encode("utf-8"),
+    )
+
+
+def create_qa_access_token() -> tuple[str, datetime]:
+    """签发访客问答 token（独立 sub，与管理员 token 互不通用），返回 (token, expires_at)。"""
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=config.QA_ACCESS_TOKEN_TTL_HOURS)
+    payload = {
+        "sub": _QA_ACCESS_SUB,
+        "iat": now,
+        "exp": expires_at,
+        "iss": _TOKEN_ISSUER,
+    }
+    token = jwt.encode(payload, _jwt_secret(), algorithm="HS256")
+    return token, expires_at
+
+
+def decode_qa_access_token(token: str) -> dict | None:
+    """校验并解码访客 token；任何异常（过期/篡改/格式错误）返回 None。"""
+    try:
+        payload = jwt.decode(
+            token,
+            _jwt_secret(),
+            algorithms=["HS256"],
+            issuer=_TOKEN_ISSUER,
+            options={"require": ["sub", "exp", "iat"]},
+        )
+    except jwt.PyJWTError:
+        return None
+    return payload if payload.get("sub") == _QA_ACCESS_SUB else None
+
+
+def has_qa_access(request: Request | None) -> bool:
+    """访客问答访问闸：有效访客 token（cookie 或 Bearer）或管理员 token 均放行；
+    未配置访问码时恒放行。"""
+    if not qa_access_enabled():
+        return True
+    if request is None:
+        return False
+    token = request.cookies.get(QA_ACCESS_COOKIE, "")
+    if not token:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth[len("Bearer "):].strip()
+    if token and decode_qa_access_token(token) is not None:
+        return True
+    return is_admin_request(request)

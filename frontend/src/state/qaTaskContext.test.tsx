@@ -36,7 +36,7 @@ function Probe() {
   );
 }
 
-function completedTask(clientRequestId: string, question = "资产合计如何校验？", taskId = "task-0001"): QATaskStatusResponse {
+function completedTask(clientRequestId: string, question = "你参与过哪些项目？", taskId = "task-0001"): QATaskStatusResponse {
   return {
     task_id: taskId,
     client_request_id: clientRequestId,
@@ -52,12 +52,12 @@ function completedTask(clientRequestId: string, question = "资产合计如何�
       detail: "已获取相关材料",
     }],
     answer: {
-      answer: "资产合计应等于分项合计。",
+      answer: "项目经历包括外卖平台、REV 与秒杀系统。",
       answer_mode: "answered",
       evidence_sufficiency: "sufficient",
       hedge_note: null,
       intent: "asset_validation",
-      resolved_question: "资产合计如何校验？",
+      resolved_question: "你参与过哪些项目？",
       retrieval_fallback_level: 0,
       context_package: null,
       degraded: false,
@@ -70,7 +70,7 @@ function completedTask(clientRequestId: string, question = "资产合计如何�
   };
 }
 
-function enterDraft(value = "资产合计如何校验？") {
+function enterDraft(value = "你参与过哪些项目？") {
   fireEvent.change(screen.getByRole("textbox", { name: "草稿" }), { target: { value } });
 }
 
@@ -103,7 +103,7 @@ describe("QATaskProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "运行" }));
 
     expect(screen.getByTestId("draft")).toBeEmptyDOMElement();
-    expect(screen.getByTestId("question")).toHaveTextContent("资产合计如何校验？");
+    expect(screen.getByTestId("question")).toHaveTextContent("你参与过哪些项目？");
     await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("completed"));
     expect(createMock).toHaveBeenCalledTimes(1);
     expect(createMock.mock.calls[0][1]).toMatch(/^[A-Za-z0-9_]+$/);
@@ -213,7 +213,7 @@ describe("QATaskProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "运行" }));
 
     await waitFor(
-      () => expect(screen.getByTestId("answer")).toHaveTextContent("资产合计应等于分项合计"),
+      () => expect(screen.getByTestId("answer")).toHaveTextContent("项目经历包括外卖平台、REV 与秒杀系统"),
       { timeout: 3000 },
     );
     expect(getMock.mock.calls.length).toBeGreaterThanOrEqual(2);

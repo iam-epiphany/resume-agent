@@ -71,8 +71,9 @@ AUDIT_ARCHIVE_DIR = DATA_DIR / "audit_archives"
 # 模型缓存默认落在项目 data/ 下（RESUME_MODEL_CACHE_DIR 可覆盖）
 MODEL_CACHE_DIR = Path(os.getenv("RESUME_MODEL_CACHE_DIR") or DATA_DIR / "model_cache")
 MODEL_DIR = DATA_DIR / "models"
-DEFAULT_EMBEDDING_MODEL_DIR = MODEL_DIR / "bge-base-zh-v1.5"
+DEFAULT_EMBEDDING_MODEL_DIR = MODEL_DIR / "bge-small-zh-v1.5"
 DEFAULT_RERANKER_MODEL_DIR = MODEL_DIR / "bge-reranker-base"
+DEFAULT_RERANKER_ONNX_INT8_DIR = MODEL_DIR / "bge-reranker-base-onnx-int8"
 HF_HOME = Path(os.getenv("HF_HOME") or MODEL_CACHE_DIR / "huggingface")
 HF_HUB_CACHE = Path(os.getenv("HF_HUB_CACHE") or HF_HOME / "hub")
 SENTENCE_TRANSFORMERS_HOME = Path(
@@ -82,6 +83,9 @@ TORCH_HOME = Path(os.getenv("TORCH_HOME") or MODEL_CACHE_DIR / "torch")
 RESUME_OFFLINE_MODE = _env_bool("RESUME_OFFLINE_MODE", True)
 EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH")
 RERANKER_MODEL_PATH = os.getenv("RERANKER_MODEL_PATH")
+RERANKER_ONNX_MODEL_PATH = Path(
+    os.getenv("RERANKER_ONNX_MODEL_PATH") or DEFAULT_RERANKER_ONNX_INT8_DIR / "model.onnx"
+)
 MODEL_DEVICE = os.getenv("MODEL_DEVICE", "auto").strip().lower()
 MODEL_GPU_MIN_FREE_MEMORY_GB = _env_float("MODEL_GPU_MIN_FREE_MEMORY_GB", 1.0)
 RESUME_PERFORMANCE_MODE = _env_choice(
@@ -97,7 +101,7 @@ MODEL_BACKEND = _env_choice(
 MODEL_WARMUP_POLICY = _env_choice(
     "MODEL_WARMUP_POLICY",
     "background",
-    {"background", "lazy"},
+    {"background", "blocking", "lazy"},
 )
 RERANK_BATCH_SIZE = _env_int("RERANK_BATCH_SIZE", 0)
 RERANK_MAX_LENGTH = _env_int("RERANK_MAX_LENGTH", 1024, minimum=1)
@@ -108,6 +112,10 @@ RERANK_INPUT_MODE = _env_choice(
 )
 TORCH_NUM_THREADS = _env_int("TORCH_NUM_THREADS", 0)
 TORCH_NUM_INTEROP_THREADS = _env_int("TORCH_NUM_INTEROP_THREADS", 0)
+RERANK_ONNX_INTRA_OP_THREADS = _env_int("RERANK_ONNX_INTRA_OP_THREADS", 0)
+RERANK_ONNX_INTER_OP_THREADS = _env_int("RERANK_ONNX_INTER_OP_THREADS", 1)
+RERANK_ONNX_ENABLE_CPU_MEM_ARENA = _env_bool("RERANK_ONNX_ENABLE_CPU_MEM_ARENA", True)
+RERANK_ONNX_ENABLE_PREPACKING = _env_bool("RERANK_ONNX_ENABLE_PREPACKING", True)
 QUERY_EMBEDDING_CACHE_BYTES = _env_int(
     "QUERY_EMBEDDING_CACHE_BYTES", 64 * 1024 * 1024, minimum=0
 )
@@ -140,7 +148,12 @@ CHUNK_MAX_TOKENS = 800
 CHUNK_OVERLAP_TOKENS = 80
 SEMANTIC_BREAK_THRESHOLD = 0.62
 
-INDEX_VERSION = "bge-base-zh-dense-v5-resume"
+# 索引版本号：模型/维度变化时必须换新值并重建索引（SQLite 与 Qdrant 双端过滤旧版本）。
+# 2026-08-11 起默认 bge-small-zh-v1.5（512 维，2C4G 轻量档）；可用环境变量覆盖回旧模型。
+INDEX_VERSION = (
+    os.getenv("INDEX_VERSION", "bge-small-zh-dense-v6-resume").strip()
+    or "bge-small-zh-dense-v6-resume"
+)
 # 直跑后端默认连 RESUME_QDRANT_HTTP_PORT 映射的 qdrant（本地 .env 为 16333，服务器默认 6333）；
 # docker-compose 内显式传 QDRANT_URL=http://qdrant:6333 覆盖此默认值
 RESUME_QDRANT_HTTP_PORT = int(os.getenv("RESUME_QDRANT_HTTP_PORT", "6333"))
@@ -149,14 +162,14 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "resumemind_chunks")
 QDRANT_AUTO_CREATE_COLLECTION = _env_bool("QDRANT_AUTO_CREATE_COLLECTION", True)
 QDRANT_UPSERT_BATCH_SIZE = _env_int("QDRANT_UPSERT_BATCH_SIZE", 128, minimum=1)
 QDRANT_DENSE_VECTOR_NAME = "dense"
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-base-zh-v1.5")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-small-zh-v1.5")
 RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-base")
-EMBEDDING_DIMENSION = _env_int("EMBEDDING_DIMENSION", 768, minimum=1)
+EMBEDDING_DIMENSION = _env_int("EMBEDDING_DIMENSION", 512, minimum=1)
 EMBEDDING_BATCH_SIZE = _env_int("EMBEDDING_BATCH_SIZE", 8, minimum=1)
 EMBEDDING_MAX_BATCH_SIZE = _env_int("EMBEDDING_MAX_BATCH_SIZE", 16, minimum=1)
-RETRIEVAL_TOP_K = 50
-RERANK_TOP_K = 20
-RERANK_CANDIDATE_LIMIT = 24
+RETRIEVAL_TOP_K = _env_int("RETRIEVAL_TOP_K", 50, minimum=1)
+RERANK_TOP_K = _env_int("RERANK_TOP_K", 20, minimum=1)
+RERANK_CANDIDATE_LIMIT = _env_int("RERANK_CANDIDATE_LIMIT", 24, minimum=1)
 MAX_PROMPT_CHUNKS = 12
 MAX_PROMPT_TOKENS = _env_int("MAX_PROMPT_TOKENS", 3600, minimum=1)
 MIN_PROMPT_CHUNKS = _env_int("MIN_PROMPT_CHUNKS", 6, minimum=0)
@@ -168,15 +181,11 @@ PER_DOCUMENT_PROMPT_CAP = _env_int("PER_DOCUMENT_PROMPT_CAP", 2, minimum=1)
 # 关键词精确召回：每个 aspect 最多注入的关键词候选数（小库全量扫，0=关闭）
 KEYWORD_RECALL_LIMIT = _env_int("KEYWORD_RECALL_LIMIT", 6, minimum=0)
 FINAL_CITATION_LIMIT = MAX_PROMPT_CHUNKS
-MIN_RERANK_SCORE = _env_float("MIN_RERANK_SCORE", 0.30)
 MIN_EVIDENCE_COVERAGE = _env_float("MIN_EVIDENCE_COVERAGE", 0.25)
 DIRECT_EVIDENCE_COVERAGE = _env_float("DIRECT_EVIDENCE_COVERAGE", 0.45)
-# 强语义匹配的 rerank 分数下限：bge-reranker-base 的 normalize 分数分布为 0.001-0.03，
-# 旧模型（v2-m3）分布是 0-1，此阈值须按实际模型分布调整
-STRONG_SEMANTIC_RERANK_SCORE = _env_float("STRONG_SEMANTIC_RERANK_SCORE", 0.02)
 # core 选择的绝对相关性下限：实际部署中 rerank 分数为 0-1 分布（跑题≈0.012、真实匹配≥0.48），
 # 而 RERANK_PROMPT_THRESHOLD 可能被调得很低（如 0.01），取两者最大值保证跑题问题必被拦截
-MIN_CORE_RERANK_SCORE = _env_float("MIN_CORE_RERANK_SCORE", 0.1)
+MIN_CORE_RERANK_SCORE = _env_float("MIN_CORE_RERANK_SCORE", 0.20)
 # 词法逃生通道收紧（2026-08-02 拒答校准）：
 # 低于主门槛的 chunk 仅当“词法命中数 ≥ MIN_LEXICAL_SCORE 且 rerank ≥ MIN_LEXICAL_RERANK_SCORE”才放行，
 # 拦截“银行卡密码”类（rerank 0.004-0.03，仅关键词命中）与“爱弹吉他”类（语义相邻但无引号锚点）跑题内容
@@ -236,12 +245,38 @@ INTENT_ROUTER_RESPONSE_FORMAT = os.getenv("INTENT_ROUTER_RESPONSE_FORMAT", "json
 REWRITE_ENABLED = _env_bool("REWRITE_ENABLED", True)
 REWRITE_MAX_QUERIES = _env_int("REWRITE_MAX_QUERIES", 3, minimum=1)
 
+# ---- fast path（2026-08-08）：普通独立问题减少 LLM 调用 ----# 简历面试的大多数问题是"明确、独立、单对象"的普通提问：逐个走
+# 「意图 LLM → 规划 LLM → 生成 LLM」成本高（DeepSeek API 延迟主导）。
+# 开启后：无上一轮对话 + 无指代/追问标记时，意图层用极简规则跳过 LLM；
+# 非枚举/非补集/无拆解需求的普通问题，规划层直接构造单方面检索跳过 LLM。
+# 追问（指代消解）、枚举/补集、复杂问题仍走完整链路。两开关可独立关闭回退。
+INTENT_FAST_PATH_ENABLED = _env_bool("INTENT_FAST_PATH_ENABLED", True)
+PLANNER_FAST_PATH_ENABLED = _env_bool("PLANNER_FAST_PATH_ENABLED", True)
+
 CONVERSATION_MEMORY_ENABLED = _env_bool("CONVERSATION_MEMORY_ENABLED", True)
 CONVERSATION_MEMORY_MAX_TURNS = _env_int("CONVERSATION_MEMORY_MAX_TURNS", 8, minimum=1)
 CONVERSATION_MEMORY_TTL_HOURS = _env_float("CONVERSATION_MEMORY_TTL_HOURS", 24.0, minimum=0.1)
 
 # 推测标注前缀（证据不足时后端强制给回答加的前缀，保证措辞统一）
 HEDGE_PREFIX = os.getenv("HEDGE_PREFIX", "根据现有知识库推测").strip() or "根据现有知识库推测"
+
+# ---- grounding 确定性硬事实校验（2026-08-08）----
+# 生成后校验答案中的数字/日期/书名号专名是否能在检索证据中找到；
+# LLM 自评 sufficient 但硬事实校验失败 → 强制降级 hedged（防"自己生成、自己判断"盲区）。
+GROUNDING_VERIFY_ENABLED = _env_bool("GROUNDING_VERIFY_ENABLED", True)
+
+# ---- 访客问答访问码闸（2026-08-04）：看过简历的面试官凭访问码提问 ----
+# 简历/分享说明中附带访问码，访客输入一次后签发短期 JWT 存 httpOnly cookie；
+# QA_ACCESS_CODE 为空 = 闸门关闭（开发/测试默认），部署时在 .env 设置
+QA_ACCESS_CODE = os.getenv("QA_ACCESS_CODE", "").strip()
+QA_ACCESS_TOKEN_TTL_HOURS = _env_float("QA_ACCESS_TOKEN_TTL_HOURS", 24.0, minimum=0.1)
+# 访问码 cookie 的 Secure 标记：HTTPS 部署（Cloudflare Tunnel）时置 true
+COOKIE_SECURE = _env_bool("COOKIE_SECURE", False)
+# ---- 全局每日提问预算（跨 IP 保险丝，防换 IP 刷爆 DeepSeek 额度）----
+QA_GLOBAL_DAILY_LIMIT = _env_int("QA_GLOBAL_DAILY_LIMIT", 300, minimum=1)
+# 预算告警：剩余 ≤ max(该值, 预算×比例) 时前端弹窗提醒"今日预算即将超限"
+QA_BUDGET_WARNING_REMAINING = _env_int("QA_BUDGET_WARNING_REMAINING", 30, minimum=0)
+QA_BUDGET_WARNING_RATIO = _env_float("QA_BUDGET_WARNING_RATIO", 0.15, minimum=0.0)
 
 # ---- 检索兜底链（P3）：证据不足时不拒答，逐级放宽 ----
 FALLBACK_LOWER_THRESHOLD_ENABLED = _env_bool("FALLBACK_LOWER_THRESHOLD_ENABLED", True)
@@ -251,12 +286,37 @@ FALLBACK_DIRECT_GENERATION_ENABLED = _env_bool("FALLBACK_DIRECT_GENERATION_ENABL
 RELAXED_RERANK_THRESHOLD = _env_float("RELAXED_RERANK_THRESHOLD", 0.05)
 RELAXED_MIN_PROMPT_CHUNKS = _env_int("RELAXED_MIN_PROMPT_CHUNKS", 6, minimum=1)
 
+# ---- 负载指示灯（公开状态 /api/qa/status 的 load 字段，2026-08-12）----
+# 按 2C4G 校准（QA_TASK_WORKERS=2，任务管线双 worker 并行）：1-2 人提问绿、3 人黄、4 人及以上红。
+# in_flight = 运行中 + 排队中的问答任务数；CPU 比 = 进程 CPU% /（核数 × 100），
+# 取最近 30s 均值平滑（rerank 突刺不误报）；内存仅作红色兜底（防 OOM），不参与黄色。
+LOAD_YELLOW_CPU_RATIO = _env_float("LOAD_YELLOW_CPU_RATIO", 0.70)
+LOAD_RED_CPU_RATIO = _env_float("LOAD_RED_CPU_RATIO", 0.90)
+LOAD_RED_MEM_RATIO = _env_float("LOAD_RED_MEM_RATIO", 0.90)
+LOAD_YELLOW_INFLIGHT = _env_int("LOAD_YELLOW_INFLIGHT", 3, minimum=1)
+LOAD_RED_INFLIGHT = _env_int("LOAD_RED_INFLIGHT", 4, minimum=1)
+# 内存基准兜底：容器内优先读 cgroup 上限；裸机/本地读不到时按服务器物理内存估算，再兜底该值
+LOAD_MEMORY_REFERENCE_BYTES = _env_int("LOAD_MEMORY_REFERENCE_BYTES", 4 * 1024**3, minimum=1)
+
 MAX_UPLOAD_BYTES = _env_int("MAX_UPLOAD_BYTES", 50 * 1024 * 1024, minimum=1)
 MAX_BATCH_UPLOAD_FILES = _env_int("MAX_BATCH_UPLOAD_FILES", 20, minimum=1)
 INDEX_QUEUE_CAPACITY = _env_int("INDEX_QUEUE_CAPACITY", 8, minimum=1)
 INDEX_TASK_MAX_RETRIES = _env_int("INDEX_TASK_MAX_RETRIES", 3)
 QA_QUEUE_CAPACITY = _env_int("QA_QUEUE_CAPACITY", 16, minimum=1)
 QA_TASK_MAX_RETRIES = _env_int("QA_TASK_MAX_RETRIES", 1)
+# 问答任务并行 worker 数（2026-08-12 起 2C4G 档默认 2）：
+# 每问约 90% 时间是外部 LLM API，本地推理仅 1-2s（全局锁串行）——
+# 双 worker 让 2 人同时提问各自并行处理，第 3 人排队；设 1 回退旧单 worker 行为。
+QA_TASK_WORKERS = _env_int("QA_TASK_WORKERS", 2, minimum=1)
+
+# ---- 问答答案缓存（2026-08-12）：面试高频问题相似语义复用 ----
+# 两层判定：① 问题归一化后完全相等（精确命中，最安全）；② embedding 余弦
+# top-1 ≥ QA_CACHE_SEMANTIC_THRESHOLD（默认 0.93 保守——"语义相似"与"答案可复用"
+# 不同，阈值宁高勿低防张冠李戴）。只缓存独立问题（无 session）的 answered+sufficient
+# 答案；知识库变更（上传/删除/重建）时整体清空。
+QA_CACHE_ENABLED = _env_bool("QA_CACHE_ENABLED", True)
+QA_CACHE_SEMANTIC_THRESHOLD = _env_float("QA_CACHE_SEMANTIC_THRESHOLD", 0.93)
+QA_CACHE_MAX_ITEMS = _env_int("QA_CACHE_MAX_ITEMS", 300, minimum=1)
 MAX_OOXML_ENTRIES = _env_int("MAX_OOXML_ENTRIES", 20_000, minimum=1)
 MAX_OOXML_UNCOMPRESSED_BYTES = _env_int(
     "MAX_OOXML_UNCOMPRESSED_BYTES", 500 * 1024 * 1024, minimum=1
@@ -301,11 +361,11 @@ ADMIN_TOKEN_EXPIRY_HOURS = _env_int("ADMIN_TOKEN_EXPIRY_HOURS", 12, minimum=1)
 AUTH_REQUIRED = _env_bool("AUTH_REQUIRED", True)
 
 RATE_LIMIT_ENABLED = _env_bool("RATE_LIMIT_ENABLED", True)
-# 问答接口（/api/qa/*）每 IP 限流：每分钟次数 + 每日次数。
-QA_IP_RATE_LIMIT_PER_MINUTE = _env_int("QA_IP_RATE_LIMIT_PER_MINUTE", 30, minimum=1)
+# 问答接口（/api/qa/*）每 IP 限流：每分钟次数（0 = 不限制，仅保留每日上限与全局并发）+ 每日次数。
+QA_IP_RATE_LIMIT_PER_MINUTE = _env_int("QA_IP_RATE_LIMIT_PER_MINUTE", 30, minimum=0)
 QA_IP_DAILY_LIMIT = _env_int("QA_IP_DAILY_LIMIT", 500, minimum=1)
-# 全局同时执行问答（跑 LLM 的路径）的最大并发数；2C4G 建议保持 4。
-QA_GLOBAL_CONCURRENCY = _env_int("QA_GLOBAL_CONCURRENCY", 4, minimum=1)
+# 全局同时执行问答（跑 LLM 的路径）的最大并发数；2C4G 保守稳定档建议 2。
+QA_GLOBAL_CONCURRENCY = _env_int("QA_GLOBAL_CONCURRENCY", 2, minimum=1)
 LOGIN_RATE_LIMIT_PER_MINUTE = _env_int("LOGIN_RATE_LIMIT_PER_MINUTE", 10, minimum=1)
 # 部署在可信反向代理（Cloudflare Tunnel）后置 true，用 X-Forwarded-For 首段作为 IP。
 RATE_LIMIT_TRUST_PROXY = _env_bool("RATE_LIMIT_TRUST_PROXY", False)

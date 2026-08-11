@@ -8,3 +8,8 @@ os.environ.setdefault("RESUMEMIND_SKIP_DOTENV", "1")
 # 并默认关闭限流（大测试集不会被 30 次/分配额打挂；限流单测用 monkeypatch 局部开启）。
 os.environ.setdefault("ADMIN_PASSWORD", "test-admin-password")
 os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
+
+# 访客访问码闸默认关闭 + 全局预算放大（既有 QA 测试不受闸门/预算影响；
+# 闸门与预算行为由 test_qa_access.py 用 monkeypatch 局部开启验证）。
+os.environ.setdefault("QA_ACCESS_CODE", "")
+os.environ.setdefault("QA_GLOBAL_DAILY_LIMIT", "100000")

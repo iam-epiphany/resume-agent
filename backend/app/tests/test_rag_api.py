@@ -176,7 +176,7 @@ def test_rag_health_remains_diagnostic_while_readiness_returns_503(monkeypatch) 
         offline_mode=True,
         embedding_model_ready=True,
         reranker_model_ready=True,
-        embedding_model_path="/models/bge-m3",
+        embedding_model_path="/models/bge-base-zh-v1.5",
         reranker_model_path="/models/reranker",
         qdrant_ready=True,
         qdrant_collection="resumemind_chunks",
@@ -266,8 +266,6 @@ def test_upload_metadata_propagates_to_document_and_chunks(fake_indexing_service
         "source_url": "https://www.henu.edu.cn/skills/1",
         "attachment_url": "https://www.henu.edu.cn/skills/1.md",
         "material_topic": "技能掌握",
-        "business_domain": "简历问答",
-        "version_status": "current",
     }
     response = client.post(
         "/api/documents/upload",
@@ -453,7 +451,7 @@ def test_url_import_persists_final_source_url(monkeypatch, fake_indexing_service
         "/api/documents/url-import",
         json={
             "url": "https://www.henu.edu.cn/official.md",
-            "metadata": {"title": "官方说明", "version_status": "current"},
+            "metadata": {"title": "官方说明", "material_topic": "项目经历"},
         },
     )
     assert response.status_code == 202
@@ -2420,7 +2418,7 @@ def test_aspect_retrieval_fuses_queries_before_single_rerank(monkeypatch) -> Non
     ]
     rerank_calls = []
 
-    def fake_collect(queries, query_metadata=None, diagnostics=None):
+    def fake_collect(queries, query_metadata=None, diagnostics=None, metadata_filter=None):
         assert len(queries) == 3
         if diagnostics is not None:
             diagnostics.query_count = len(queries)
@@ -2634,3 +2632,237 @@ def test_prompt_coverage_sync_marks_late_recovered_context_as_sufficient() -> No
 
 
 
+
+
+def test_aspect_anchor_documents_become_retrieval_metadata_filter(monkeypatch) -> None:
+    """简历领域结构：aspect 锚定的对象文档名解析为 document_ids 检索过滤。"""
+    from backend.app.services import rag_service
+
+    captured: dict = {}
+
+    def fake_collect(queries, query_metadata=None, diagnostics=None, metadata_filter=None):
+        captured["metadata_filter"] = metadata_filter
+        captured["queries"] = queries
+        return [], {}, []
+
+    monkeypatch.setattr(rag_service, "collect_candidates_with_query_hits", fake_collect)
+
+    aspect = QueryAspect(
+        aspect_id="obj_1",
+        question="介绍一下你的秒杀项目",
+        search_queries=(QuerySearchQuery("秒杀项目", "semantic_question", ""),),
+        evidence_need="项目经历",
+        keywords=("秒杀",),
+        anchor_documents=("项目介绍_高并发电商秒杀平台.md",),
+    )
+    rag_service._retrieve_aspect_matches(object(), aspect)
+
+    # object() 作为 db 时 _anchor_document_ids 查询失败 → 返回空集 → 不设过滤（退化安全）
+    assert captured["metadata_filter"] is None
+    assert captured["queries"] == ["秒杀项目"]
+
+
+def test_anchor_document_ids_resolves_indexed_filenames(monkeypatch) -> None:
+    """anchor_documents 文件名 → document_id 集合（仅已索引文档）。"""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from backend.app.core.database import Base
+    from backend.app.models.document import Document
+    from backend.app.services import rag_service
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        db.add(Document(
+            document_id="DOC-PROJ-1",
+            filename="项目介绍_高并发电商秒杀平台.md",
+            filename_norm="项目介绍_高并发电商秒杀平台.md",
+            file_type="md",
+            size=10,
+            storage_path="/tmp/x.md",
+            status="indexed",
+        ))
+        db.add(Document(
+            document_id="DOC-PROJ-2",
+            filename="项目介绍_外卖平台.md",
+            filename_norm="项目介绍_外卖平台.md",
+            file_type="md",
+            size=10,
+            storage_path="/tmp/y.md",
+            status="indexed",
+        ))
+        db.commit()
+        resolved = rag_service._anchor_document_ids(
+            db, ("项目介绍_高并发电商秒杀平台.md", "不存在的文档.md")
+        )
+
+    assert resolved == {"DOC-PROJ-1"}
+
+
+def test_complement_question_excludes_documents_from_final_prompt(monkeypatch) -> None:
+    """补集问句：被排除对象文档的 chunk 绝不进入最终 prompt（即使 coverage 逻辑会倾向选它）。"""
+    from backend.app.services import rag_service
+
+    monkeypatch.setattr(rag_service, "MIN_PROMPT_CHUNKS", 2)
+    monkeypatch.setattr(rag_service, "FORCE_MIN_CHUNKS", True)
+
+    excluded_filename = "项目介绍_外卖平台.md"
+    included_filename = "项目介绍_高并发电商秒杀平台.md"
+    aspects = tuple(
+        QueryAspect(
+            aspect_id=f"aspect_{index}",
+            question=f"还有哪些项目 {index}",
+            search_queries=(QuerySearchQuery(f"项目 {index}", "semantic_question", ""),),
+            evidence_need="项目经历",
+            keywords=(f"项目 {index}",),
+        )
+        for index in (1, 2)
+    )
+    chunks = [
+        RetrievalResult(
+            chunk_id=f"CHUNK-EXCL-{index}",
+            rank=index,
+            score=0.95,
+            source_doc=excluded_filename,
+            section_title=f"项目 {index}",
+            section_path=[f"项目 {index}"],
+            text=f"被排除项目 {index} 的介绍内容。",
+            citation_label=f"[{index}]",
+            metadata={"rerank_score": 0.95, "filename": excluded_filename, "token_count": 500},
+        )
+        for index in (1, 2)
+    ] + [
+        RetrievalResult(
+            chunk_id=f"CHUNK-INC-{index}",
+            rank=index,
+            score=0.6,
+            source_doc=included_filename,
+            section_title=f"保留项目 {index}",
+            section_path=[f"保留项目 {index}"],
+            text=f"保留项目 {index} 的介绍内容。",
+            citation_label=f"[{index}]",
+            metadata={"rerank_score": 0.6, "filename": included_filename, "token_count": 500},
+        )
+        for index in (1, 2)
+    ]
+    retrievals = [
+        rag_service.AspectRetrieval(
+            aspect=aspect,
+            candidates=chunks,
+            diagnostics=[],
+            citation_validation={"valid_chunks": len(chunks)},
+            selected_chunk_ids=[],
+            retrieval_covered=True,
+        )
+        for aspect in aspects
+    ]
+    plan = rag_service.QueryPlan(
+        original_question="除了外卖平台还有哪些项目？",
+        aspects=aspects,
+        planner="test",
+        enumerative=True,
+        excluded_documents=(excluded_filename,),
+    )
+
+    selected, _summary = rag_service._select_prompt_chunks(plan.original_question, plan, retrievals)
+
+    # 最终 prompt 中不得出现被排除文档的任何 chunk
+    selected_docs = {chunk.metadata.get("filename") or chunk.source_doc for chunk in selected}
+    assert excluded_filename not in selected_docs
+    assert all(chunk.source_doc != excluded_filename for chunk in selected)
+    # 保留项目文档有入选（确保不是全被排除）
+    assert included_filename in selected_docs
+
+
+def test_complement_exclusion_survives_force_min_chunks(monkeypatch) -> None:
+    """即使 MIN_PROMPT_CHUNKS 强制补足，被排除文档也不得因 coverage 逻辑重新进入 prompt。"""
+    from backend.app.services import rag_service
+
+    monkeypatch.setattr(rag_service, "MIN_PROMPT_CHUNKS", 4)
+    monkeypatch.setattr(rag_service, "FORCE_MIN_CHUNKS", True)
+
+    excluded_filename = "项目介绍_REV密码算法.md"
+    included_filename = "项目介绍_外卖平台.md"
+    aspect = QueryAspect(
+        aspect_id="aspect_1",
+        question="还有哪些项目？",
+        search_queries=(QuerySearchQuery("项目", "semantic_question", ""),),
+        evidence_need="项目经历",
+        keywords=("项目",),
+    )
+    chunks = [
+        RetrievalResult(
+            chunk_id=f"CHUNK-{index}",
+            rank=index,
+            score=0.9,
+            source_doc=(excluded_filename if index % 2 else included_filename),
+            section_title=f"项目 {index}",
+            section_path=[f"项目 {index}"],
+            text=f"项目 {index} 介绍。",
+            citation_label=f"[{index}]",
+            metadata={
+                "rerank_score": 0.9,
+                "filename": (excluded_filename if index % 2 else included_filename),
+                "token_count": 400,
+            },
+        )
+        for index in range(1, 7)
+    ]
+    retrievals = [
+        rag_service.AspectRetrieval(
+            aspect=aspect,
+            candidates=chunks,
+            diagnostics=[],
+            citation_validation={"valid_chunks": len(chunks)},
+            selected_chunk_ids=[],
+            retrieval_covered=True,
+        )
+    ]
+    plan = rag_service.QueryPlan(
+        original_question="除了 REV 项目还有哪些项目？",
+        aspects=(aspect,),
+        planner="test",
+        enumerative=True,
+        excluded_documents=(excluded_filename,),
+    )
+
+    selected, _summary = rag_service._select_prompt_chunks(plan.original_question, plan, retrievals)
+
+    selected_docs = {chunk.metadata.get("filename") or chunk.source_doc for chunk in selected}
+    assert excluded_filename not in selected_docs
+    assert included_filename in selected_docs
+
+
+def test_qa_api_answer_patch_isolates_real_rag(monkeypatch) -> None:
+    """验证 monkeypatch 目标正确：patch qa.py 模块绑定的 answer_question 后，
+    QA API 端点走 fake，不再触发真实 RAG（模型/Qdrant 零调用）。"""
+    from backend.app.api import qa as qa_module
+    from backend.app.schemas.qa import QAResponse
+
+    reset_database()
+    real_rag_called = {"called": False}
+
+    def fake_answer(db, question, **kwargs):
+        # 若 patch 未生效，这里不会被调用；真实 RAG 会走模型链路
+        return QAResponse(
+            answer=f"fake:{question}",
+            answer_mode="answered",
+            evidence_sufficiency="sufficient",
+            intent="resume_qa",
+            generation_status="completed",
+        )
+
+    # 打桩：若真实 answer_question 被调用（patch 失败），必然经过这些模块
+    monkeypatch.setattr(
+        "backend.app.services.intent_router_service.chat_completion_content",
+        lambda *a, **k: real_rag_called.update(called=True) or "{}",
+    )
+    monkeypatch.setattr(qa_module, "answer_question", fake_answer)
+
+    response = client.post("/api/qa/ask", json={"question": "介绍一下你的项目"})
+
+    assert response.status_code == 200
+    assert response.json()["answer"].startswith("fake:")
+    assert real_rag_called["called"] is False

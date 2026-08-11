@@ -22,7 +22,7 @@ ENV PYTHONUNBUFFERED=1 \
     HF_DATASETS_OFFLINE=1 \
     SENTENCE_TRANSFORMERS_HOME=/app/data/model_cache/sentence_transformers \
     TORCH_HOME=/app/data/model_cache/torch \
-    EMBEDDING_MODEL_PATH=/app/data/models/bge-base-zh-v1.5 \
+    EMBEDDING_MODEL_PATH=/app/data/models/bge-small-zh-v1.5 \
     RERANKER_MODEL_PATH=/app/data/models/bge-reranker-base
 
 WORKDIR /app

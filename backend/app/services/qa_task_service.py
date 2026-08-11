@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.app.core.config import QA_QUEUE_CAPACITY, QA_TASK_MAX_RETRIES
+from backend.app.core.config import QA_QUEUE_CAPACITY, QA_TASK_MAX_RETRIES, QA_TASK_WORKERS
 from backend.app.core.database import SessionLocal
 from backend.app.models.document import QATask
 from backend.app.schemas.qa import (
@@ -43,13 +43,23 @@ class QATaskCancelled(Exception):
 
 
 def start_qa_task_worker() -> None:
-    """Start one bounded worker and resume durable queued QA tasks."""
+    """Start the bounded worker pool and resume durable queued QA tasks.
+
+    多 worker（QA_TASK_WORKERS，2C4G 档默认 2）：LLM 调用在外部 API，本地推理
+    由 MODEL_INFERENCE_LOCK 串行——并行 worker 让多人提问的 API 等待真正并行；
+    队列与 _PENDING 去重均线程安全，多个 worker 不会重复领取同一任务。
+    """
 
     global _STARTED
     newly_started = False
     with _LOCK:
         if not _STARTED:
-            Thread(target=_worker_loop, name="resumemind-qa-worker", daemon=True).start()
+            for index in range(max(1, QA_TASK_WORKERS)):
+                Thread(
+                    target=_worker_loop,
+                    name=f"resumemind-qa-worker-{index + 1}",
+                    daemon=True,
+                ).start()
             _STARTED = True
             newly_started = True
     if newly_started:

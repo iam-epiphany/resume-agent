@@ -13,11 +13,8 @@
     environment:
       RESUME_DATA_DIR: /app/data
       RESUME_MODEL_CACHE_DIR: /app/data/model_cache
-      RESUME_OFFLINE_MODE: ${RESUME_OFFLINE_MODE:-false}
+      RESUME_OFFLINE_MODE: ${RESUME_OFFLINE_MODE:-true}
       RESUME_BUILD_ID: ${RESUME_BUILD_ID:-dev}
-      SEMANTIC_GROUNDING_MODE: ${SEMANTIC_GROUNDING_MODE:-risk_based}
-      SEMANTIC_GROUNDING_MODEL: ${SEMANTIC_GROUNDING_MODEL:-deepseek-v4-flash}
-      SEMANTIC_GROUNDING_TIMEOUT_SECONDS: ${SEMANTIC_GROUNDING_TIMEOUT_SECONDS:-12}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-resumemind_chunks}
@@ -29,17 +26,25 @@
       EMBEDDING_MAX_BATCH_SIZE: ${EMBEDDING_MAX_BATCH_SIZE:-8}
       RESUME_PERFORMANCE_MODE: ${RESUME_PERFORMANCE_MODE:-cpu_low_resource}
       MODEL_BACKEND: ${MODEL_BACKEND:-pytorch}
-      MODEL_WARMUP_POLICY: ${MODEL_WARMUP_POLICY:-background}
+      # blocking avoids a first-question cold start. It is safe because healthcheck
+      # start_period already leaves the model-loading window.
+      MODEL_WARMUP_POLICY: ${MODEL_WARMUP_POLICY:-blocking}
       RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-2}
       RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-512}
-      RERANK_INPUT_MODE: ${RERANK_INPUT_MODE:-embedding}
+      RERANK_INPUT_MODE: ${RERANK_INPUT_MODE:-compact}
+      # 2C4G 下 cross-encoder 是本地热路径；十余篇个人材料无需重排 24 个候选。
+      RERANK_CANDIDATE_LIMIT: ${RERANK_CANDIDATE_LIMIT:-12}
+      RERANK_TOP_K: ${RERANK_TOP_K:-12}
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-2}
       TORCH_NUM_INTEROP_THREADS: ${TORCH_NUM_INTEROP_THREADS:-1}
+      RERANKER_ONNX_MODEL_PATH: ${RERANKER_ONNX_MODEL_PATH:-/app/data/models/bge-reranker-base-onnx-int8/model.onnx}
+      RERANK_ONNX_INTRA_OP_THREADS: ${RERANK_ONNX_INTRA_OP_THREADS:-2}
+      RERANK_ONNX_INTER_OP_THREADS: ${RERANK_ONNX_INTER_OP_THREADS:-1}
       QUERY_EMBEDDING_CACHE_BYTES: ${QUERY_EMBEDDING_CACHE_BYTES:-67108864}
       RERANK_SCORE_CACHE_BYTES: ${RERANK_SCORE_CACHE_BYTES:-33554432}
       MODEL_DEVICE: ${MODEL_DEVICE:-cpu}
-      MIN_RERANK_SCORE: ${MIN_RERANK_SCORE:-0.004}
-      RERANK_PROMPT_THRESHOLD: ${RERANK_PROMPT_THRESHOLD:-0.01}
+      MIN_CORE_RERANK_SCORE: ${MIN_CORE_RERANK_SCORE:-0.20}
+      RERANK_PROMPT_THRESHOLD: ${RERANK_PROMPT_THRESHOLD:-0.20}
       MIN_EVIDENCE_COVERAGE: ${MIN_EVIDENCE_COVERAGE:-0}
       MAX_PROMPT_TOKENS: ${MAX_PROMPT_TOKENS:-3600}
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
@@ -47,9 +52,11 @@
       INDEX_TASK_MAX_RETRIES: ${INDEX_TASK_MAX_RETRIES:-3}
       QA_QUEUE_CAPACITY: ${QA_QUEUE_CAPACITY:-16}
       QA_TASK_MAX_RETRIES: ${QA_TASK_MAX_RETRIES:-1}
+      # 问答并行 worker：2C4G 档 2（2 人同时提问各自并行，3 人排队变慢）；
+      # 1 = 回退单 worker 串行；4C8G 档可到 3
+      QA_TASK_WORKERS: ${QA_TASK_WORKERS:-2}
       MAX_OOXML_ENTRIES: ${MAX_OOXML_ENTRIES:-20000}
       MAX_OOXML_UNCOMPRESSED_BYTES: ${MAX_OOXML_UNCOMPRESSED_BYTES:-524288000}
-      MAX_SPREADSHEET_LOGICAL_CELLS: ${MAX_SPREADSHEET_LOGICAL_CELLS:-5000000}
       OFFICE_CONVERSION_TIMEOUT_SECONDS: ${OFFICE_CONVERSION_TIMEOUT_SECONDS:-120}
       OFFICE_CONVERSION_MAX_BYTES: ${OFFICE_CONVERSION_MAX_BYTES:-209715200}
       HF_ENDPOINT: https://hf-mirror.com
@@ -60,7 +67,12 @@
       HF_DATASETS_OFFLINE: ${HF_DATASETS_OFFLINE:-0}
       SENTENCE_TRANSFORMERS_HOME: /app/data/model_cache/sentence_transformers
       TORCH_HOME: /app/data/model_cache/torch
-      EMBEDDING_MODEL_PATH: ${EMBEDDING_MODEL_PATH:-/app/data/models/bge-base-zh-v1.5}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-zh-v1.5}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-512}
+      INDEX_VERSION: ${INDEX_VERSION:-bge-small-zh-dense-v6-resume}
+      # 2C4G 轻量档：bge-small-zh-v1.5（512 维）。如需回退 bge-base-zh-v1.5（768 维），
+      # 同时改 EMBEDDING_MODEL_PATH/EMBEDDING_DIMENSION/INDEX_VERSION 并重建索引。
+      EMBEDDING_MODEL_PATH: ${EMBEDDING_MODEL_PATH:-/app/data/models/bge-small-zh-v1.5}
       RERANKER_MODEL_PATH: ${RERANKER_MODEL_PATH:-/app/data/models/bge-reranker-base}
       # 前台/后台权限分离：管理员密码（必填）、JWT、限流参数
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -70,15 +82,31 @@
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
       QA_IP_RATE_LIMIT_PER_MINUTE: ${QA_IP_RATE_LIMIT_PER_MINUTE:-30}
       QA_IP_DAILY_LIMIT: ${QA_IP_DAILY_LIMIT:-500}
-      QA_GLOBAL_CONCURRENCY: ${QA_GLOBAL_CONCURRENCY:-4}
+      # One local inference lock protects the 2C4G CPU; a small queue prevents
+      # concurrent visitors from creating a memory/latency spiral.
+      QA_GLOBAL_CONCURRENCY: ${QA_GLOBAL_CONCURRENCY:-2}
       LOGIN_RATE_LIMIT_PER_MINUTE: ${LOGIN_RATE_LIMIT_PER_MINUTE:-10}
       RATE_LIMIT_TRUST_PROXY: ${RATE_LIMIT_TRUST_PROXY:-false}
+      # 访客问答访问码闸 + 全局每日预算（2026-08-04；QA_ACCESS_CODE 为空 = 关闭闸门）
+      QA_ACCESS_CODE: ${QA_ACCESS_CODE:-}
+      QA_ACCESS_TOKEN_TTL_HOURS: ${QA_ACCESS_TOKEN_TTL_HOURS:-24}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      QA_GLOBAL_DAILY_LIMIT: ${QA_GLOBAL_DAILY_LIMIT:-300}
+      QA_BUDGET_WARNING_REMAINING: ${QA_BUDGET_WARNING_REMAINING:-30}
+      QA_BUDGET_WARNING_RATIO: ${QA_BUDGET_WARNING_RATIO:-0.15}
+      # fast path：普通独立问题减少 LLM 调用（默认开，可关回退完整链路）
+      INTENT_FAST_PATH_ENABLED: ${INTENT_FAST_PATH_ENABLED:-true}
+      PLANNER_FAST_PATH_ENABLED: ${PLANNER_FAST_PATH_ENABLED:-true}
+      # grounding：确定性硬事实校验（默认开，可关）
+      GROUNDING_VERIFY_ENABLED: ${GROUNDING_VERIFY_ENABLED:-true}
     ports:
       - "127.0.0.1:${RESUME_APP_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data
       - ./data/models:/app/data/models:ro
     restart: unless-stopped
+    mem_limit: ${RESUME_APP_MEM_LIMIT:-2800m}
+    cpus: ${RESUME_APP_CPU_LIMIT:-2.0}
     # /api/health/ready 已收进管理员后台，容器探活降级为公开存活接口 /api/health
     # （容器 healthy 不再等于模型就绪；模型就绪状态由后台系统状态面板查看）
     healthcheck:
@@ -99,6 +127,8 @@
     volumes:
       - ./data/qdrant:/qdrant/storage
     restart: unless-stopped
+    mem_limit: ${RESUME_QDRANT_MEM_LIMIT:-384m}
+    cpus: ${RESUME_QDRANT_CPU_LIMIT:-0.5}
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && grep -q 'healthz check passed' <&3"]
       interval: 10s

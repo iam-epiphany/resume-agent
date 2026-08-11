@@ -43,8 +43,8 @@ describe("AuditPage", () => {
 
   it("filters audit events and keeps full QA content in the detail drawer", async () => {
     const details = {
-      question: "综合成绩如何校验？",
-      answer: "综合成绩应等于所有分项成绩合计，且必须与课程成绩表中的合计行一致。[1]",
+      question: "秒杀项目怎么防超卖？",
+      answer: "秒杀系统通过 Redis 预扣库存防止超卖，与项目介绍文档一致。[1]",
       refused: false,
       confidence: 0.87,
       citation_count: 1,
@@ -54,15 +54,15 @@ describe("AuditPage", () => {
         {
           document_id: "DOC-1",
           chunk_id: "DOC-1-CHUNK-1",
-          filename: "课程成绩表.xlsx",
-          section_title: "综合成绩",
+          filename: "项目介绍_秒杀平台.md",
+          section_title: "超卖防护",
           page_number: null,
-          excerpt: "综合成绩应等于所有分项成绩合计。",
+          excerpt: "秒杀系统通过 Redis 预扣库存防止超卖。",
           score: 0.8,
           rerank_score: 0.9,
-          chunk_type: "table",
-          evidence_role: "table_evidence",
-          metadata: { sheet_name: "G01", cell: "B12", value: "100" },
+          chunk_type: "paragraph",
+          evidence_role: "direct_evidence",
+          metadata: { issuing_authority: "河南大学", material_topic: "项目经历" },
         },
       ],
     };
@@ -79,19 +79,19 @@ describe("AuditPage", () => {
 
     renderAuditPage();
 
-    expect(await screen.findByText("问题：综合成绩如何校验？")).toBeInTheDocument();
+    expect(await screen.findByText("问题：秒杀项目怎么防超卖？")).toBeInTheDocument();
     expect(screen.queryByText(details.answer)).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("事件筛选"), { target: { value: "exception" } });
     expect(screen.getByText("文档入库失败")).toBeInTheDocument();
-    expect(screen.queryByText("问题：综合成绩如何校验？")).not.toBeInTheDocument();
+    expect(screen.queryByText("问题：秒杀项目怎么防超卖？")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("事件筛选"), { target: { value: "qa" } });
     fireEvent.click(screen.getByRole("button", { name: "详情" }));
 
     expect(await screen.findByRole("dialog", { name: "日志详情" })).toBeInTheDocument();
     expect(screen.getByText(details.answer)).toBeInTheDocument();
-    expect(screen.getAllByText(/课程成绩表\.xlsx/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/项目介绍_秒杀平台\.md/).length).toBeGreaterThan(0);
     expect(screen.getAllByText("2.740s").length).toBeGreaterThan(0);
 
     fireEvent.keyDown(document, { key: "Escape" });

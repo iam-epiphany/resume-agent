@@ -82,13 +82,13 @@ def resolve_performance_profile(selected_device: str) -> PerformanceProfile:
         requested_mode=requested,
         selected_mode=selected,
         requested_backend=config.MODEL_BACKEND,
-        # Alternative CPU backends remain gated experiments. Until their output
-        # parity suite passes, runtime inference deliberately stays on PyTorch.
-        backend="pytorch",
+        # ONNX uses the same BGE weights and is enabled only after parity checks.
+        # OpenVINO remains intentionally gated and therefore falls back safely.
+        backend="onnx" if config.MODEL_BACKEND == "onnx" else "pytorch",
         backend_fallback_reason=(
             None
-            if config.MODEL_BACKEND == "pytorch"
-            else f"{config.MODEL_BACKEND}_backend_not_quality_qualified"
+            if config.MODEL_BACKEND in {"pytorch", "onnx"}
+            else "openvino_backend_not_quality_qualified"
         ),
         effective_cpu_cores=cores,
         memory_limit_bytes=memory_limit_bytes(),

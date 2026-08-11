@@ -3,7 +3,7 @@
 用法（本地或云服务器）:
     python scripts/download_models.py
     python scripts/download_models.py --endpoint https://hf-mirror.com
-    python scripts/download_models.py --repo BAAI/bge-base-zh-v1.5 --repo BAAI/bge-reranker-base
+    python scripts/download_models.py --repo BAAI/bge-small-zh-v1.5 --repo BAAI/bge-reranker-base
 
 下载完成后把 data/models 挂载进容器（docker-compose 已配置 :ro），
 并将 .env 中 RESUME_OFFLINE_MODE 设为 true 即可离线运行。
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REPOS = ["BAAI/bge-base-zh-v1.5", "BAAI/bge-reranker-base"]
+DEFAULT_REPOS = ["BAAI/bge-small-zh-v1.5", "BAAI/bge-reranker-base"]
 
 
 def fetch_json(url: str, timeout: float = 60.0) -> Any:

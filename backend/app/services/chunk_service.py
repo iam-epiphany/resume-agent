@@ -4,9 +4,7 @@ from typing import Any
 
 from backend.app.core.config import (
     CHUNK_MAX_TOKENS,
-    CHUNK_OVERLAP,
     CHUNK_OVERLAP_TOKENS,
-    CHUNK_SIZE,
     CHUNK_TARGET_TOKENS,
     SEMANTIC_BREAK_THRESHOLD,
 )
@@ -35,17 +33,6 @@ class ChunkDraft:
     previous_chunk_id: str | None = None
     next_chunk_id: str | None = None
     metadata: dict[str, Any] | None = None
-
-
-def build_chunks(document_id: str, text: str) -> list[ChunkDraft]:
-    """Compatibility wrapper for plain text callers."""
-
-    parsed = ParsedDocument(
-        text=text.strip(),
-        blocks=[ParsedBlock(text=text.strip(), block_type="paragraph", order_index=1)] if text.strip() else [],
-        metadata={"source_format": "plain_text", "parser_version": "plain-text-compat"},
-    )
-    return build_chunks_from_parsed(document_id=document_id, parsed=parsed)
 
 
 def build_chunks_from_parsed(
@@ -438,51 +425,3 @@ def _semantic_overlap_tail(text: str) -> str:
             break
         selected.insert(0, sentence)
     return "".join(selected).strip()
-
-
-def _split_by_size(text: str) -> list[str]:
-    cleaned = text.strip()
-    if not cleaned:
-        return []
-    if len(cleaned) <= CHUNK_SIZE:
-        return [cleaned]
-
-    paragraph_pieces = _split_by_paragraph(cleaned)
-    if all(len(piece) <= CHUNK_SIZE for piece in paragraph_pieces):
-        return paragraph_pieces
-    pieces: list[str] = []
-    for piece in paragraph_pieces:
-        pieces.extend(_split_long_text(piece))
-    return [piece for piece in pieces if piece]
-
-
-def _split_by_paragraph(text: str) -> list[str]:
-    paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
-    pieces: list[str] = []
-    buffer: list[str] = []
-
-    for paragraph in paragraphs:
-        candidate = "\n\n".join([*buffer, paragraph]).strip()
-        if len(candidate) <= CHUNK_SIZE:
-            buffer.append(paragraph)
-            continue
-        if buffer:
-            pieces.append("\n\n".join(buffer).strip())
-        buffer = [paragraph]
-
-    if buffer:
-        pieces.append("\n\n".join(buffer).strip())
-    return pieces
-
-
-def _split_long_text(text: str) -> list[str]:
-    if len(text) <= CHUNK_SIZE:
-        return [text]
-
-    pieces = []
-    start = 0
-    step = max(CHUNK_SIZE - CHUNK_OVERLAP, 1)
-    while start < len(text):
-        pieces.append(text[start : start + CHUNK_SIZE].strip())
-        start += step
-    return [piece for piece in pieces if piece]

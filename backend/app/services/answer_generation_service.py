@@ -21,6 +21,7 @@ from backend.app.core.config import (
     ANSWER_GENERATION_RESPONSE_FORMAT,
     ANSWER_GENERATION_STREAM,
     ANSWER_GENERATION_TIMEOUT_SECONDS,
+    GROUNDING_VERIFY_ENABLED,
     HEDGE_PREFIX,
 )
 from backend.app.schemas.qa import RetrievalResult
@@ -32,6 +33,7 @@ from backend.app.services.llm_client import (
 )
 from backend.app.services.performance_metrics import measure
 from backend.app.services.intent_router_service import INTENT_GREETING, INTENT_OFF_TOPIC
+from backend.app.services.grounding_verification_service import verify_hard_facts
 
 CancellationChecker = Callable[[], None]
 PreviewReporter = Callable[[str], None]
@@ -76,14 +78,17 @@ def generate_answer(
     cancellation_checker: CancellationChecker | None = None,
     preview_reporter: PreviewReporter | None = None,
     no_evidence: bool = False,
+    known_entities: list[str] | None = None,
 ) -> GeneratedAnswer:
     """单次 LLM 生成 + 答案自评 + 置信度分级。
 
     - greeting / off_topic → 礼貌转移（零 LLM）
     - 其余 → 单次 LLM 调用输出 {answer, evidence_sufficiency, reason}
-    - 自评 partial/insufficient → hedged 模式，后端强制“根据现有知识库推测”前缀（唯一一次）
+    - 自评 partial/insufficient → hedged 模式，后端强制"根据现有知识库推测"前缀（唯一一次）
     - no_evidence（兜底链第 3 级）：无检索证据，限制为 persona 软信息，硬事实必须说明未收录
     - LLM 异常 → 摘录兜底（hedged）；无上下文且 LLM 异常 → 礼貌兜底文案
+    - known_entities：知识库已知的简历领域实体（学校/项目/奖项/证书/技术栈等），
+      用于 grounding 校验——答案中出现但证据缺失的已知实体被标记为未核实
     """
     if intent == INTENT_GREETING:
         return _redirected(POLITE_REDIRECT_GREETING)
@@ -105,7 +110,7 @@ def generate_answer(
             logger.warning("LLM 回答生成失败，降级: %s: %s", type(exc).__name__, exc)
             generated = None
     if generated is not None and (generated.answer or "").strip():
-        return _apply_confidence_mode(generated)
+        return _apply_confidence_mode(generated, context_chunks, known_entities=known_entities)
 
     fallback = _extractive_fallback(context_chunks)
     if fallback is not None and (fallback.answer or "").strip():
@@ -122,17 +127,56 @@ def _redirected(text: str, mode: AnswerMode = "redirected") -> GeneratedAnswer:
     )
 
 
-def _apply_confidence_mode(generated: GeneratedAnswer) -> GeneratedAnswer:
+def _apply_confidence_mode(
+    generated: GeneratedAnswer,
+    context_chunks: list[RetrievalResult],
+    *,
+    known_entities: list[str] | None = None,
+) -> GeneratedAnswer:
     """按自评结果分级；partial/insufficient 时由系统统一加推测前缀（且只加一次）。
 
     旧实现同时让 LLM 自写前缀 + 后端 prepend，出现过"根据现有知识库推测"双前缀
     （LLM 中途插入 + 后端开头追加）。现在前缀完全由系统管理：先剥掉 LLM 在
     开头自写的（含旧 prompt 历史行为的残留），再精确 prepend 一次。
+
+    Grounding 硬事实校验：LLM 自评 sufficient 时，仍用确定性校验器核对答案中的
+    数字/日期/书名号专名是否在检索证据中——缺失则降级 hedged（防"自己生成、
+    自己判断"的高估盲区）。校验结果写入 extra 供 qa_logs/调试观测。
     """
     sufficiency = generated.evidence_sufficiency or "partial"
     generated.evidence_sufficiency = (
         sufficiency if sufficiency in {"sufficient", "partial", "insufficient"} else "partial"
     )
+    if generated.evidence_sufficiency == "sufficient" and GROUNDING_VERIFY_ENABLED:
+        evidence_texts = [
+            part
+            for chunk in context_chunks
+            for part in (chunk.text, chunk.section_title or "")
+            if part
+        ]
+        grounding = verify_hard_facts(generated.answer, evidence_texts, known_entities=known_entities)
+        generated.extra["grounding_verification"] = grounding.to_dict()
+        if not grounding.verified:
+            generated.answer_mode = "hedged"
+            generated.evidence_sufficiency = "partial"
+            missing_parts = []
+            if grounding.missing_numbers:
+                missing_parts.append(f"数字 {len(grounding.missing_numbers)}")
+            if grounding.missing_dates:
+                missing_parts.append(f"日期/年份 {len(grounding.missing_dates)}")
+            if grounding.missing_names:
+                missing_parts.append(f"专名 {len(grounding.missing_names)}")
+            if grounding.missing_entities:
+                missing_parts.append(f"实体 {len(grounding.missing_entities)}")
+            generated.hedge_note = (
+                f"硬事实未在检索证据中核实：{'、'.join(missing_parts) or '无'}"
+            )
+            answer = (generated.answer or "").strip()
+            while answer.startswith(HEDGE_PREFIX):
+                answer = answer[len(HEDGE_PREFIX):].lstrip("，,。;； ")
+            answer = answer.strip()
+            generated.answer = f"{HEDGE_PREFIX}，{answer}" if answer else HEDGE_PREFIX
+            return generated
     if generated.evidence_sufficiency == "sufficient":
         generated.answer_mode = "answered"
         return generated

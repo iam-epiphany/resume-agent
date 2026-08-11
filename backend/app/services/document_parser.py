@@ -21,12 +21,6 @@ class DocumentLoader(Protocol):
     def load(self, file_path: Path) -> LoaderResult: ...
 
 
-def parse_document_text(file_path: Path) -> str:
-    """Compatibility wrapper for callers that still need a plain text string."""
-
-    return parse_document(file_path).text
-
-
 def parse_document(
     file_path: Path,
     loader_name: str | None = None,
@@ -71,12 +65,6 @@ def _apply_source_name(blocks: list[ParsedBlock], result: LoaderResult, source_n
     result.metadata["source_filename"] = source_name
 
 
-def parse_document_with_loader(file_path: Path, loader_name: str) -> ParsedDocument:
-    """Run a specific loader by name for loader evaluation."""
-
-    return parse_document(file_path=file_path, loader_name=loader_name)
-
-
 def available_loader_names(file_path: Path) -> list[str]:
     return [loader.name for loader in _candidate_loaders(file_path)]
 
@@ -103,39 +91,6 @@ class MarkdownDocumentLoader:
     def load(self, file_path: Path) -> LoaderResult:
         text = _read_utf8_text(file_path)
         return LoaderResult(blocks=_markdown_to_blocks(text), loader_name=self.name)
-
-
-class CsvDocumentLoader:
-    name = "spreadsheet-csv"
-
-    def supports(self, file_path: Path) -> bool:
-        return file_path.suffix.lower() == ".csv"
-
-    def load(self, file_path: Path) -> LoaderResult:
-        text = _read_utf8_text(file_path)
-        try:
-            rows = list(csv.reader(StringIO(text)))
-        except csv.Error as exc:
-            raise DocumentParseError("CSV 表格解析失败") from exc
-        blocks: list[ParsedBlock] = []
-        for row in rows:
-            line = "，".join(cell for cell in (_normalize_text(cell) for cell in row) if cell)
-            if not line:
-                continue
-            blocks.append(
-                ParsedBlock(
-                    text=line,
-                    block_type="paragraph",
-                    order_index=len(blocks) + 1,
-                )
-            )
-        if not blocks:
-            raise DocumentParseError("CSV 没有可解析数据")
-        return LoaderResult(
-            blocks=blocks,
-            loader_name=self.name,
-            metadata={"source_format": "csv", "row_count": len(blocks)},
-        )
 
 
 class JsonlDocumentLoader:
@@ -503,7 +458,6 @@ def _candidate_loaders(file_path: Path, loader_name: str | None = None) -> list[
     registry: dict[str, DocumentLoader] = {
         "text": TextDocumentLoader(),
         "markdown": MarkdownDocumentLoader(),
-        "spreadsheet-csv": CsvDocumentLoader(),
         "jsonl": JsonlDocumentLoader(),
         "html": HtmlDocumentLoader(),
         "libreoffice-doc": LegacyDocDocumentLoader(),

@@ -6,8 +6,6 @@ python-dotenv
 python-multipart
 SQLAlchemy
 python-docx
-openpyxl
-xlrd
 pypdf
 pyjwt
 reportlab
@@ -16,3 +14,7 @@ FlagEmbedding
 qdrant-client
 torch
 transformers<5
+onnxruntime
+onnx
+optimum
+optimum-onnx

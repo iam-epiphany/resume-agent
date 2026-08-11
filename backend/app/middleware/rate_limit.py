@@ -100,11 +100,14 @@ class RateLimitMiddleware:
         now = time.time()
         today = datetime.now(timezone.utc).date().isoformat()
         with self._lock:
-            window = self._minute_hits.setdefault(ip, deque())
-            while window and now - window[0] > _MINUTE_WINDOW_SECONDS:
-                window.popleft()
-            if len(window) >= per_minute:
-                return False
+            # per_minute <= 0 = 不限制每分钟次数（仅保留每日上限与全局并发）
+            if per_minute > 0:
+                window = self._minute_hits.setdefault(ip, deque())
+                while window and now - window[0] > _MINUTE_WINDOW_SECONDS:
+                    window.popleft()
+                if len(window) >= per_minute:
+                    return False
+                window.append(now)
 
             if daily_limit is not None:
                 day, count = self._daily_hits.get(ip, ("", 0))
@@ -114,11 +117,9 @@ class RateLimitMiddleware:
                     return False
                 self._daily_hits[ip] = (day, count + 1)
 
-            window.append(now)
-
             # 顺带清理：跨天后丢弃昨天的每日计数与空窗口
-            if not window:
-                self._minute_hits.pop(ip, None)
+            if per_minute <= 0 and not self._minute_hits:
+                self._minute_hits.clear()
             stale = [key for key, (day, _) in self._daily_hits.items() if day != today]
             for key in stale:
                 self._daily_hits.pop(key, None)

@@ -22,12 +22,6 @@ class OfficeConversionResult:
     elapsed_ms: float
 
 
-def convert_with_libreoffice(file_path: Path, target_extension: str) -> Path:
-    """Convert an Office file with LibreOffice into a temporary file."""
-
-    return convert_with_libreoffice_detailed(file_path, target_extension).path
-
-
 def convert_with_libreoffice_detailed(
     file_path: Path, target_extension: str
 ) -> OfficeConversionResult:

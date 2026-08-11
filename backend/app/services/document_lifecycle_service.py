@@ -16,6 +16,7 @@ from backend.app.services.vector_store_service import (
     document_vector_chunk_ids,
 )
 from backend.app.services.rerank_service import invalidate_rerank_score_cache
+from backend.app.services.qa_cache_service import clear as clear_qa_answer_cache
 
 
 class DocumentDeletionError(RuntimeError):
@@ -83,6 +84,8 @@ def delete_document_record(db: Session, document: Document) -> None:
 
         clear_document_snapshot_cache({document.document_id})
         invalidate_rerank_score_cache()
+        # 知识库内容变更 → 问答答案缓存整体失效
+        clear_qa_answer_cache()
     except Exception as exc:
         db.rollback()
         current = db.scalar(

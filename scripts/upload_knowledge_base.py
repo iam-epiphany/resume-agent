@@ -113,6 +113,8 @@ def scan_documents(root: Path) -> tuple[list[Path], list[Path]]:
     """递归扫描 root，返回 (可上传文件列表, 图片文件列表)。"""
     files: list[Path] = []
     images: list[Path] = []
+    # 规范化文字版是问答口径基线；同一简历 PDF 再入库只会制造重复 chunk。
+    has_canonical_resume = any(path.is_file() for path in root.rglob("简历文字版.md"))
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -133,6 +135,8 @@ def scan_documents(root: Path) -> tuple[list[Path], list[Path]]:
         ):
             continue
         suffix = path.suffix.lower()
+        if suffix == ".pdf" and "简历" in path.stem and has_canonical_resume:
+            continue
         if suffix in SUPPORTED_EXTENSIONS:
             files.append(path)
         elif suffix in {".jpg", ".jpeg", ".png", ".gif", ".bmp"}:

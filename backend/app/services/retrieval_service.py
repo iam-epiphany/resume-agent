@@ -122,14 +122,11 @@ def filter_active_candidates(
             "external_doc_id": document.external_doc_id,
             "issuing_authority": document.issuing_authority,
             "publication_date": document.publication_date,
-            "effective_date": document.effective_date,
             "expiration_date": document.expiration_date,
             "document_number": document.document_number,
             "material_topic": document.material_topic,
-            "business_domain": document.business_domain,
             "source_url": document.source_url,
             "attachment_url": document.attachment_url,
-            "version_status": document.version_status,
             "file_type": document.file_type,
             "source_format": document.file_type,
         }
@@ -159,8 +156,8 @@ def filter_candidates_by_metadata(
 ) -> list[VectorSearchResult]:
     """Apply auditable document filters after hybrid recall.
 
-    Table-specific fields remain handled by SpreadsheetCell. This function is
-    deliberately strict only for explicit document metadata constraints.
+    Deliberately strict only for explicit document metadata constraints
+    (source/title/authority/material topic/file type).
     """
 
     filters = filters or {}
@@ -172,9 +169,6 @@ def filter_candidates_by_metadata(
         "publication_date": ("publication_date",),
         "document_number": ("document_number",),
         "material_topic": ("material_topic",),
-        "business_domain": ("business_domain",),
-        "article_number": ("article_number", "section_number"),
-        "version_status": ("version_status",),
         "file_type": ("source_format", "file_type"),
     }
     active_filters = {
@@ -197,7 +191,7 @@ def filter_candidates_by_metadata(
                 else:
                     actual_values.append(metadata.get(field_name))
             expected_norm = _normalize_for_match(str(expected))
-            if key in {"publication_date", "version_status", "external_doc_id", "file_type"}:
+            if key in {"publication_date", "external_doc_id", "file_type"}:
                 accepted = any(_normalize_for_match(str(actual)) == expected_norm for actual in actual_values if actual)
             else:
                 accepted = any(expected_norm in _normalize_for_match(str(actual)) for actual in actual_values if actual)
@@ -450,11 +444,6 @@ def _query_anchor_boost(query: str, candidate: VectorSearchResult) -> float:
         normalized = _normalize_for_match(title)
         if normalized and normalized in filename:
             boost = max(boost, 0.30)
-    for document_number in re.findall(r"[\u4e00-\u9fffA-Za-z]+〔\d{4}〕\d+号", query):
-        if _normalize_for_match(document_number) in _normalize_for_match(
-            f"{candidate.filename} {candidate.embedding_text}"
-        ):
-            boost = max(boost, 0.20)
     return boost
 
 
@@ -583,7 +572,6 @@ def _to_citation(item: _AnnotatedChunk) -> Citation:
         issuing_authority=_optional_text(metadata.get("issuing_authority")),
         publication_date=_optional_text(metadata.get("publication_date")),
         document_number=_optional_text(metadata.get("document_number")),
-        version_status=_optional_text(metadata.get("version_status")),
         section_title=candidate.section_title,
         section_path=candidate.section_path or ([candidate.section_title] if candidate.section_title else []),
         section_number=candidate.section_number,

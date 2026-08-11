@@ -551,12 +551,10 @@ function AuditEvidenceList({ evidence }: { evidence: Citation[] }) {
 function AuditEvidenceFacts({ citation }: { citation: Citation }) {
   const metadata = citation.metadata ?? {};
   const facts = [
-    pair("工作表", metadata.sheet_name),
-    pair("单元格", metadata.cell),
-    pair("行标签", metadata.row_label),
-    pair("列标签", metadata.column_label),
-    pair("原始值", metadata.value),
-    pair("单位", metadata.unit),
+    pair("颁发机构", metadata.issuing_authority),
+    pair("证书编号", metadata.document_number),
+    pair("颁发日期", metadata.publication_date),
+    pair("材料主题", metadata.material_topic),
   ].filter((item): item is { label: string; value: string } => Boolean(item));
   if (!facts.length) return null;
   return (
@@ -576,9 +574,7 @@ function auditEvidenceLocation(citation: Citation): string {
 function auditEvidenceRoleLabel(role: string): string {
   const labels: Record<string, string> = {
     direct_evidence: "直接依据",
-    table_evidence: "表格依据",
     related_context: "相关背景",
-    table_context: "表格背景",
     expanded_context: "补充上下文",
   };
   return labels[role] ?? "引用依据";

@@ -43,7 +43,7 @@ def fetch_url_document(
             current,
             headers={
                 "User-Agent": "ResumeMind/1.0 provenance-import",
-                "Accept": "application/pdf,application/msword,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,text/csv,application/x-ndjson,text/plain;q=0.8,*/*;q=0.2",
+                "Accept": "application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/html,application/x-ndjson,text/plain;q=0.8,*/*;q=0.2",
             },
         )
         try:
@@ -109,13 +109,10 @@ def _response_filename(headers: Message, url: str, content_type: str) -> str:
         return filename
     suffixes = {
         "text/html": ".html",
-        "text/csv": ".csv",
         "application/x-ndjson": ".jsonl",
         "application/pdf": ".pdf",
         "application/msword": ".doc",
-        "application/vnd.ms-excel": ".xls",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
         "text/plain": ".txt",
     }
     return f"url-import{suffixes.get(content_type, '')}"
@@ -127,7 +124,7 @@ def _normalize_text_content(
     content_type: str,
     charset: str | None,
 ) -> tuple[bytes, str, str]:
-    if content_type not in {"text/html", "text/csv", "application/x-ndjson", "application/json", "text/plain"}:
+    if content_type not in {"text/html", "application/x-ndjson", "application/json", "text/plain"}:
         return content, filename, content_type
     encoding = charset or "utf-8"
     try:
@@ -140,8 +137,6 @@ def _normalize_text_content(
     suffix = Path(filename).suffix.lower()
     if content_type == "text/html" and suffix not in {".html", ".htm"}:
         filename = f"{Path(filename).stem or 'url-import'}.html"
-    elif content_type == "text/csv" and suffix != ".csv":
-        filename = f"{Path(filename).stem or 'url-import'}.csv"
     elif content_type in {"application/x-ndjson", "application/json"} and suffix != ".jsonl":
         filename = f"{Path(filename).stem or 'url-import'}.jsonl"
         content_type = "application/x-ndjson"

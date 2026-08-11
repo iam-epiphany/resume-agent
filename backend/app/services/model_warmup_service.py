@@ -26,6 +26,15 @@ def start_background_model_warmup() -> None:
     Thread(target=_background_target, name="resumemind-model-warmup", daemon=True).start()
 
 
+def warmup_models_at_startup() -> None:
+    """Apply the configured startup policy without hiding a blocking-warmup failure."""
+
+    if config.MODEL_WARMUP_POLICY == "blocking":
+        warmup_models_once()
+        return
+    start_background_model_warmup()
+
+
 def warmup_models_once() -> dict[str, Any]:
     global _STATE, _ERROR, _ELAPSED_MS
     with _CONDITION:

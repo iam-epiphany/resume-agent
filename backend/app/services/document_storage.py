@@ -1,7 +1,6 @@
 from datetime import datetime
 from dataclasses import dataclass
 import hashlib
-from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
@@ -60,33 +59,6 @@ def next_document_id(db: Session) -> str:
     raise RuntimeError("无法生成唯一文档编号，请重试上传")
 
 
-def save_original_document(
-    document_id: str,
-    filename: str,
-    content: bytes,
-    content_type: str | None = None,
-) -> StoredOriginalDocument:
-    if not content:
-        raise EmptyDocumentError("上传文档不能为空")
-
-    suffix = Path(filename).suffix.lower()
-    if suffix not in SUPPORTED_DOCUMENT_EXTENSIONS:
-        raise UnsupportedDocumentTypeError("仅支持 .txt、.md、.doc、.docx、.pdf、.xls、.xlsx、.csv、.jsonl、.html 文档")
-    _validate_mime_type(suffix, content_type)
-    _validate_file_content(suffix, content)
-
-    DOCUMENT_DIR.mkdir(parents=True, exist_ok=True)
-    storage_path = DOCUMENT_DIR / f"{document_id}{suffix}"
-    if storage_path.exists():
-        raise UnsupportedDocumentTypeError("文档存储路径已存在，请刷新后重试上传")
-    storage_path.write_bytes(content)
-    return StoredOriginalDocument(
-        path=storage_path,
-        size=len(content),
-        file_sha256=hashlib.sha256(content).hexdigest(),
-    )
-
-
 async def save_original_document_stream(
     *,
     document_id: str,
@@ -99,7 +71,7 @@ async def save_original_document_stream(
 
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED_DOCUMENT_EXTENSIONS:
-        raise UnsupportedDocumentTypeError("仅支持 .txt、.md、.doc、.docx、.pdf、.xls、.xlsx、.csv、.jsonl、.html 文档")
+        raise UnsupportedDocumentTypeError("仅支持 .txt、.md、.doc、.docx、.pdf、.jsonl、.html 文档")
     _validate_mime_type(suffix, content_type)
     DOCUMENT_DIR.mkdir(parents=True, exist_ok=True)
     storage_path = DOCUMENT_DIR / f"{document_id}{suffix}"
@@ -139,41 +111,6 @@ def _validate_mime_type(suffix: str, content_type: str | None) -> None:
         raise UnsupportedDocumentTypeError(f"文件 MIME 类型与扩展名不匹配：{content_type}")
 
 
-def _validate_file_content(suffix: str, content: bytes) -> None:
-    if suffix == ".pdf":
-        if not content.startswith(b"%PDF-"):
-            raise UnsupportedDocumentTypeError("PDF 文件内容校验失败")
-        return
-
-    if suffix in {".docx", ".xlsx"}:
-        if not content.startswith(b"PK"):
-            raise UnsupportedDocumentTypeError(f"{suffix.upper().lstrip('.')} 文件内容校验失败")
-        try:
-            with ZipFile(BytesIO(content)) as archive:
-                _validate_ooxml_resource_limits(archive)
-                names = set(archive.namelist())
-        except BadZipFile as exc:
-            raise UnsupportedDocumentTypeError(f"{suffix.upper().lstrip('.')} 文件内容校验失败") from exc
-        if suffix == ".docx" and ("[Content_Types].xml" not in names or "word/document.xml" not in names):
-            raise UnsupportedDocumentTypeError("DOCX 文件内容校验失败")
-        if suffix == ".xlsx" and ("[Content_Types].xml" not in names or "xl/workbook.xml" not in names):
-            raise UnsupportedDocumentTypeError("XLSX 文件内容校验失败")
-        return
-
-    if suffix in {".doc", ".xls"}:
-        if not content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
-            raise UnsupportedDocumentTypeError(f"{suffix.upper().lstrip('.')} 文件内容校验失败")
-        return
-
-    if suffix in {".txt", ".md", ".csv", ".jsonl", ".html", ".htm"}:
-        try:
-            text = content.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise UnsupportedDocumentTypeError("文本文件必须使用 UTF-8 编码") from exc
-        if "\x00" in text:
-            raise UnsupportedDocumentTypeError("文本文件内容校验失败")
-
-
 def _validate_file_path(suffix: str, path: Path) -> None:
     with path.open("rb") as stream:
         signature = stream.read(8)
@@ -181,25 +118,23 @@ def _validate_file_path(suffix: str, path: Path) -> None:
         if not signature.startswith(b"%PDF-"):
             raise UnsupportedDocumentTypeError("PDF 文件内容校验失败")
         return
-    if suffix in {".docx", ".xlsx"}:
+    if suffix == ".docx":
         if not signature.startswith(b"PK"):
-            raise UnsupportedDocumentTypeError(f"{suffix.upper().lstrip('.')} 文件内容校验失败")
+            raise UnsupportedDocumentTypeError("DOCX 文件内容校验失败")
         try:
             with ZipFile(path) as archive:
                 _validate_ooxml_resource_limits(archive)
                 names = set(archive.namelist())
         except BadZipFile as exc:
-            raise UnsupportedDocumentTypeError(f"{suffix.upper().lstrip('.')} 文件内容校验失败") from exc
-        if suffix == ".docx" and ("[Content_Types].xml" not in names or "word/document.xml" not in names):
+            raise UnsupportedDocumentTypeError("DOCX 文件内容校验失败") from exc
+        if "[Content_Types].xml" not in names or "word/document.xml" not in names:
             raise UnsupportedDocumentTypeError("DOCX 文件内容校验失败")
-        if suffix == ".xlsx" and ("[Content_Types].xml" not in names or "xl/workbook.xml" not in names):
-            raise UnsupportedDocumentTypeError("XLSX 文件内容校验失败")
         return
-    if suffix in {".doc", ".xls"}:
+    if suffix == ".doc":
         if not signature.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
-            raise UnsupportedDocumentTypeError(f"{suffix.upper().lstrip('.')} 文件内容校验失败")
+            raise UnsupportedDocumentTypeError("DOC 文件内容校验失败")
         return
-    if suffix in {".txt", ".md", ".csv", ".jsonl", ".html", ".htm"}:
+    if suffix in {".txt", ".md", ".jsonl", ".html", ".htm"}:
         try:
             with path.open("r", encoding="utf-8-sig") as stream:
                 while text := stream.read(1024 * 1024):

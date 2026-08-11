@@ -1200,7 +1200,6 @@ export function DocumentsPage() {
                         <span>{chunk.section_title ?? "未命名章节"}</span>
                         <span className="muted">第 {selectedDetail.chunk_offset + index + 1} 条</span>
                       </div>
-                      <TableChunkMeta chunk={chunk} />
                       <pre className={chunk.chunk_type === "table" ? "chunk-text chunk-text--table" : "chunk-text"}>
                         {displayChunkText(chunk)}
                       </pre>
@@ -1564,9 +1563,6 @@ function documentTypeLabel(document: DocumentSummary): string {
     return metadataCategory;
   }
   const type = document.file_type.toLowerCase();
-  if (type === "xls" || type === "xlsx") {
-    return "表格文档";
-  }
   if (type === "pdf") {
     return "PDF 文档";
   }
@@ -1663,7 +1659,7 @@ function documentStageLabel(stage: string): string {
     queued: "文件已保存，等待解析",
     parsing: "正在解析文档内容",
     chunking: "正在按文档结构切分",
-    metadata_indexing: "正在建立表格与引用元数据",
+    metadata_indexing: "正在建立材料元数据索引",
     embedding: "正在生成检索向量",
     vector_upsert: "正在写入向量索引",
     verifying: "正在核对索引完整性",
@@ -1702,72 +1698,3 @@ function displayChunkText(chunk: ChunkSummary): string {
   return withoutTitle || chunk.text;
 }
 
-function TableChunkMeta({ chunk }: { chunk: ChunkSummary }) {
-  const metadata = chunk.metadata ?? {};
-  if (!metadata.spreadsheet_table) {
-    return null;
-  }
-
-  const period =
-    metadata.period && typeof metadata.period === "object" ? (metadata.period as Record<string, unknown>) : null;
-  const periodText = period ? compactJoin([periodValue(period, "year"), periodValue(period, "quarter"), periodValue(period, "month")]) : "";
-  const firstCell = Array.isArray(metadata.cells)
-    ? (metadata.cells.find((cell) => cell && typeof cell === "object") as Record<string, unknown> | undefined)
-    : null;
-  const cellText =
-    firstCell
-      ? compactJoin([
-          valueOf(firstCell, "coordinate"),
-          valueOf(firstCell, "column_label"),
-          valueOf(firstCell, "value"),
-        ])
-      : "";
-
-  const parts = [
-    labelValue("工作表", valueOf(metadata, "sheet_name")),
-    labelValue("表名", valueOf(metadata, "table_title")),
-    labelValue("单位", valueOf(metadata, "unit")),
-    labelValue("期间", periodText),
-    labelValue("行标签", valueOf(metadata, "row_label")),
-    labelValue("单元格", cellText),
-  ].filter(Boolean);
-
-  if (parts.length === 0) {
-    return null;
-  }
-
-  return <p className="muted">{parts.join(" / ")}</p>;
-}
-
-function valueOf(source: Record<string, unknown>, key: string): string {
-  const value = source[key];
-  if (value === null || value === undefined) {
-    return "";
-  }
-  return String(value);
-}
-
-function periodValue(source: Record<string, unknown>, key: string): string {
-  const value = source[key];
-  if (value === null || value === undefined || value === "") {
-    return "";
-  }
-  if (key === "year") {
-    return `${value}年`;
-  }
-  if (key === "quarter") {
-    return `${value}季度`;
-  }
-  if (key === "month") {
-    return `${value}月`;
-  }
-  return String(value);
-}
-
-function labelValue(label: string, value: string): string {
-  return value ? `${label}：${value}` : "";
-}
-
-function compactJoin(values: string[]): string {
-  return values.filter(Boolean).join(" ");
-}

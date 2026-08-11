@@ -31,7 +31,6 @@ def _document(document_id: str, title: str, authority: str) -> Document:
         storage_path=f"/tmp/{document_id}.pdf",
         title=title,
         issuing_authority=authority,
-        version_status="current",
         status="indexed",
         index_version=config.INDEX_VERSION,
     )
@@ -117,11 +116,10 @@ class _Models:
 def test_qdrant_filter_applies_same_scope_to_prefetch() -> None:
     compiled = _retrieval_filter(
         _Models,
-        {"document_ids": ["DOC-1", "DOC-2"], "article_number": "第十条"},
+        {"document_ids": ["DOC-1", "DOC-2"]},
     )
     conditions = {item.key: item.match for item in compiled.must}
     assert conditions["document_id"].any == ["DOC-1", "DOC-2"]
-    assert conditions["article_number"].value == "第十条"
     assert "index_version" in conditions
 
 

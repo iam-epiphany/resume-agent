@@ -14,6 +14,7 @@ import json
 from dataclasses import dataclass, field
 
 from backend.app.core.config import (
+    INTENT_FAST_PATH_ENABLED,
     INTENT_ROUTER_API_KEY,
     INTENT_ROUTER_BASE_URL,
     INTENT_ROUTER_ENABLED,
@@ -22,6 +23,11 @@ from backend.app.core.config import (
     INTENT_ROUTER_PROVIDER,
     INTENT_ROUTER_RESPONSE_FORMAT,
     INTENT_ROUTER_TIMEOUT_SECONDS,
+)
+from backend.app.services.context_dependency import (
+    RESUME_ANCHOR_TERMS,
+    is_greeting_phrase,
+    needs_context_resolution,
 )
 from backend.app.services.llm_client import ChatCompletionConfig, ChatCompletionError, chat_completion_content
 
@@ -95,14 +101,60 @@ def _fallback_result(question: str) -> IntentResult:
     )
 
 
-def classify_and_resolve(question: str, previous_turn: dict | None = None) -> IntentResult:
-    """意图分类 + 追问补全合并调用（一次 LLM）。
+# 简历领域锚点（自足问题快速归类 resume_qa；无锚点的自足问题交给 LLM 判 off_topic）
+# 定义见 context_dependency.RESUME_ANCHOR_TERMS（单一事实源）
 
-    - 纯 LLM 判断，无任何关键词表；失败/坏 JSON → 保守回退 resume_qa 原问
-    - previous_turn 提供时（dict 含 question/answer_excerpt）附上轮摘录供补全
+
+def _fast_path_result(question: str) -> IntentResult | None:
+    """自足问题（不依赖上一轮上下文）的确定性旁路。
+
+    仅当问题判定为"自足"（needs_context_resolution=False）时才可能走 fast path：
+    - 整句问候短语 → greeting（零 LLM 礼貌转移）
+    - 含简历领域锚点 → resume_qa（直接进检索）
+    - 无锚点（如"今天天气怎么样""帮我写一首诗"）→ 返回 None 交 LLM 判 off_topic
+    注意：短词（"爱好/籍贯/薪资/项目"等 ≤4 字）会被 needs_context_resolution
+    判为需要上下文（可能指代前文对象），不会在此被当作 greeting——它们交给 LLM。
+    """
+    stripped = question.strip()
+    if not stripped:
+        return _fallback_result(stripped)
+    if is_greeting_phrase(stripped):
+        return IntentResult(
+            intent=INTENT_GREETING,
+            classifier="fast_path",
+            confidence=0.9,
+            reason="fast path：整句问候短语",
+            rewritten_question=stripped,
+            strategy=_STRATEGIES[INTENT_GREETING],
+        )
+    if any(term in stripped for term in RESUME_ANCHOR_TERMS):
+        return IntentResult(
+            intent=INTENT_RESUME_QA,
+            classifier="fast_path",
+            confidence=0.7,
+            reason="fast path：自足问题命中简历领域锚点",
+            rewritten_question=stripped,
+            strategy=_STRATEGIES[INTENT_RESUME_QA],
+        )
+    return None
+
+
+def classify_and_resolve(question: str, previous_turn: dict | None = None) -> IntentResult:
+    """意图分类 + 追问补全。
+
+    完整链路：一次 LLM 调用完成「3 类意图分类 + 指代消解」；
+    fast path（默认开启）：**无论是否有上一轮对话**，只要当前问题是自足的
+    （needs_context_resolution=False，不依赖前文），就用确定性规则旁路：
+    整句问候 → greeting；其余 → resume_qa。这样用户连续提多个独立问题时，
+    第二问起仍能跳过 LLM。只有真依赖上下文（追问/指代/省略）时才走 LLM 消解。
+    分类失败/坏 JSON → 保守回退 resume_qa 原问，意图层绝不当掉任何检索机会。
     """
     if not INTENT_ROUTER_ENABLED:
         return _fallback_result(question)
+    if INTENT_FAST_PATH_ENABLED and not needs_context_resolution(question):
+        fast_result = _fast_path_result(question)
+        if fast_result is not None:
+            return fast_result
     if previous_turn:
         user_content = (
             f"上一轮对话：\nQ: {previous_turn.get('question') or ''}\n"

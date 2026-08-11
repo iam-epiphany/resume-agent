@@ -14,7 +14,7 @@ except AttributeError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_ROOT = PROJECT_ROOT / "data" / "models"
 MODELS = {
-    "BGE-Base-ZH": MODEL_ROOT / "bge-base-zh-v1.5",
+    "BGE-Small-ZH": MODEL_ROOT / "bge-small-zh-v1.5",
     "BGE reranker": MODEL_ROOT / "bge-reranker-base",
 }
 TOKENIZER_FILES = {

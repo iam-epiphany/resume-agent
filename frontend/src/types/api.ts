@@ -6,12 +6,6 @@ export interface ApiErrorBody {
   error?: ApiError;
 }
 
-export interface HealthResponse {
-  status: string;
-  message: string;
-  build_id: string;
-}
-
 export type DocumentStatus =
   | "uploaded"
   | "index_queued"
@@ -292,7 +286,6 @@ export interface Citation {
   issuing_authority?: string | null;
   publication_date?: string | null;
   document_number?: string | null;
-  version_status?: string | null;
   section_title: string | null;
   page_number: number | null;
   excerpt: string;
@@ -365,10 +358,6 @@ export interface LLMContextPackage {
         aspect_id: string;
         question: string;
         evidence_need?: string;
-        modality?: "text" | "table" | "mixed" | string;
-        table_task?: "lookup" | "compare" | "calculate" | "locate" | "none" | string;
-        table_filters?: Record<string, unknown>;
-        operation?: "max" | "min" | "difference" | "sum" | "ratio" | "none" | string;
         search_queries: QueryPlanSearchQuery[];
         expected_evidence_type: string;
         keywords: string[];
@@ -378,10 +367,6 @@ export interface LLMContextPackage {
       aspect_id: string;
       question: string;
       evidence_need?: string;
-      modality?: "text" | "table" | "mixed" | string;
-      table_task?: "lookup" | "compare" | "calculate" | "locate" | "none" | string;
-      table_filters?: Record<string, unknown>;
-      operation?: "max" | "min" | "difference" | "sum" | "ratio" | "none" | string;
       search_queries: QueryPlanSearchQuery[];
       expected_evidence_type: string;
       keywords: string[];
@@ -427,12 +412,6 @@ export interface LLMContextPackage {
       final_prompt_chunk_ids?: string[];
       aspect_selected_chunk_ids?: Record<string, string[]>;
     };
-    citation_validation?: {
-      checked_chunks: number;
-      valid_chunks: number;
-      invalid_chunks: number;
-      invalid_chunk_ids: string[];
-    };
   };
   context_chunks: RetrievalResult[];
   llm_prompt: string;
@@ -444,8 +423,6 @@ export interface QueryPlanSearchQuery {
     | "semantic_question"
     | "document_style_statement"
     | "keyword_anchor"
-    | "table_locator"
-    | "legacy"
     | "fallback"
     | string;
   rationale: string;

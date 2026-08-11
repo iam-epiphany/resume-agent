@@ -150,7 +150,43 @@ def test_invalid_sufficiency_value_defaults_to_hedged(monkeypatch) -> None:
     assert result.evidence_sufficiency == "partial"
 
 
-def test_llm_answer_is_returned_directly_without_validation_gate(monkeypatch) -> None:
+def test_sufficient_answer_with_matching_evidence_returns_answered(monkeypatch) -> None:
+    """LLM 自评 sufficient 且硬事实在证据中 → answered（grounding 校验通过）。"""
+    _mock_llm_answer(monkeypatch, answer="该材料规定本人必须在2099年完成技能评估。", evidence_sufficiency="sufficient")
+
+    result = generate_answer(
+        "请概述《技能专长.md》的主要内容。",
+        [_chunk(text="技能专长包括Python开发与Java开发等技能。该材料规定本人必须在2099年完成技能评估。")],
+        intent=INTENT_RESUME_QA,
+    )
+
+    assert result.answer_mode == "answered"
+    assert result.generation_status == "completed"
+    assert "2099年" in result.answer
+
+
+def test_sufficient_answer_with_unverified_hard_fact_downgrades_to_hedged(monkeypatch) -> None:
+    """LLM 自评 sufficient 但答案中的硬事实（2099）不在证据中 → grounding 降级 hedged。"""
+    _mock_llm_answer(monkeypatch, answer="该材料规定本人必须在2099年完成技能评估。", evidence_sufficiency="sufficient")
+
+    result = generate_answer(
+        "请概述《技能专长.md》的主要内容。",
+        [_chunk(text="技能专长包括Python开发与Java开发等技能。")],
+        intent=INTENT_RESUME_QA,
+    )
+
+    assert result.answer_mode == "hedged"
+    assert result.evidence_sufficiency == "partial"
+    assert result.answer.startswith("根据现有知识库推测，")
+    assert "硬事实未在检索证据中核实" in (result.hedge_note or "")
+    grounding = result.extra.get("grounding_verification") or {}
+    assert grounding.get("verified") is False
+    assert "2099" in grounding.get("missing_dates", [])
+
+
+def test_grounding_verification_disabled_keeps_sufficient_answered(monkeypatch) -> None:
+    """关闭 GROUNDING_VERIFY_ENABLED 时，sufficient 自评直接 answered（兼容旧行为）。"""
+    monkeypatch.setattr(answer_generation_service, "GROUNDING_VERIFY_ENABLED", False)
     _mock_llm_answer(monkeypatch, answer="该材料规定本人必须在2099年完成技能评估。", evidence_sufficiency="sufficient")
 
     result = generate_answer(
@@ -160,7 +196,7 @@ def test_llm_answer_is_returned_directly_without_validation_gate(monkeypatch) ->
     )
 
     assert result.answer_mode == "answered"
-    assert result.generation_status == "completed"
+    assert result.evidence_sufficiency == "sufficient"
     assert "2099年" in result.answer
 
 

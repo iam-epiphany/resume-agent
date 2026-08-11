@@ -38,12 +38,12 @@ def check_model_directory(path: str | Path) -> tuple[bool, list[str]]:
 
 def resolve_embedding_model_path() -> str:
     return _resolve_model_path(
-        display_name="BGE-Base-ZH",
+        display_name="BGE-Small-ZH",
         env_var_name="EMBEDDING_MODEL_PATH",
         explicit_path=config.EMBEDDING_MODEL_PATH,
         default_dir=config.DEFAULT_EMBEDDING_MODEL_DIR,
         hub_cache_dir=config.HF_HUB_CACHE,
-        hub_repo_cache_name="models--BAAI--bge-base-zh-v1.5",
+        hub_repo_cache_name="models--BAAI--bge-small-zh-v1.5",
         online_model_name=config.EMBEDDING_MODEL_NAME,
         offline_mode=config.RESUME_OFFLINE_MODE,
     )
@@ -51,12 +51,12 @@ def resolve_embedding_model_path() -> str:
 
 def resolve_embedding_model_local_path() -> str:
     return _resolve_model_path(
-        display_name="BGE-Base-ZH",
+        display_name="BGE-Small-ZH",
         env_var_name="EMBEDDING_MODEL_PATH",
         explicit_path=config.EMBEDDING_MODEL_PATH,
         default_dir=config.DEFAULT_EMBEDDING_MODEL_DIR,
         hub_cache_dir=config.HF_HUB_CACHE,
-        hub_repo_cache_name="models--BAAI--bge-base-zh-v1.5",
+        hub_repo_cache_name="models--BAAI--bge-small-zh-v1.5",
         online_model_name=config.EMBEDDING_MODEL_NAME,
         offline_mode=True,
     )
@@ -86,6 +86,26 @@ def resolve_reranker_model_local_path() -> str:
         online_model_name=config.RERANKER_MODEL_NAME,
         offline_mode=True,
     )
+
+
+def resolve_reranker_onnx_model_local_path() -> str:
+    """Resolve the single-file ONNX reranker artifact used by the CPU runtime."""
+
+    model_path = config.RERANKER_ONNX_MODEL_PATH
+    model_dir = model_path.parent
+    missing: list[str] = []
+    if not model_path.is_file():
+        missing.append("model.onnx")
+    if not any((model_dir / name).is_file() for name in TOKENIZER_FILES):
+        missing.append("tokenizer related files")
+    if missing:
+        detail = ", ".join(missing)
+        raise ModelPathResolutionError(
+            "ONNX reranker artifact is incomplete. "
+            f"Expected {detail} under {model_dir}. "
+            "Run scripts/export_reranker_onnx.py before setting MODEL_BACKEND=onnx."
+        )
+    return str(model_path)
 
 
 def _resolve_model_path(

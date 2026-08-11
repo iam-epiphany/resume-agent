@@ -16,9 +16,9 @@ env/
 ENV/
 
 # Environment variables
+# .env 含真实密钥不入库；.env.example 为脱敏模板，应提交（勿在其中填写真实值）
 .env
 .env.local
-.env.example
 
 # PyCharm
 .idea/
@@ -53,10 +53,6 @@ data/documents/originals/*
 .qdrant-initialized
 data/test_documents/parser_samples/*
 data/evaluation/
-data/contest-data/
-data/contest_dataset/
-data/contest_staging/
-data/contest dataset/
 data/dev_runtime/
 dist-delivery/
 delivery/
@@ -75,5 +71,8 @@ hf_cache/
 *.sqlite3
 *.db
 
-# External contest briefs and raw binary source material
-/docs/*.docx
+# Personal privacy: docs folder (resume, personal info, project files)
+docs/
+
+# ZCode 工作区内部文件（计划/会话记录），不入库
+.zcode/

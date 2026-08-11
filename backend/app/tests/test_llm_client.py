@@ -101,3 +101,77 @@ def test_missing_api_key_fails_before_http_request() -> None:
     else:
         raise AssertionError("expected ChatCompletionError")
     assert called is False
+
+
+# ---------------------------------------------------------------------------
+# 请求级 LLM 调用计数（2026-08-08 二轮）：llm_client 真实 API 请求统计
+# ---------------------------------------------------------------------------
+
+from backend.app.services.llm_client import (
+    llm_call_count,
+    open_chat_completion,
+    reset_llm_call_count,
+)
+
+
+class _FakeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+
+def _config() -> ChatCompletionConfig:
+    return ChatCompletionConfig(
+        provider="openai_compatible",
+        api_key="key",
+        base_url="https://api.example.com",
+        model="model-a",
+        timeout_seconds=5,
+    )
+
+
+def test_llm_call_count_increments_on_success(monkeypatch) -> None:
+    reset_llm_call_count()
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _FakeResponse())
+
+    chat_completion_content(_config(), [{"role": "user", "content": "hi"}])
+
+    assert llm_call_count() == 1
+
+
+def test_llm_call_count_increments_on_timeout(monkeypatch) -> None:
+    """超时/失败也算一次真实 API 调用（请求已发出）。"""
+    reset_llm_call_count()
+
+    def failing_urlopen(*_a, **_k):
+        raise TimeoutError("timeout")
+
+    monkeypatch.setattr("urllib.request.urlopen", failing_urlopen)
+
+    try:
+        chat_completion_content(_config(), [{"role": "user", "content": "hi"}])
+    except ChatCompletionError:
+        pass
+
+    assert llm_call_count() == 1
+
+
+def test_llm_call_count_isolated_between_requests() -> None:
+    reset_llm_call_count()
+    assert llm_call_count() == 0
+    reset_llm_call_count()
+    assert llm_call_count() == 0
+
+
+def test_open_chat_completion_increments_count(monkeypatch) -> None:
+    reset_llm_call_count()
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _FakeResponse())
+
+    open_chat_completion(_config(), [{"role": "user", "content": "hi"}], stream=False)
+
+    assert llm_call_count() == 1

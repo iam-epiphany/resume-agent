@@ -16,24 +16,38 @@ def _write_minimal_model_dir(path: Path) -> None:
 
 
 def test_local_model_resolution_does_not_treat_online_name_as_ready(tmp_path, monkeypatch) -> None:
-    missing_default = tmp_path / "missing-bge-m3"
+    missing_default = tmp_path / "missing-bge-base-zh-v1.5"
     monkeypatch.setattr(model_path_resolver.config, "EMBEDDING_MODEL_PATH", None)
     monkeypatch.setattr(model_path_resolver.config, "DEFAULT_EMBEDDING_MODEL_DIR", missing_default)
     monkeypatch.setattr(model_path_resolver.config, "HF_HUB_CACHE", tmp_path / "hub")
-    monkeypatch.setattr(model_path_resolver.config, "EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
+    monkeypatch.setattr(model_path_resolver.config, "EMBEDDING_MODEL_NAME", "BAAI/bge-base-zh-v1.5")
 
     with pytest.raises(model_path_resolver.ModelPathResolutionError):
         model_path_resolver.resolve_embedding_model_local_path()
 
 
 def test_local_model_resolution_accepts_downloaded_model_dir(tmp_path, monkeypatch) -> None:
-    model_dir = tmp_path / "bge-m3"
+    model_dir = tmp_path / "bge-base-zh-v1.5"
     _write_minimal_model_dir(model_dir)
     monkeypatch.setattr(model_path_resolver.config, "EMBEDDING_MODEL_PATH", None)
     monkeypatch.setattr(model_path_resolver.config, "DEFAULT_EMBEDDING_MODEL_DIR", model_dir)
     monkeypatch.setattr(model_path_resolver.config, "HF_HUB_CACHE", tmp_path / "hub")
 
     assert model_path_resolver.resolve_embedding_model_local_path() == str(model_dir)
+
+
+def test_onnx_reranker_resolution_requires_model_and_tokenizer(tmp_path, monkeypatch) -> None:
+    artifact_dir = tmp_path / "reranker-onnx"
+    artifact_dir.mkdir()
+    monkeypatch.setattr(model_path_resolver.config, "RERANKER_ONNX_MODEL_PATH", artifact_dir / "model.onnx")
+
+    with pytest.raises(model_path_resolver.ModelPathResolutionError):
+        model_path_resolver.resolve_reranker_onnx_model_local_path()
+
+    (artifact_dir / "model.onnx").write_bytes(b"onnx")
+    (artifact_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    assert model_path_resolver.resolve_reranker_onnx_model_local_path() == str(artifact_dir / "model.onnx")
 
 
 def test_qdrant_service_available_even_when_collection_is_empty(monkeypatch) -> None:
