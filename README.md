@@ -124,11 +124,13 @@ python scripts/upload_knowledge_base.py --purge               # 清空整个知�
 | `AUTH_REQUIRED` | `true` | 管理接口鉴权开关（生产必须 `true`，开发期可临时关闭） |
 | `ADMIN_JWT_SECRET` | 空 | JWT 签名密钥；为空时由 ADMIN_PASSWORD 派生（改密码即吊销旧 token） |
 | `RATE_LIMIT_ENABLED` | `true` | 问答/登录接口 IP 限流总开关 |
-| `QA_IP_RATE_LIMIT_PER_MINUTE` / `QA_IP_DAILY_LIMIT` | `30` / `500` | 每 IP 每分钟 / 每日问答次数上限（分钟数设 `0` = 不限制，仅保留每日上限与全局并发） |
+| `QA_IP_RATE_LIMIT_PER_MINUTE` | `30` | 问答每 IP 每分钟次数上限（设 `0` = 不限制） |
+| `QA_IP_MAX_QUESTIONS` | `20` | 每 IP 累计可提问总数上限（写 qa_logs 即消耗 1 次，不按天）；用尽返回 429，调大或清理 qa_logs 恢复；管理员不受限 |
+| `QA_MAX_QUESTION_CHARS` | `500` | 问题长度上限（字符数），超限返回 400 |
 | `QA_GLOBAL_CONCURRENCY` | `4` | 全局同时执行问答的最大并发（2C4G 建议保持 4） |
 | `LOGIN_RATE_LIMIT_PER_MINUTE` | `10` | 登录接口每 IP 每分钟次数上限 |
 | `RATE_LIMIT_TRUST_PROXY` | `false` | 部署在可信反向代理（Cloudflare Tunnel）后置 `true`，按 X-Forwarded-For 取 IP |
-| `QA_ACCESS_CODE` | 空 | 访客问答访问码（简历中附带）；面试官输入一次签发 24h JWT 存 httpOnly cookie，无码访客不能提问；为空 = 关闭闸门 |
+| `QA_ACCESS_CODE` | 空 | 访客问答访问码（简历中附带），6 位数字+大写英文字母；面试官输入一次签发 24h JWT 存 httpOnly cookie，无码访客不能提问；为空 = 关闭闸门。输错阶梯锁定：同一 IP 连续错 3 次锁 1 分钟，解锁后再错升一档（1→5→10→30→60 分钟封顶） |
 | `QA_ACCESS_TOKEN_TTL_HOURS` | `24` | 访问码 cookie 有效期（小时） |
 | `COOKIE_SECURE` | `false` | HTTPS 部署（Cloudflare Tunnel）时置 `true`，给访问码 cookie 加 Secure 标记 |
 | `QA_GLOBAL_DAILY_LIMIT` | `300` | 全局每日提问预算（跨 IP，防换 IP 刷爆额度）；用尽后当天拒绝新问答（429） |
@@ -141,8 +143,9 @@ python scripts/upload_knowledge_base.py --purge               # 清空整个知�
 - **前台（访客免登录）**：智能问答页 + 操作日志页（仅问答类记录）
 - **后台（管理员密码登录）**：知识库管理（上传/删除/索引）、系统状态面板、完整操作日志与历史归档
 - **后端强制权限**：`/api/documents/**`、`/api/health/rag` 等管理接口全部要求 JWT；前端隐藏导航只是体验，安全边界在后端
-- **防刷限流**：问答接口每 IP 限流 + 全局并发上限；登录接口独立限流；429 响应带 `Retry-After` 与 `X-Request-ID`
-- **访客访问码闸**：简历中附带访问码（`QA_ACCESS_CODE`），面试官输入一次签发 24h JWT 存 httpOnly cookie；无码访客只能看到页面、不能提问；管理员不受闸门限制
+- **防刷限流**：问答接口每 IP 限流（每分钟 + 累计提问配额 `QA_IP_MAX_QUESTIONS`）+ 全局并发上限；登录接口独立限流；429 响应带 `Retry-After` 与 `X-Request-ID`
+- **访客访问码闸**：简历中附带 6 位访问码（`QA_ACCESS_CODE`），面试官输入一次签发 24h JWT 存 httpOnly cookie；无码访客只能看到页面、不能提问；管理员不受闸门限制。输错阶梯锁定（IP 维度）：连续错 3 次锁 1 分钟，解锁后再错升一档（封顶 60 分钟）
+- **提问配额**：每 IP 累计最多 `QA_IP_MAX_QUESTIONS`（默认 20）个问题，写问答日志即消耗；问题超 500 字返回 400——拿到访问码也刷不动，成本可控
 - **全局预算保险丝**：每日全局提问预算（`QA_GLOBAL_DAILY_LIMIT`，跨 IP 统计，防换 IP 刷爆 DeepSeek 额度）——接近上限前端弹窗提醒，用尽后当天拒绝新问答
 - **上线建议**：为项目单独申请 DeepSeek API Key 并设置消费上限（保险丝）；公网走 Cloudflare Tunnel（自带 DDoS 防护）；在 Cloudflare 配置简单 WAF 规则与 Bot Fight Mode（脚本在应用层之前就被拦截）
 

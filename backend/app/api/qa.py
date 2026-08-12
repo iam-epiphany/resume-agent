@@ -21,6 +21,7 @@ from backend.app.core.security import (
     qa_access_enabled,
     verify_qa_access_code,
 )
+from backend.app.middleware.rate_limit import get_client_ip
 from backend.app.models.document import QALog
 from backend.app.schemas.qa import (
     LLMContextPackage,
@@ -31,6 +32,8 @@ from backend.app.schemas.qa import (
     QATaskStatusResponse,
     QaPublicStatusResponse,
 )
+from backend.app.services import qa_access_guard
+from backend.app.services.audit_service import record_event
 from backend.app.services.qa_task_service import (
     cancel_qa_task,
     create_qa_task,
@@ -93,6 +96,38 @@ def _ensure_budget_available(db: Session) -> None:
         raise HTTPException(status_code=429, detail="今日问答预算已用完，请明天再试。")
 
 
+def _ensure_question_length(question: str) -> None:
+    """问题长度上限（默认 500 字）：超限返回 400。
+
+    注意 QARequest.max_length 保持 8000 不收紧——schema 校验失败返回 422，
+    这里显式检查才能返回约定的 400。
+    """
+    if len(question.strip()) > config.QA_MAX_QUESTION_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"问题过长，请控制在 {config.QA_MAX_QUESTION_CHARS} 字以内。",
+        )
+
+
+def _ensure_ip_question_quota(request: Request, db: Session) -> None:
+    """每 IP 累计提问配额（QA_IP_MAX_QUESTIONS，不按天）：写 qa_logs 即消耗 1 次。
+
+    防拿到访问码的人换着花样刷；管理员请求除外（后台自测/调试不影响配额）。
+    用尽返回 429，调大配置或清理 qa_logs 恢复。
+    """
+    if is_admin_request(request):
+        return
+    ip = get_client_ip(request)
+    used = int(
+        db.scalar(select(func.count()).select_from(QALog).where(QALog.client_ip == ip)) or 0
+    )
+    if used >= config.QA_IP_MAX_QUESTIONS:
+        raise HTTPException(
+            status_code=429,
+            detail="该网络地址的提问次数已达上限，请更换网络后重试。",
+        )
+
+
 def require_qa_access(request: Request) -> None:
     """访客问答访问码闸（fail-closed）：无有效访问凭证（cookie/Bearer/管理员）时 401。"""
     if not has_qa_access(request):
@@ -106,12 +141,39 @@ def qa_status() -> QaPublicStatusResponse:
 
 
 @router.post("/access")
-def qa_access_login(payload: QAAccessRequest, response: Response) -> dict[str, Any]:
-    """访客访问码登录：校验访问码后签发短期 JWT 存 httpOnly cookie（默认 24 小时）。"""
+def qa_access_login(
+    payload: QAAccessRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """访客访问码登录：校验访问码后签发短期 JWT 存 httpOnly cookie（默认 24 小时）。
+
+    输错阶梯锁定（qa_access_guard，IP 维度）：
+    - 锁定期内任何输入（无论对错）一律 429 + Retry-After
+    - 连续输错 3 次锁 1 分钟，解锁后再错升一档（1→5→10→30→60 分钟封顶）
+    - 输对后计数清零
+    """
     if not qa_access_enabled():
         return {"granted": True, "access_enabled": False}
+    ip = get_client_ip(request)
+    locked_seconds = qa_access_guard.locked_seconds(ip)
+    if locked_seconds > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"输错次数过多，请 {_minutes_text(locked_seconds)}后再试。",
+            headers={"Retry-After": str(locked_seconds)},
+        )
     if not verify_qa_access_code(payload.code):
+        lock_seconds = qa_access_guard.record_failure(ip)
+        _record_access_failed_audit(db, ip)
+        if lock_seconds > 0:
+            raise HTTPException(
+                status_code=403,
+                detail=f"访问码不正确，请 {_minutes_text(lock_seconds)}后重试。",
+            )
         raise HTTPException(status_code=403, detail="访问码不正确")
+    qa_access_guard.record_success(ip)
     token, expires_at = create_qa_access_token()
     response.set_cookie(
         key=QA_ACCESS_COOKIE,
@@ -123,6 +185,33 @@ def qa_access_login(payload: QAAccessRequest, response: Response) -> dict[str, A
         path="/",
     )
     return {"granted": True, "access_enabled": True, "expires_at": expires_at.isoformat()}
+
+
+def _minutes_text(seconds: int) -> str:
+    """锁定时长文案：不足 1 分钟按 1 分钟，整分钟去小数（60 分钟封顶显示 60 分钟）。"""
+    minutes = max(1, -(-seconds // 60))
+    return f"{minutes} 分钟"
+
+
+def _record_access_failed_audit(db: Session, ip: str) -> None:
+    """访问码输错写审计（warning，按 IP+小时聚合）：管理员可发现爆破/异常尝试。"""
+    hour_window = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    try:
+        record_event(
+            db,
+            "qa_access_code_failed",
+            "auth",
+            None,
+            detail=f"访客访问码输入错误，IP: {ip}",
+            severity="warning",
+            event_key=f"qa_access_code_failed:{ip}:{hour_window}",
+            summary="访问码输入错误",
+            user_message="访客访问码输入错误。",
+            details={"client_ip": ip},
+        )
+    except Exception:
+        # 审计失败不影响主流程（403 照常返回）
+        db.rollback()
 
 
 @router.get("/access/status")
@@ -148,6 +237,8 @@ def ask_question(
 ) -> QAResponse:
     """Return a deterministic table answer or a generated, grounded text answer."""
 
+    _ensure_question_length(payload.question)
+    _ensure_ip_question_quota(request, db)
     _ensure_budget_available(db)
     try:
         response = answer_question(
@@ -156,6 +247,7 @@ def ask_question(
             options=payload.options,
             include_debug=payload.include_debug,
             session_id=payload.session_id,
+            client_ip=get_client_ip(request),
         )
     except RetrievalServiceUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -172,6 +264,7 @@ def ask_question(
 @router.post("/tasks", response_model=QATaskCreateResponse, dependencies=[Depends(require_qa_access)])
 def create_question_task(
     payload: QATaskRequest,
+    request: Request,
     response: Response,
     db: Session = Depends(get_db),
 ) -> QATaskCreateResponse:
@@ -179,8 +272,10 @@ def create_question_task(
 
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
+    _ensure_question_length(payload.question)
+    _ensure_ip_question_quota(request, db)
     _ensure_budget_available(db)
-    result = create_qa_task(payload)
+    result = create_qa_task(payload, client_ip=get_client_ip(request))
     _apply_budget_headers(response, db)
     return result
 
@@ -242,6 +337,8 @@ def cancel_question_task(task_id: str, db: Session = Depends(get_db)) -> QATaskS
 def ask_question_stream(payload: QARequest, request: Request, db: Session = Depends(get_db)) -> StreamingResponse:
     """可信问答流式观测：通过 SSE 推送 RAG 阶段进度，最终返回 QAResponse。"""
 
+    _ensure_question_length(payload.question)
+    _ensure_ip_question_quota(request, db)
     _ensure_budget_available(db)
     return StreamingResponse(
         _stream_qa_events(
@@ -250,6 +347,7 @@ def ask_question_stream(payload: QARequest, request: Request, db: Session = Depe
             payload.include_debug,
             payload.session_id,
             is_admin=is_admin_request(request),
+            client_ip=get_client_ip(request),
         ),
         media_type="text/event-stream",
         headers={
@@ -273,6 +371,7 @@ def retrieve_context(
 
     if not is_admin_request(request):
         raise HTTPException(status_code=403, detail="检索调试接口仅管理员可用")
+    _ensure_question_length(payload.question)
     try:
         return retrieve_context_package(db, payload.question, options=payload.options)
     except RetrievalServiceUnavailable as exc:
@@ -285,6 +384,7 @@ def _stream_qa_events(
     include_debug: bool = False,
     session_id: str | None = None,
     is_admin: bool = False,
+    client_ip: str | None = None,
 ) -> Iterator[str]:
     events: Queue[tuple[str, dict[str, Any]] | None] = Queue()
 
@@ -301,6 +401,7 @@ def _stream_qa_events(
                 include_debug=include_debug,
                 session_id=session_id,
                 progress_reporter=progress_reporter,
+                client_ip=client_ip,
             )
             # 匿名视角剥离检索依据与内部提示词（SSE 无法带 Authorization 头）
             if not is_admin:

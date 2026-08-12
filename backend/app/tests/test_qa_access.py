@@ -28,9 +28,11 @@ from backend.app.core import config
 from backend.app.core.database import Base
 from backend.app.models.document import QALog
 from backend.app.schemas.qa import QAResponse
+from backend.app.services import qa_access_guard
 from backend.main import app
 
-ACCESS_CODE = "Wbz_123"
+# 合法访问码：6 位数字+大写英文字母（config 加载期会校验格式）
+ACCESS_CODE = "WBZ123"
 
 TEST_DATABASE_PATH = Path(tempfile.gettempdir()) / f"resumemind-access-test-{os.getpid()}.db"
 test_engine = create_engine(
@@ -60,6 +62,7 @@ def qa_env(monkeypatch):
     api.qa 的流式会话 / qa_task_service 的任务会话）。
     """
     reset_database()
+    qa_access_guard._clear()  # 访问码守卫是模块级内存状态，须跨用例清理
     monkeypatch.setattr(config, "QA_ACCESS_CODE", "")
     monkeypatch.setattr(config, "QA_GLOBAL_DAILY_LIMIT", 100000)
     monkeypatch.setattr("backend.app.core.database.SessionLocal", MySession)
@@ -218,3 +221,79 @@ class TestDailyRemainingQuery:
             db.commit()
             remaining, _ = _global_daily_qa_remaining(db)
         assert remaining == 99999  # 预算 100000 - 今日 1 条
+
+
+class TestAccessCodeLockout:
+    """访问码输错阶梯锁定（IP 维度，qa_access_guard）。
+
+    阶梯：连续错 3 次锁 1 分钟；解锁后再错升一档（1→5→10→30→60 分钟封顶）；
+    锁定期内任何输入一律 429；输对清零。
+    """
+
+    def _lock_clock(self, monkeypatch) -> list[float]:
+        """注入可控单调时钟，避免真实等待。"""
+        clock = [1000.0]
+        monkeypatch.setattr(qa_access_guard, "_now", lambda: clock[0])
+        return clock
+
+    def test_three_failures_then_locked(self, monkeypatch, client) -> None:
+        _enable_gate(monkeypatch)
+        for _ in range(2):
+            response = client.post("/api/qa/access", json={"code": "WRONG1"})
+            assert response.status_code == 403
+        # 第 3 次错 → 触发锁定（提示等待 1 分钟）
+        response = client.post("/api/qa/access", json={"code": "WRONG1"})
+        assert response.status_code == 403
+        assert "1 分钟" in response.json()["detail"]
+        # 锁定期内：正确码也拒绝（429 + Retry-After）
+        response = client.post("/api/qa/access", json={"code": ACCESS_CODE})
+        assert response.status_code == 429
+        assert "Retry-After" in response.headers
+
+    def test_lockout_expires_then_success_clears(self, monkeypatch, client) -> None:
+        _enable_gate(monkeypatch)
+        clock = self._lock_clock(monkeypatch)
+        for _ in range(3):
+            client.post("/api/qa/access", json={"code": "WRONG1"})
+        assert client.post("/api/qa/access", json={"code": ACCESS_CODE}).status_code == 429
+        # 拨过 1 分钟锁定 → 输对清零，正常放行
+        clock[0] += 61
+        response = client.post("/api/qa/access", json={"code": ACCESS_CODE})
+        assert response.status_code == 200
+        # 清零后重新累计：再错 3 次仍回到第一档（1 分钟）
+        for _ in range(3):
+            client.post("/api/qa/access", json={"code": "WRONG1"})
+        response = client.post("/api/qa/access", json={"code": ACCESS_CODE})
+        assert response.status_code == 429
+
+    def test_failure_escalates_after_unlock(self, monkeypatch, client) -> None:
+        _enable_gate(monkeypatch)
+        clock = self._lock_clock(monkeypatch)
+        for _ in range(3):
+            client.post("/api/qa/access", json={"code": "WRONG1"})
+        # 解锁后再错 → 升档（5 分钟）
+        clock[0] += 61
+        response = client.post("/api/qa/access", json={"code": "WRONG1"})
+        assert response.status_code == 403
+        assert "5 分钟" in response.json()["detail"]
+        # 新档位锁定期长于 1 分钟：拨过 61s 仍在锁定
+        clock[0] += 61
+        assert client.post("/api/qa/access", json={"code": ACCESS_CODE}).status_code == 429
+        # 拨满 5 分钟 → 解锁，输对放行
+        clock[0] += 300
+        assert client.post("/api/qa/access", json={"code": ACCESS_CODE}).status_code == 200
+
+    def test_failed_attempt_writes_audit(self, monkeypatch, client) -> None:
+        _enable_gate(monkeypatch)
+        client.post("/api/qa/access", json={"code": "WRONG1"})
+        from backend.app.services.audit_service import list_audit_logs
+
+        with MySession() as db:
+            logs = list_audit_logs(db, limit=50)
+        assert any(log.action == "qa_access_code_failed" for log in logs)
+
+    def test_lowercase_input_accepted(self, monkeypatch, client) -> None:
+        """输入小写字母同样通过（verify 统一转大写比较）。"""
+        _enable_gate(monkeypatch)
+        response = client.post("/api/qa/access", json={"code": "wbz123"})
+        assert response.status_code == 200

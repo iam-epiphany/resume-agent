@@ -1,4 +1,5 @@
 ﻿import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -267,8 +268,15 @@ GROUNDING_VERIFY_ENABLED = _env_bool("GROUNDING_VERIFY_ENABLED", True)
 
 # ---- 访客问答访问码闸（2026-08-04）：看过简历的面试官凭访问码提问 ----
 # 简历/分享说明中附带访问码，访客输入一次后签发短期 JWT 存 httpOnly cookie；
-# QA_ACCESS_CODE 为空 = 闸门关闭（开发/测试默认），部署时在 .env 设置
-QA_ACCESS_CODE = os.getenv("QA_ACCESS_CODE", "").strip()
+# QA_ACCESS_CODE 为空 = 闸门关闭（开发/测试默认），部署时在 .env 设置。
+# 访问码必须为 6 位数字+大写英文字母（如 A7K2M9）：印在简历上不便更换，
+# 高熵码 + 输错阶梯锁定（qa_access_guard）配合抵御暴力破解。格式不合法启动即报错。
+QA_ACCESS_CODE = os.getenv("QA_ACCESS_CODE", "").strip().upper()
+if QA_ACCESS_CODE and not re.fullmatch(r"[0-9A-Z]{6}", QA_ACCESS_CODE):
+    raise RuntimeError(
+        "QA_ACCESS_CODE 必须为空或 6 位数字+大写英文字母（如 A7K2M9）；"
+        f"当前值 {QA_ACCESS_CODE!r} 不合法。"
+    )
 QA_ACCESS_TOKEN_TTL_HOURS = _env_float("QA_ACCESS_TOKEN_TTL_HOURS", 24.0, minimum=0.1)
 # 访问码 cookie 的 Secure 标记：HTTPS 部署（Cloudflare Tunnel）时置 true
 COOKIE_SECURE = _env_bool("COOKIE_SECURE", False)
@@ -361,9 +369,15 @@ ADMIN_TOKEN_EXPIRY_HOURS = _env_int("ADMIN_TOKEN_EXPIRY_HOURS", 12, minimum=1)
 AUTH_REQUIRED = _env_bool("AUTH_REQUIRED", True)
 
 RATE_LIMIT_ENABLED = _env_bool("RATE_LIMIT_ENABLED", True)
-# 问答接口（/api/qa/*）每 IP 限流：每分钟次数（0 = 不限制，仅保留每日上限与全局并发）+ 每日次数。
+# 问答接口（/api/qa/*）每 IP 限流：每分钟次数（0 = 不限制，仅保留全局并发）。
+# 提问总量改用 QA_IP_MAX_QUESTIONS 按 qa_logs 累计计数（不按天，防拿到访问码的人刷）。
 QA_IP_RATE_LIMIT_PER_MINUTE = _env_int("QA_IP_RATE_LIMIT_PER_MINUTE", 30, minimum=0)
-QA_IP_DAILY_LIMIT = _env_int("QA_IP_DAILY_LIMIT", 500, minimum=1)
+# 每个 IP 累计可提问的总数上限（写进 qa_logs 即消耗 1 次，含缓存命中与寒暄/无关转移）；
+# 用尽后该 IP 提问返回 429，调大此值或清理 qa_logs 恢复。管理员请求不受限。
+QA_IP_MAX_QUESTIONS = _env_int("QA_IP_MAX_QUESTIONS", 20, minimum=1)
+# 问题长度上限（字符数）：超限返回 400。schema 的 max_length=8000 保留为最后防线——
+# schema 校验失败返回 422，API 层显式检查才能返回约定的 400。
+QA_MAX_QUESTION_CHARS = _env_int("QA_MAX_QUESTION_CHARS", 500, minimum=1)
 # 全局同时执行问答（跑 LLM 的路径）的最大并发数；2C4G 保守稳定档建议 2。
 QA_GLOBAL_CONCURRENCY = _env_int("QA_GLOBAL_CONCURRENCY", 2, minimum=1)
 LOGIN_RATE_LIMIT_PER_MINUTE = _env_int("LOGIN_RATE_LIMIT_PER_MINUTE", 10, minimum=1)

@@ -223,6 +223,7 @@ def answer_question(
     progress_reporter: ProgressReporter | None = None,
     answer_preview_reporter: Callable[[QAAnswerPreview], None] | None = None,
     cancellation_checker: Callable[[], None] | None = None,
+    client_ip: str | None = None,
 ) -> QAResponse:
     """简历面试问答主流程：意图路由 → 追问记忆 → 检索 → 单次自评生成 → 置信度分级。"""
     cleaned_question = question.strip()
@@ -250,7 +251,7 @@ def answer_question(
                     "summary": {"cached": True},
                 },
             )
-            _save_qa_log(db, original_question, cached_response)
+            _save_qa_log(db, original_question, cached_response, client_ip=client_ip)
             return cached_response
 
     # ① 意图分类 + 追问补全（一次 LLM 调用双职责；失败保守回退 resume_qa 原问）
@@ -319,8 +320,8 @@ def answer_question(
             llm_call_count=_request_llm_call_count(),
         )
         _record_turn_if_needed(db, session_id, original_question, resolved_question, intent_result.intent, response)
-        _save_qa_log(db, original_question, response)
-        _log_qa_audit(db, "qa_answered", original_question, response)
+        _save_qa_log(db, original_question, response, client_ip=client_ip)
+        _log_qa_audit(db, "qa_answered", original_question, response, client_ip=client_ip)
         return response
 
     # ④ 检索与上下文（兜底链：标准 → 降阈 → 改写 → 直接生成）
@@ -494,8 +495,8 @@ def answer_question(
         llm_call_count=llm_call_count,
     )
     _record_turn_if_needed(db, session_id, original_question, resolved_question, intent_result.intent, response)
-    _save_qa_log(db, original_question, response)
-    _log_qa_audit(db, "qa_answered", original_question, response)
+    _save_qa_log(db, original_question, response, client_ip=client_ip)
+    _log_qa_audit(db, "qa_answered", original_question, response, client_ip=client_ip)
     # 写答案缓存：仅独立问题的 answered+sufficient 答案（推测/拒答/失败不缓存）
     if (
         session_id is None
@@ -2756,7 +2757,9 @@ def _filter_indexed_matches(db: Session, matches: list[RetrievalMatch]) -> list[
     return [match for match in matches if match.citation.document_id in indexed_ids]
 
 
-def _save_qa_log(db: Session, question: str, response: QAResponse) -> None:
+def _save_qa_log(
+    db: Session, question: str, response: QAResponse, client_ip: str | None = None
+) -> None:
     package = response.context_package
     used_chunks = (
         int(package.retrieval_summary.get("used_chunks") or 0)
@@ -2773,12 +2776,19 @@ def _save_qa_log(db: Session, question: str, response: QAResponse) -> None:
         evidence_sufficiency=response.evidence_sufficiency,
         fallback_level=response.retrieval_fallback_level,
         used_chunks=used_chunks,
+        client_ip=client_ip,
     )
     db.add(log)
     db.commit()
 
 
-def _log_qa_audit(db: Session, action: str, question: str, response: QAResponse) -> None:
+def _log_qa_audit(
+    db: Session,
+    action: str,
+    question: str,
+    response: QAResponse,
+    client_ip: str | None = None,
+) -> None:
     package = response.context_package
     used_chunks = (
         int(package.retrieval_summary.get("used_chunks") or 0)
@@ -2795,6 +2805,7 @@ def _log_qa_audit(db: Session, action: str, question: str, response: QAResponse)
         "intent": response.intent,
         "evidence_sufficiency": response.evidence_sufficiency,
         "retrieval_fallback_level": response.retrieval_fallback_level,
+        "client_ip": client_ip,
     }
     details_payload = {**detail_payload}
     detail = json.dumps(detail_payload, ensure_ascii=False)

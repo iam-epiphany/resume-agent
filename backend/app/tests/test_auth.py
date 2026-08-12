@@ -67,7 +67,6 @@ def _clear_rate_limit_state() -> None:
     for _ in range(20):
         if isinstance(node, RateLimitMiddleware):
             node._minute_hits.clear()
-            node._daily_hits.clear()
             node._active_requests = 0
             return
         node = getattr(node, "app", None)
@@ -309,7 +308,6 @@ def test_qa_rate_limit_rejects_excess_requests(monkeypatch) -> None:
     _clear_rate_limit_state()
     monkeypatch.setattr(config, "RATE_LIMIT_ENABLED", True)
     monkeypatch.setattr(config, "QA_IP_RATE_LIMIT_PER_MINUTE", 2)
-    monkeypatch.setattr(config, "QA_IP_DAILY_LIMIT", 100)
 
     statuses = [client.get("/api/qa/tasks?limit=1").status_code for _ in range(3)]
     assert statuses[0] != 429 and statuses[1] != 429
@@ -323,11 +321,10 @@ def test_qa_rate_limit_rejects_excess_requests(monkeypatch) -> None:
 
 
 def test_qa_rate_limit_per_minute_zero_means_unlimited(monkeypatch) -> None:
-    """每分钟限流设为 0 = 不限制（仅保留每日上限，如 QA_GLOBAL_DAILY_LIMIT 全局预算）。"""
+    """每分钟限流设为 0 = 不限制（仅保留全局并发与 API 层配额/预算）。"""
     _clear_rate_limit_state()
     monkeypatch.setattr(config, "RATE_LIMIT_ENABLED", True)
     monkeypatch.setattr(config, "QA_IP_RATE_LIMIT_PER_MINUTE", 0)
-    monkeypatch.setattr(config, "QA_IP_DAILY_LIMIT", 100000)
 
     statuses = [client.get("/api/qa/tasks?limit=1").status_code for _ in range(5)]
     assert all(status != 429 for status in statuses), f"0 = 不限分钟次数，实际 {statuses}"
@@ -358,7 +355,6 @@ def test_qa_global_concurrency_limit(monkeypatch) -> None:
     monkeypatch.setattr(config, "RATE_LIMIT_ENABLED", True)
     monkeypatch.setattr(config, "QA_GLOBAL_CONCURRENCY", 1)
     monkeypatch.setattr(config, "QA_IP_RATE_LIMIT_PER_MINUTE", 1000)
-    monkeypatch.setattr(config, "QA_IP_DAILY_LIMIT", 100000)
 
     def slow_answer(*_args, **_kwargs):
         time.sleep(0.3)

@@ -71,8 +71,12 @@ hf_cache/
 *.sqlite3
 *.db
 
-# Personal privacy: docs folder (resume, personal info, project files)
+# ============ 个人隐私：docs/ 整目录一律不入库 ============
+# docs/ 含个人简历、获奖证书扫描件、知识库（个人经历/荣誉/求职意向）与项目源码资源，
+# 均属隐私或超大文件，禁止随代码仓库上传。
+# 若确需提交 docs/ 下某个文件，必须先脱敏，再显式强制添加：git add -f docs/xxx
 docs/
+# ========================================================
 
 # ZCode 工作区内部文件（计划/会话记录），不入库
 .zcode/

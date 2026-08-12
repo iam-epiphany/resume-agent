@@ -72,14 +72,25 @@ RERANK_TOP_K=12
 ADMIN_PASSWORD=改成强密码
 ADMIN_JWT_SECRET=                     # 可选；留空时由 ADMIN_PASSWORD 派生
 AUTH_REQUIRED=true                    # 生产必须 true
-# 限流（防恶意刷 token）：问答每 IP 每分钟 30 次、每日 500 次，全局并发 4
+# 限流与防滥用（防恶意刷 token）：问答每 IP 每分钟 30 次 + 每 IP 累计 20 问 + 全局并发 4
 RATE_LIMIT_ENABLED=true
 QA_IP_RATE_LIMIT_PER_MINUTE=30
-QA_IP_DAILY_LIMIT=500
+# 每 IP 累计可提问总数上限（不按天，写 qa_logs 即消耗 1 次）；用尽 429，调大或清 qa_logs 恢复
+QA_IP_MAX_QUESTIONS=20
+# 问题长度上限（字符数），超限返回 400
+QA_MAX_QUESTION_CHARS=500
 QA_GLOBAL_CONCURRENCY=4
 LOGIN_RATE_LIMIT_PER_MINUTE=10
 # 使用 Cloudflare Tunnel 后置 true（按 X-Forwarded-For 取真实访客 IP）
 RATE_LIMIT_TRUST_PROXY=true
+# 访客访问码（简历中附带，印在简历上不便更换）：6 位数字+大写英文字母（如 A7K2M9），
+# 格式不合法启动即报错。输错阶梯锁定（IP 维度）：连续错 3 次锁 1 分钟，
+# 解锁后再错升一档（1→5→10→30→60 分钟封顶）。生成命令：
+#   python -c "import secrets,string;print(''.join(secrets.choice(string.digits+string.ascii_uppercase) for _ in range(6)))"
+QA_ACCESS_CODE=
+QA_ACCESS_TOKEN_TTL_HOURS=24
+# HTTPS 部署（Cloudflare Tunnel）时置 true，给访问码 cookie 加 Secure 标记
+COOKIE_SECURE=true
 ```
 
 **建议**：为本项目单独申请一个 DeepSeek API Key 并设置消费上限（保险丝）——即使被恶意刷量，也只会烧到上限自动停止。
@@ -179,9 +190,10 @@ cloudflared tunnel run resume-agent
 1. ✅ `AUTH_REQUIRED=true`（生产必须；`false` 只用于开发）
 2. ✅ `ADMIN_PASSWORD` 为强密码（后台 = 知识库删除权限）
 3. ✅ 为本项目单独申请 DeepSeek API Key 并设置**消费上限**（防恶意刷量烧钱）
-4. ✅ 限流已开启（`RATE_LIMIT_ENABLED=true`，问答 30 次/分/IP + 全局并发 4）
+4. ✅ 限流与防滥用已开启（`RATE_LIMIT_ENABLED=true`，问答 30 次/分/IP + 每 IP 累计 20 问 + 全局并发 4；访问码为 6 位数字+大写字母且带输错阶梯锁定）
 5. ✅ 公网走 Cloudflare Tunnel（自带 DDoS 防护 + HTTPS），可再加 WAF 规则拦截非浏览器 UA
 6. ✅ 知识库接口全部需要登录 token——访客（面试官）只能问答和看问答日志，无法上传/删除/看管理日志
+7. ✅ 上线前把 `QA_ACCESS_CODE` 设为 6 位新码并印到简历/分享说明中（改码后旧 cookie 24h 内仍有效；需立即全局踢人则更换 `ADMIN_JWT_SECRET`）
 
 ### 方式三：nginx 反代 + HTTPS（域名已备案时）
 

@@ -162,6 +162,7 @@ def _upgrade_sqlite_schema() -> None:
                 "error_retryable": "ALTER TABLE qa_tasks ADD COLUMN error_retryable BOOLEAN DEFAULT 0",
                 "attempt_count": "ALTER TABLE qa_tasks ADD COLUMN attempt_count INTEGER DEFAULT 0",
                 "answer_preview_json": "ALTER TABLE qa_tasks ADD COLUMN answer_preview_json TEXT",
+                "client_ip": "ALTER TABLE qa_tasks ADD COLUMN client_ip VARCHAR(64)",
             }
             for column_name, statement in qa_task_migrations.items():
                 if column_name not in qa_task_columns:
@@ -179,10 +180,18 @@ def _upgrade_sqlite_schema() -> None:
                 "evidence_sufficiency": "ALTER TABLE qa_logs ADD COLUMN evidence_sufficiency VARCHAR(20)",
                 "fallback_level": "ALTER TABLE qa_logs ADD COLUMN fallback_level INTEGER DEFAULT 0",
                 "used_chunks": "ALTER TABLE qa_logs ADD COLUMN used_chunks INTEGER DEFAULT 0",
+                "client_ip": "ALTER TABLE qa_logs ADD COLUMN client_ip VARCHAR(64)",
             }
             for column_name, statement in qa_log_migrations.items():
                 if column_name not in qa_log_columns:
                     connection.execute(text(statement))
+            # 按 IP 累计提问配额查询走该索引（qa_logs 行数少，查询按 client_ip 精确过滤）
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_qa_logs_client_ip "
+                    "ON qa_logs(client_ip)"
+                )
+            )
         # 银行场景遗留表已不再建模（模型已移除 SpreadsheetCell），幂等清理旧库残留
         connection.execute(text("DROP TABLE IF EXISTS spreadsheet_cells"))
 

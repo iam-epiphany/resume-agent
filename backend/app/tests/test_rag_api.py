@@ -2024,6 +2024,7 @@ def test_qa_task_stream_snapshot_contains_verified_preview_and_cancel_clears_it(
         progress_reporter=None,
         answer_preview_reporter=None,
         cancellation_checker=None,
+        client_ip=None,
     ):
         assert answer_preview_reporter is not None
         answer_preview_reporter(QAAnswerPreview(

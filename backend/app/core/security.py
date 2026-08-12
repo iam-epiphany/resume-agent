@@ -107,13 +107,17 @@ def qa_access_enabled() -> bool:
 
 
 def verify_qa_access_code(code: str) -> bool:
-    """校验访问码（常量时间比较，避免时序侧信道）。"""
+    """校验访问码（常量时间比较，避免时序侧信道）。
+
+    输入统一转大写后比较：配置侧（config.QA_ACCESS_CODE）已规范化为大写，
+    访客输入小写/混合大小写同样接受。
+    """
     if not config.QA_ACCESS_CODE:
         return True
     if not code:
         return False
     return hmac.compare_digest(
-        code.encode("utf-8"),
+        code.strip().upper().encode("utf-8"),
         config.QA_ACCESS_CODE.encode("utf-8"),
     )
 

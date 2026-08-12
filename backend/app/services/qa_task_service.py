@@ -67,8 +67,12 @@ def start_qa_task_worker() -> None:
     _fill_queue_from_db()
 
 
-def create_qa_task(payload: QATaskRequest) -> QATaskCreateResponse:
-    """Create or recover the task identified by the browser request id."""
+def create_qa_task(payload: QATaskRequest, client_ip: str | None = None) -> QATaskCreateResponse:
+    """Create or recover the task identified by the browser request id.
+
+    client_ip 在创建时落库：任务在 worker 线程执行（无 Request 对象），
+    IP 须经 QATask.client_ip 透传给日志与审计。
+    """
 
     task: QATask | None = None
     with SessionLocal() as db:
@@ -85,6 +89,7 @@ def create_qa_task(payload: QATaskRequest) -> QATaskCreateResponse:
                 include_debug=payload.include_debug,
                 status="queued",
                 progress_json="[]",
+                client_ip=client_ip,
             )
             db.add(task)
             try:
@@ -262,6 +267,7 @@ def _run_task(task_id: str) -> bool:
                 progress_reporter=progress_reporter,
                 answer_preview_reporter=answer_preview_reporter,
                 cancellation_checker=cancellation_checker,
+                client_ip=task.client_ip,
             )
             db.expire_all()
             task = db.get(QATask, task_id)
