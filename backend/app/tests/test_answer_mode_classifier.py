@@ -145,7 +145,7 @@ def test_greeting_maps_to_redirected_with_template_text(monkeypatch) -> None:
     result = generate_answer("你好", [], intent=INTENT_GREETING)
 
     assert result.answer_mode == "redirected"
-    assert result.answer == POLITE_REDIRECT_GREETING
+    assert result.answer == POLITE_REDIRECT_GREETING.format(persona_name="简历主人公")
     assert result.evidence_sufficiency is None
     assert result.generation_status == "skipped"
 
@@ -161,7 +161,7 @@ def test_off_topic_maps_to_redirected_with_template_text(monkeypatch) -> None:
     result = generate_answer("今天天气怎么样", [], intent=INTENT_OFF_TOPIC)
 
     assert result.answer_mode == "redirected"
-    assert result.answer == POLITE_REDIRECT_OFF_TOPIC
+    assert result.answer == POLITE_REDIRECT_OFF_TOPIC.format(persona_name="简历主人公")
     assert result.evidence_sufficiency is None
     assert result.generation_status == "skipped"
 

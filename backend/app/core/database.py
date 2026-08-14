@@ -1,13 +1,17 @@
 from collections.abc import Generator
+import json
 from pathlib import Path, PureWindowsPath
 import unicodedata
 
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, event, func, inspect, select, text, update
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from backend.app.core.config import DATABASE_PATH, ensure_runtime_dirs
 
 DATABASE_URL = f"sqlite:///{DATABASE_PATH.as_posix()}"
+
+# 默认人物（2026-08-14）：单当前人物模型下，存量库零配置升级的兜底人物
+DEFAULT_PERSONA_ID = "default"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
@@ -34,7 +38,53 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _upgrade_sqlite_schema()
+    _seed_default_persona()
     _recover_interrupted_states()
+
+
+def _seed_default_persona() -> None:
+    """存量/全新库的默认人物（张三）种子：零配置升级、向后兼容。
+
+    已有文档/事实回填到默认人物（persona_id=DEFAULT_PERSONA_ID），
+    保证旧库升级后检索过滤不丢数据。
+    """
+    from backend.app.models.document import Document, FactLedger, Persona
+
+    with SessionLocal() as db:
+        existing = db.scalar(select(Persona).where(Persona.persona_id == DEFAULT_PERSONA_ID))
+        if existing is None:
+            db.add(
+                Persona(
+                    persona_id=DEFAULT_PERSONA_ID,
+                    name="张三",
+                    display_name="张三",
+                    profile_json=json.dumps(
+                        {
+                            "name": "张三",
+                            "summary": "AI 应用后端开发方向，计算机相关专业背景。",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    status="confirmed",
+                    is_active=True,
+                )
+            )
+            db.flush()
+            db.execute(
+                update(Document).where(Document.persona_id.is_(None)).values(persona_id=DEFAULT_PERSONA_ID)
+            )
+            db.execute(
+                update(FactLedger).where(FactLedger.persona_id.is_(None)).values(persona_id=DEFAULT_PERSONA_ID)
+            )
+            db.commit()
+        elif existing.is_active is False:
+            # 默认人物被切换走但仍在：保证至少一个 active（单当前人物模型）
+            active_count = db.scalar(
+                select(func.count()).select_from(Persona).where(Persona.is_active.is_(True))
+            )
+            if not active_count:
+                existing.is_active = True
+                db.commit()
 
 
 def _upgrade_sqlite_schema() -> None:
@@ -192,6 +242,16 @@ def _upgrade_sqlite_schema() -> None:
                     "ON qa_logs(client_ip)"
                 )
             )
+        # 人物模型（2026-08-14）：persona_id 列迁移（存量数据回填由 _seed_default_persona 完成）
+        document_columns_after = {column["name"] for column in inspector.get_columns("documents")}
+        if "persona_id" not in document_columns_after:
+            connection.execute(text("ALTER TABLE documents ADD COLUMN persona_id VARCHAR(40)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_persona_id ON documents(persona_id)"))
+        if "fact_ledger" in table_names:
+            fact_columns = {column["name"] for column in inspector.get_columns("fact_ledger")}
+            if "persona_id" not in fact_columns:
+                connection.execute(text("ALTER TABLE fact_ledger ADD COLUMN persona_id VARCHAR(40)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_ledger_persona_id ON fact_ledger(persona_id)"))
         # 银行场景遗留表已不再建模（模型已移除 SpreadsheetCell），幂等清理旧库残留
         connection.execute(text("DROP TABLE IF EXISTS spreadsheet_cells"))
 

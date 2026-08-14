@@ -5,6 +5,7 @@ import { AuditPage } from "./pages/AuditPage";
 import { DocumentsPage } from "./pages/DocumentsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { RagPage } from "./pages/RagPage";
+import { WorkshopPage } from "./pages/WorkshopPage";
 import { AuthProvider, useAuth } from "./state/authContext";
 import { ChatHistoryProvider } from "./state/chatHistoryContext";
 import { QATaskProvider } from "./state/qaTaskContext";
@@ -52,7 +53,12 @@ function RoutedApp() {
   );
 }
 
-type Route = { name: "documents" } | { name: "qa" } | { name: "audit" } | { name: "login" };
+type Route =
+  | { name: "documents" }
+  | { name: "workshop" }
+  | { name: "qa" }
+  | { name: "audit" }
+  | { name: "login" };
 
 function matchRoute(path: string): Route {
   const parts = path.split("/").filter(Boolean);
@@ -61,6 +67,9 @@ function matchRoute(path: string): Route {
   }
   if (parts[0] === "qa") {
     return { name: "qa" };
+  }
+  if (parts[0] === "workshop") {
+    return { name: "workshop" };
   }
   if (parts[0] === "audit") {
     return { name: "audit" };
@@ -82,6 +91,10 @@ function renderRoute(
   }
   if (route.name === "qa") {
     return <RagPage />;
+  }
+  if (route.name === "workshop") {
+    // 工坊是后台功能：未登录先引导登录
+    return isAuthenticated ? <WorkshopPage /> : <LoginPage redirectPath="/workshop" onNavigate={navigate} />;
   }
   if (route.name === "audit") {
     return <AuditPage />;

@@ -59,6 +59,7 @@ from backend.app.schemas.qa import (
 from backend.app.services.audit_service import record_event
 from backend.app.services.answer_generation_service import generate_answer
 from backend.app.services.conversation_memory_service import record_turn, recent_turns
+from backend.app.services.persona_service import get_active_persona, persona_prompt_context
 from backend.app.services.context_dependency import RESUME_ANCHOR_TERMS
 from backend.app.services.intent_router_service import classify_and_resolve
 from backend.app.services.llm_client import (
@@ -250,10 +251,15 @@ def answer_question(
     # 单问硬时间预算（自意图路由起算）：重排前不足跳过重排、生成前不足摘录兜底
     budget = TimeBudget(QA_HARD_BUDGET_SECONDS)
 
+    # 当前人物（2026-08-14）：驱动提示词个性化与检索/台账隔离
+    persona = get_active_persona(db)
+    persona_ctx = persona_prompt_context(persona)
+    persona_name = persona_ctx["persona_name"]
+
     # 问答答案缓存（独立问题才查；追问链依赖前文，禁止缓存）：
     # 命中直接返回完整答案（含证据上下文），零 LLM 调用、秒回
     if session_id is None:
-        cached_response = qa_cache_service.lookup(db, cleaned_question)
+        cached_response = qa_cache_service.lookup(db, cleaned_question, persona_id=persona.persona_id)
         if cached_response is not None:
             cached_response.llm_call_count = 0
             cached_response.cached = True
@@ -278,7 +284,11 @@ def answer_question(
     )
     memory_turns = recent_turns(db, session_id, limit=CONVERSATION_MEMORY_MAX_TURNS) if session_id else []
     previous_turn = memory_turns[-1] if memory_turns else None
-    intent_result = classify_and_resolve(cleaned_question, previous_turn)
+    intent_result = classify_and_resolve(
+        cleaned_question,
+        previous_turn,
+        persona_description=persona_ctx["persona_description"],
+    )
     resolved_question = cleaned_question
     if (
         intent_result.needs_context
@@ -326,7 +336,9 @@ def answer_question(
 
     # ③ 礼貌转移（寒暄/无关话题：零检索零生成）
     if intent_result.strategy.polite_redirect:
-        generated = generate_answer(resolved_question, [], intent=intent_result.intent)
+        generated = generate_answer(
+            resolved_question, [], intent=intent_result.intent, persona_name=persona_name
+        )
         response = QAResponse(
             answer=generated.answer,
             answer_mode=generated.answer_mode,
@@ -357,6 +369,7 @@ def answer_question(
         cancellation_checker=cancellation_checker,
         memory_context=memory_context,
         budget=budget,
+        persona_id=persona.persona_id,
     )
     package = _package_from_retrieval(
         db,
@@ -365,12 +378,13 @@ def answer_question(
         aspect_retrievals,
         progress_reporter=progress_reporter,
         cancellation_checker=cancellation_checker,
+        persona_name=persona_name,
     )
     grade = _evidence_grade(package.context_chunks)
     if grade == "none" and FALLBACK_DIRECT_GENERATION_ENABLED:
         # level 3：无检索直接生成（LLM 基于 persona + 会话历史推理，强制推测标注）
         fallback_level = 3
-        package = _empty_context_package(resolved_question)
+        package = _empty_context_package(resolved_question, persona_name=persona_name)
     elif grade == "weak":
         # level 1：降阈重选（复用同一 plan 与候选池，仅放宽选择门槛，不再整链重跑）
         if FALLBACK_LOWER_THRESHOLD_ENABLED:
@@ -415,6 +429,7 @@ def answer_question(
                     cancellation_checker=cancellation_checker,
                     rewritten_queries=queries,
                     budget=budget,
+                    persona_id=persona.persona_id,
                 )
                 rewritten_package = _package_from_retrieval(
                     db,
@@ -472,7 +487,7 @@ def answer_question(
         )
     # 事实台账（与 grounding 并存）：检测"实体—属性—值"错配（张冠李戴），
     # 同时为最终上下文块标注 fact_status 供公开出处展示
-    ledger_facts = load_fact_ledger(db) if GROUNDING_VERIFY_ENABLED else None
+    ledger_facts = load_fact_ledger(db, persona_id=persona.persona_id) if GROUNDING_VERIFY_ENABLED else None
     if ledger_facts is not None:
         for chunk in package.context_chunks:
             fact_status = fact_status_for_source(chunk.source_doc, ledger_facts)
@@ -482,11 +497,12 @@ def answer_question(
         resolved_question,
         package.context_chunks,
         intent=intent_result.intent,
+        persona_name=persona_name,
         llm_prompt=package.llm_prompt,
         cancellation_checker=cancellation_checker,
         preview_reporter=report_preview,
         no_evidence=(fallback_level == 3),
-        known_entities=_known_resume_entities(db),
+        known_entities=_known_resume_entities(db, persona_id=persona.persona_id),
         ledger_facts=ledger_facts,
         # 硬时间预算：剩余不足 LLM 生成下限 → 跳过生成摘录兜底；否则按剩余预算收紧 LLM 超时
         force_extractive=not budget.can_afford(GENERATION_MIN_BUDGET_SECONDS),
@@ -533,7 +549,7 @@ def answer_question(
         and response.answer_mode == "answered"
         and response.evidence_sufficiency == "sufficient"
     ):
-        qa_cache_service.store(db, original_question, response)
+        qa_cache_service.store(db, original_question, response, persona_id=persona.persona_id)
     return response
 
 
@@ -578,7 +594,7 @@ def retrieve_context_package(
 ) -> LLMContextPackage:
     cleaned_question = question.strip()
     if not cleaned_question:
-        return _empty_context_package("")
+        return _empty_context_package("", persona_name=persona_name)
     return build_context_package(db, cleaned_question)
 
 
@@ -591,6 +607,7 @@ def _plan_and_retrieve(
     rewritten_queries: list[str] | None = None,
     memory_context: dict | None = None,
     budget: TimeBudget | None = None,
+    persona_id: str | None = None,
 ) -> tuple[QueryPlan, list[AspectRetrieval]]:
     """检索规划 + 候选召回（标准与改写重试两条路径共用）。
 
@@ -628,7 +645,7 @@ def _plan_and_retrieve(
     else:
         query_plan = plan_query(
             question,
-            catalog=_document_catalog_entries(db),
+            catalog=_document_catalog_entries(db, persona_id=persona_id),
             memory_context=memory_context,
             cancellation_checker=cancellation_checker,
         )
@@ -649,7 +666,7 @@ def _plan_and_retrieve(
             },
         },
     )
-    aspect_retrievals = _retrieve_aspects(db, query_plan, progress_reporter=progress_reporter, budget=budget)
+    aspect_retrievals = _retrieve_aspects(db, query_plan, progress_reporter=progress_reporter, budget=budget, persona_id=persona_id)
     return query_plan, aspect_retrievals
 
 
@@ -662,6 +679,7 @@ def _package_from_retrieval(
     relaxed: bool = False,
     progress_reporter: ProgressReporter | None = None,
     cancellation_checker: Callable[[], None] | None = None,
+    persona_name: str = "",
 ) -> LLMContextPackage:
     """基于已完成的检索结果构造最终上下文包（选择/摘要/prompt）。
 
@@ -759,7 +777,7 @@ def _package_from_retrieval(
             "detail": "正在将问题和依据片段组装为后续 LLM 输入……",
         },
     )
-    prompt = RAGPromptBuilder().build(question, context_chunks)
+    prompt = RAGPromptBuilder(persona_name=persona_name).build(question, context_chunks)
     prompt_elapsed_ms = _elapsed_ms(prompt_started_at)
     _report_progress(
         progress_reporter,
@@ -793,6 +811,9 @@ def build_context_package(
     memory_context: dict | None = None,
 ) -> LLMContextPackage:
     """检索规划 → 召回 → 选择 → 上下文包（保留的公开入口，供 retrieve API 等使用）。"""
+    persona = get_active_persona(db)
+    persona_id = persona.persona_id
+    persona_name = persona_prompt_context(persona)["persona_name"]
     query_plan, aspect_retrievals = _plan_and_retrieve(
         db,
         question,
@@ -800,6 +821,7 @@ def build_context_package(
         cancellation_checker=cancellation_checker,
         rewritten_queries=rewritten_queries,
         memory_context=memory_context,
+        persona_id=persona_id,
     )
     return _package_from_retrieval(
         db,
@@ -809,6 +831,7 @@ def build_context_package(
         relaxed=relaxed,
         progress_reporter=progress_reporter,
         cancellation_checker=cancellation_checker,
+        persona_name=persona_name,
     )
 
 
@@ -825,20 +848,26 @@ def _evidence_grade(context_chunks: list[RetrievalResult]) -> str:
     return "strong"
 
 
-def _document_catalog_entries(db: Session, limit: int = 60) -> list[tuple[str, str, str]]:
+def _document_catalog_entries(
+    db: Session, limit: int = 60, persona_id: str | None = None
+) -> list[tuple[str, str, str]]:
     """运行时读取知识库文档清单 [(filename, title, material_topic)]，供 planner 结构化使用。
 
-    动态数据（每次从 Document 表读取），非硬编码：文档增删后自动反映。
+    动态数据（每次从 Document 表读取），非硬编码：文档增删后自动反映；
+    persona_id 不为空时只列当前人物的文档（多人物隔离，2026-08-14）。
     material_topic 是简历领域类别（项目经历/技能掌握/竞赛奖项/证书资格/教育背景…），
     供枚举检索按类别确定对象文档集合（文件名 pattern 仅作旧数据兼容 fallback）。
     """
     try:
-        documents = db.scalars(
+        statement = (
             select(Document)
             .where(Document.status == "indexed")
             .order_by(Document.filename.asc())
             .limit(limit)
-        ).all()
+        )
+        if persona_id:
+            statement = statement.where(Document.persona_id == persona_id)
+        documents = db.scalars(statement).all()
     except Exception:
         return []
     return [
@@ -866,8 +895,8 @@ def _document_catalog_summary(db: Session, limit: int = 60) -> str:
     return "\n".join(lines)
 
 
-def _empty_context_package(question: str) -> LLMContextPackage:
-    prompt = RAGPromptBuilder().build(question, [])
+def _empty_context_package(question: str, persona_name: str = "") -> LLMContextPackage:
+    prompt = RAGPromptBuilder(persona_name=persona_name).build(question, [])
     query_plan = plan_query(question) if question else QueryPlan("", (), "empty", fallback_used=True)
     return LLMContextPackage(
         query=question,
@@ -896,49 +925,58 @@ def _empty_context_package(question: str) -> LLMContextPackage:
     )
 
 
-def _indexed_document_ids(db: Session) -> set[str]:
-    return set(
-        db.scalars(
-            select(Document.document_id).where(
-                Document.status.in_(["indexed", "table_indexed"])
-            )
-        ).all()
+def _indexed_document_ids(db: Session, persona_id: str | None = None) -> set[str]:
+    statement = select(Document.document_id).where(
+        Document.status.in_(["indexed", "table_indexed"])
     )
+    if persona_id:
+        statement = statement.where(Document.persona_id == persona_id)
+    return set(db.scalars(statement).all())
 
 
-def _anchor_document_ids(db: Session, anchor_documents: tuple[str, ...]) -> set[str]:
+def _anchor_document_ids(
+    db: Session,
+    anchor_documents: tuple[str, ...],
+    persona_id: str | None = None,
+) -> set[str]:
     """把 aspect 锚定的对象文档名解析为 document_id 集合（用于检索过滤）。
 
-    仅解析已索引的文档；解析不到时返回空集（调用方不设过滤，退化为全库检索）。
+    仅解析已索引且属于当前人物的文档；解析不到时返回空集（调用方不设过滤，退化为全库检索）。
     """
     if not anchor_documents:
         return set()
     try:
-        rows = db.execute(
-            select(Document.document_id, Document.filename).where(
-                Document.status.in_(["indexed", "table_indexed"]),
-                Document.filename.in_(list(anchor_documents)),
-            )
-        ).all()
+        statement = select(Document.document_id, Document.filename).where(
+            Document.status.in_(["indexed", "table_indexed"]),
+            Document.filename.in_(list(anchor_documents)),
+        )
+        if persona_id:
+            statement = statement.where(Document.persona_id == persona_id)
+        rows = db.execute(statement).all()
     except Exception:
         return set()
     return {document_id for document_id, _filename in rows}
 
 
-def _known_resume_entities(db: Session, limit: int = 60) -> list[str]:
+def _known_resume_entities(
+    db: Session, limit: int = 60, persona_id: str | None = None
+) -> list[str]:
     """从知识库文档提取简历领域已知实体（学校/项目/奖项/证书/技术栈等）。
 
     用于 grounding 硬事实校验：答案中出现但检索证据中缺失的已知实体被标记为
     未核实。实体来源：文档标题、material_topic、颁发机构、文件名去前缀后的对象名。
-    全部动态读取 Document 表（非硬编码）。
+    全部动态读取 Document 表（非硬编码）；persona_id 不为空时按当前人物过滤。
     """
     try:
-        documents = db.scalars(
+        statement = (
             select(Document)
             .where(Document.status == "indexed")
             .order_by(Document.filename.asc())
             .limit(limit)
-        ).all()
+        )
+        if persona_id:
+            statement = statement.where(Document.persona_id == persona_id)
+        documents = db.scalars(statement).all()
     except Exception:
         return []
     entities: list[str] = []
@@ -979,6 +1017,7 @@ def _keyword_recall_candidates(
     db: Session,
     terms: list[str],
     limit: int = KEYWORD_RECALL_LIMIT,
+    persona_id: str | None = None,
 ) -> list[tuple[_DocumentChunkSnapshot, int]]:
     """关键词精确召回：小库优势——全量扫描已索引 chunk，术语子串命中计数取 top-N。
 
@@ -993,7 +1032,7 @@ def _keyword_recall_candidates(
     if not normalized_terms or limit <= 0:
         return []
     try:
-        chunks_by_document = _chunks_by_document(db, _indexed_document_ids(db))
+        chunks_by_document = _chunks_by_document(db, _indexed_document_ids(db, persona_id=persona_id))
     except Exception as exc:
         # 关键词召回是最佳努力路径：SQLite 扫描失败不阻断 dense 检索主链
         logger.warning("keyword recall skipped: %s", exc)
@@ -1174,6 +1213,7 @@ def _retrieve_aspects(
     query_plan: QueryPlan,
     progress_reporter: ProgressReporter | None = None,
     budget: TimeBudget | None = None,
+    persona_id: str | None = None,
 ) -> list[AspectRetrieval]:
     if len(query_plan.aspects) > 1 and retrieve_citations is _DEFAULT_RETRIEVE_CITATIONS:
         # 多角度问题（枚举/补集/复合）：对象文档跨 aspect 高度重叠（5 个项目文档被
@@ -1181,7 +1221,7 @@ def _retrieve_aspects(
         # 再按 aspect 切分（省 4/5 重排计算；歧义低时进一步跳过重排）。
         # retrieve_citations 被替换（测试/自定义检索钩子）时保持逐 aspect 串行，
         # 保留 legacy hook 的既有语义。
-        return _retrieve_aspects_fused(db, query_plan, progress_reporter=progress_reporter, budget=budget)
+        return _retrieve_aspects_fused(db, query_plan, progress_reporter=progress_reporter, budget=budget, persona_id=persona_id)
     retrieval_started_at = perf_counter()
     _report_progress(
         progress_reporter,
@@ -1218,6 +1258,7 @@ def _retrieve_aspects(
             document_chunk_cache=document_chunk_cache,
             enumerative=query_plan.enumerative,
             budget=budget,
+            persona_id=persona_id,
         )
         candidates = _to_retrieval_results(matches)
         for candidate in candidates:
@@ -1291,6 +1332,7 @@ def _retrieve_aspects_fused(
     query_plan: QueryPlan,
     progress_reporter: ProgressReporter | None = None,
     budget: TimeBudget | None = None,
+    persona_id: str | None = None,
 ) -> list[AspectRetrieval]:
     """多角度融合检索：全部 aspect 的查询一次 dense 召回 + 关键词精确召回 → 至多一次 BGE rerank。
 
@@ -1344,7 +1386,7 @@ def _retrieve_aspects_fused(
             all_keywords.extend(_recall_terms(aspect))
         all_keywords = list(dict.fromkeys(all_keywords))
         existing_by_chunk_id = {candidate.chunk_id: candidate for candidate in candidates}
-        for snapshot, hits in _keyword_recall_candidates(db, all_keywords):
+        for snapshot, hits in _keyword_recall_candidates(db, all_keywords, persona_id=persona_id):
             existing = existing_by_chunk_id.get(snapshot.chunk_id)
             if existing is not None:
                 if existing.metadata is None:
@@ -1456,7 +1498,7 @@ def _retrieve_aspects_fused(
         diagnostics=diagnostics,
         limit=max(FINAL_CITATION_LIMIT, len(reranked)),
     )
-    matches = _filter_indexed_matches(db, matches)
+    matches = _filter_indexed_matches(db, matches, persona_id=persona_id)
 
     # 5. 按查询命中把候选切分回各 aspect（关键词候选归属所有 aspect，选择层按块去重）
     query_texts_by_aspect = {
@@ -1652,6 +1694,7 @@ def _retrieve_aspect_matches(
     *,
     enumerative: bool = False,
     budget: TimeBudget | None = None,
+    persona_id: str | None = None,
 ) -> tuple[list[RetrievalMatch], list[dict[str, Any]]]:
     if retrieve_citations is not _DEFAULT_RETRIEVE_CITATIONS:
         return _retrieve_aspect_matches_legacy_hook(db, aspect, progress_reporter)
@@ -1673,7 +1716,7 @@ def _retrieve_aspect_matches(
     # 直接从对象文档召回（与关键词精确召回互补：dense 侧限定范围、应用层注入锚点）。
     metadata_filter = None
     if aspect.anchor_documents:
-        anchor_ids = _anchor_document_ids(db, aspect.anchor_documents)
+        anchor_ids = _anchor_document_ids(db, aspect.anchor_documents, persona_id=persona_id)
         if anchor_ids:
             metadata_filter = {"document_ids": sorted(anchor_ids)}
     try:
@@ -1700,7 +1743,7 @@ def _retrieve_aspect_matches(
     # 50 名开外，词面子串命中（项目名/证书/学校等专名）保证对象文档的片段必然入池，
     # 相关性最终由 rerank/融合分裁决。小库全量扫，CPU 开销可忽略。
     if KEYWORD_RECALL_LIMIT > 0:
-        keyword_candidates = _keyword_recall_candidates(db, _recall_terms(aspect))
+        keyword_candidates = _keyword_recall_candidates(db, _recall_terms(aspect), persona_id=persona_id)
         existing_by_chunk_id = {candidate.chunk_id: candidate for candidate in candidates}
         for snapshot, hits in keyword_candidates:
             existing = existing_by_chunk_id.get(snapshot.chunk_id)
@@ -1796,7 +1839,7 @@ def _retrieve_aspect_matches(
         diagnostics=diagnostics,
     )
     diagnostics.timings_ms["total"] = _elapsed_ms(total_started_at)
-    matches = _filter_indexed_matches(db, matches)
+    matches = _filter_indexed_matches(db, matches, persona_id=persona_id)
     for match in matches:
         chunk_id = match.citation.chunk_id
         match.metadata["aspect_id"] = aspect.aspect_id
@@ -2982,7 +3025,9 @@ def _max_optional(current: float | None, candidate: float | None) -> float | Non
     return candidate if current is None else max(current, candidate)
 
 
-def _filter_indexed_matches(db: Session, matches: list[RetrievalMatch]) -> list[RetrievalMatch]:
+def _filter_indexed_matches(
+    db: Session, matches: list[RetrievalMatch], persona_id: str | None = None
+) -> list[RetrievalMatch]:
     if not matches:
         return []
     document_ids = {match.citation.document_id for match in matches}
@@ -2994,14 +3039,13 @@ def _filter_indexed_matches(db: Session, matches: list[RetrievalMatch]) -> list[
     unchecked_ids = document_ids.difference(verified_ids)
     indexed_ids = set(verified_ids)
     if unchecked_ids:
-        indexed_ids.update(
-            db.scalars(
-                select(Document.document_id).where(
-                    Document.document_id.in_(unchecked_ids),
-                    Document.status.in_(["indexed", "table_indexed"]),
-                )
-            ).all()
+        statement = select(Document.document_id).where(
+            Document.document_id.in_(unchecked_ids),
+            Document.status.in_(["indexed", "table_indexed"]),
         )
+        if persona_id:
+            statement = statement.where(Document.persona_id == persona_id)
+        indexed_ids.update(db.scalars(statement).all())
     return [match for match in matches if match.citation.document_id in indexed_ids]
 
 

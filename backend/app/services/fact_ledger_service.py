@@ -40,10 +40,16 @@ class FactCheckResult:
         }
 
 
-def load_fact_ledger(db: Session) -> list[FactLedger]:
-    """读取全部台账事实（台账规模小，逐请求读取即可）。"""
+def load_fact_ledger(db: Session, persona_id: str | None = None) -> list[FactLedger]:
+    """读取台账事实（台账规模小，逐请求读取即可）。
+
+    persona_id 不为空时只读该人物的台账（多人物隔离，2026-08-14）。
+    """
     try:
-        return list(db.scalars(select(FactLedger).order_by(FactLedger.id.asc())).all())
+        statement = select(FactLedger).order_by(FactLedger.id.asc())
+        if persona_id:
+            statement = statement.where(FactLedger.persona_id == persona_id)
+        return list(db.scalars(statement).all())
     except Exception:
         return []
 

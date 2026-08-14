@@ -2,6 +2,7 @@ import { AlertTriangle, KeyRound, MessageSquareText } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { qaAccessStatus, qaAccessSubmit, type QAAccessStatus } from "../api/qa";
+import { getActivePersona, type PersonaPublic } from "../api/workshop";
 import { QuestionComposer } from "../components/qa/QuestionComposer";
 import { QuestionHistoryDrawer } from "../components/qa/QuestionHistoryDrawer";
 import { useAuth } from "../state/authContext";
@@ -134,6 +135,20 @@ export function RagPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.activeThreadId]);
 
+  // 当前人物（公开安全视图）：驱动前台文案
+  const [personaTitle, setPersonaTitle] = useState("关于我的一切，都可以问");
+  useEffect(() => {
+    getActivePersona()
+      .then((persona) => {
+        if (persona.status === "confirmed" && persona.name) {
+          setPersonaTitle(`关于${persona.display_name || persona.name}的一切，都可以问`);
+        }
+      })
+      .catch(() => {
+        // 匿名接口不可用时保持默认文案
+      });
+  }, []);
+
   // 自动滚动到底部
   useEffect(() => {
     const el = threadRef.current;
@@ -210,7 +225,7 @@ export function RagPage() {
           <div>
             <p className="eyebrow">ResumeMind 智能问答</p>
             <div className="product-title-lockup">
-              <h1>关于我的一切，都可以问</h1>
+              <h1>{personaTitle}</h1>
             </div>
           </div>
         </header>
@@ -254,7 +269,7 @@ export function RagPage() {
         <div>
           <p className="eyebrow">ResumeMind 智能问答</p>
           <div className="product-title-lockup">
-            <h1>关于我的一切，都可以问</h1>
+            <h1>{personaTitle}</h1>
           </div>
         </div>
         <div className="product-header-actions">

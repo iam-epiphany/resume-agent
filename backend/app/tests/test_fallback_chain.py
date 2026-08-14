@@ -82,7 +82,7 @@ class _FakeRetrieval:
         self.rewritten = rewritten if rewritten is not None else standard
         self.seen_aspects: list[tuple[str, list[str]]] = []
 
-    def __call__(self, db, query_plan: QueryPlan, progress_reporter=None, budget=None) -> list[AspectRetrieval]:
+    def __call__(self, db, query_plan: QueryPlan, progress_reporter=None, budget=None, persona_id=None) -> list[AspectRetrieval]:
         aspect = query_plan.aspects[0]
         self.seen_aspects.append(
             (aspect.aspect_id, [search_query.query for search_query in aspect.search_queries])

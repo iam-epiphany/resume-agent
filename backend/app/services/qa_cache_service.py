@@ -45,20 +45,23 @@ def normalize_question(question: str) -> str:
     return re.sub(r"[^\w]+", "", text)
 
 
-def model_signature() -> str:
-    """模型签名：索引版本 + embedding 模型 + LLM 模型。变化即缓存自然失效。"""
+def model_signature(persona_id: str = "") -> str:
+    """模型签名：索引版本 + embedding 模型 + LLM 模型 + 人物（切换自动失效）。
+
+    persona_id 为空时使用当前激活人物（问答缓存调用方通常传当前人物）。
+    """
     embedding_identity = config.EMBEDDING_MODEL_PATH or config.EMBEDDING_MODEL_NAME
-    return f"{config.INDEX_VERSION}|{embedding_identity}|{config.LLM_MODEL}"
+    return f"{config.INDEX_VERSION}|{embedding_identity}|{config.LLM_MODEL}|{persona_id or 'default'}"
 
 
-def lookup(db: Session, question: str) -> QAResponse | None:
+def lookup(db: Session, question: str, persona_id: str = "") -> QAResponse | None:
     """查询缓存：先精确匹配，再高阈值语义匹配；均未命中返回 None。"""
     if not config.QA_CACHE_ENABLED:
         return None
     norm = normalize_question(question)
     if not norm:
         return None
-    signature = model_signature()
+    signature = model_signature(persona_id=persona_id)
     # 精确命中不应依赖 embedding：模型预热失败或临时不可用时，仍可安全复用同一个问题。
     exact = _load_answer(db, signature, norm)
     if exact is not None:
@@ -83,14 +86,14 @@ def lookup(db: Session, question: str) -> QAResponse | None:
     return None
 
 
-def store(db: Session, question: str, response: QAResponse) -> None:
+def store(db: Session, question: str, response: QAResponse, persona_id: str = "") -> None:
     """写入缓存（upsert）；超限时按 updated_at 淘汰最旧条目。调用方保证缓存条件。"""
     if not config.QA_CACHE_ENABLED:
         return
     norm = normalize_question(question)
     if not norm:
         return
-    signature = model_signature()
+    signature = model_signature(persona_id=persona_id)
     vector = _embed_vector(question)
     _ensure_loaded(db, signature)
     with _LOCK:

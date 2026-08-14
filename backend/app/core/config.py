@@ -363,8 +363,20 @@ OFFICE_CONVERSION_MAX_BYTES = _env_int(
     "OFFICE_CONVERSION_MAX_BYTES", 200 * 1024 * 1024, minimum=1
 )
 
-SUPPORTED_DOCUMENT_MIME_TYPES = {
-    ".txt": {"text/plain"},
+# ---- 人物工坊（2026-08-14）：任意简历上传 → LLM 加工为检索友好 Markdown ----
+# 加工师 LLM 配置（默认复用主 LLM）；转换按批调用，受全局每日预算与超时约束。
+WORKSHOP_ENABLED = _env_bool("WORKSHOP_ENABLED", True)
+WORKSHOP_PROVIDER = os.getenv("WORKSHOP_PROVIDER", LLM_PROVIDER)
+WORKSHOP_API_KEY = os.getenv("WORKSHOP_API_KEY") or LLM_API_KEY
+WORKSHOP_BASE_URL = os.getenv("WORKSHOP_BASE_URL", LLM_BASE_URL)
+WORKSHOP_MODEL = os.getenv("WORKSHOP_MODEL", LLM_MODEL)
+WORKSHOP_TIMEOUT_SECONDS = _env_float("WORKSHOP_TIMEOUT_SECONDS", 60.0, minimum=1.0)
+# 单次转换最多输入字符数（超出按此分批）；单任务最多文件数
+WORKSHOP_MAX_INPUT_CHARS = _env_int("WORKSHOP_MAX_INPUT_CHARS", 12_000, minimum=500)
+WORKSHOP_MAX_FILES_PER_JOB = _env_int("WORKSHOP_MAX_FILES_PER_JOB", 10, minimum=1)
+
+
+SUPPORTED_DOCUMENT_MIME_TYPES = {    ".txt": {"text/plain"},
     ".md": {"text/markdown", "text/plain"},
     ".doc": {"application/msword", "application/octet-stream"},
     ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},

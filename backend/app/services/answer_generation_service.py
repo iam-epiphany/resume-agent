@@ -61,12 +61,12 @@ class GeneratedAnswer:
 
 
 POLITE_REDIRECT_GREETING = (
-    "你好！我是张三的简历问答助手，可以围绕他的教育背景、项目经历、专业技能、"
+    "你好！我是{persona_name}的简历问答助手，可以围绕他的教育背景、项目经历、专业技能、"
     "荣誉奖项和求职意向提问，比如「介绍一下你的项目经历」或「你的技术栈是什么」？"
 )
 
 POLITE_REDIRECT_OFF_TOPIC = (
-    "抱歉，这个问题不在我的简历知识范围内。我是基于张三的简历和项目文档回答问题的助手，"
+    "抱歉，这个问题不在我的简历知识范围内。我是基于{persona_name}的简历和项目文档回答问题的助手，"
     "建议换个关于他个人经历的问题，比如他的教育背景、项目细节或求职意向，我很乐意详细解答。"
 )
 
@@ -88,6 +88,7 @@ def generate_answer(
     context_chunks: list[RetrievalResult],
     *,
     intent: str,
+    persona_name: str = "",
     llm_prompt: str | None = None,
     cancellation_checker: CancellationChecker | None = None,
     preview_reporter: PreviewReporter | None = None,
@@ -110,9 +111,9 @@ def generate_answer(
     - timeout_override（硬时间预算）：按剩余预算收紧 LLM 调用超时（秒）
     """
     if intent == INTENT_GREETING:
-        return _redirected(POLITE_REDIRECT_GREETING)
+        return _redirected(POLITE_REDIRECT_GREETING.format(persona_name=persona_name or "简历主人公"))
     if intent == INTENT_OFF_TOPIC:
-        return _redirected(POLITE_REDIRECT_OFF_TOPIC)
+        return _redirected(POLITE_REDIRECT_OFF_TOPIC.format(persona_name=persona_name or "简历主人公"))
 
     generated: GeneratedAnswer | None = None
     if not force_extractive and ANSWER_GENERATION_ENABLED and ANSWER_GENERATION_API_KEY:
@@ -121,6 +122,7 @@ def generate_answer(
                 question,
                 context_chunks,
                 intent=intent,
+                persona_name=persona_name,
                 llm_prompt=llm_prompt,
                 cancellation_checker=cancellation_checker,
                 preview_reporter=preview_reporter,
@@ -157,6 +159,15 @@ def _redirected(text: str, mode: AnswerMode = "redirected") -> GeneratedAnswer:
         answer_mode=mode,
         evidence_sufficiency=None,
         generation_status="skipped",
+    )
+
+
+def _polite_redirects(persona_name: str) -> tuple[str, str]:
+    """礼貌转移文案（随当前人物姓名渲染；空姓名用中性表述）。"""
+    name = persona_name or "简历主人公"
+    return (
+        POLITE_REDIRECT_GREETING.format(persona_name=name),
+        POLITE_REDIRECT_OFF_TOPIC.format(persona_name=name),
     )
 
 
@@ -247,13 +258,14 @@ def _call_llm(
     context_chunks: list[RetrievalResult],
     *,
     intent: str = "resume_qa",
+    persona_name: str = "",
     llm_prompt: str | None = None,
     cancellation_checker: CancellationChecker | None = None,
     preview_reporter: PreviewReporter | None = None,
     no_evidence: bool = False,
     timeout_override: float | None = None,
 ) -> GeneratedAnswer:
-    messages = RAGPromptBuilder().build_generation_messages(
+    messages = RAGPromptBuilder(persona_name=persona_name).build_generation_messages(
         question,
         context_chunks,
         llm_prompt=llm_prompt,

@@ -14,13 +14,25 @@ CORE_RAG_RULES = (
 
 # 角色与代词消歧：面试官提问中的“你/他/自己”等称呼，一律指知识库的主人公（简历所属求职者），
 # 而不是 ResumeMind 系统本身。例如“介绍你自己”应输出主人公的第一人称自我介绍。
+# 2026-08-14 动态化：persona_name 由当前人物档案注入（未确认人物为空，用中性表述）。
 PERSONA_AND_PRONOUN_RULES = (
     "代词消歧（必须遵守）：用户问题中的“你”“您”“自己”“本人”“他”“她”“这个人”“求职者”“候选人”等称呼，"
     "一律指知识库的主人公——即简历所属的求职者本人，而不是 ResumeMind 系统。\n"
     "用户问“介绍你自己”“你是谁”“你的情况”等时，以主人公的第一人称视角回答"
-    "（如“我是张三，……”，内容必须基于知识库证据）；用户以“他/她”提问时，用第三人称介绍主人公。\n"
+    "（如“我是{persona_name}，……”{persona_name_example}，内容必须基于知识库证据）；"
+    "用户以“他/她”提问时，用第三人称介绍主人公。\n"
     "不得介绍 ResumeMind 系统本身的功能或定位。\n"
 )
+
+
+def render_persona_rules(persona_name: str = "") -> str:
+    """渲染代词消歧规则（人物姓名可选注入；空姓名时用中性表述）。"""
+    name_example = (
+        f"“我是{persona_name}，……”"
+        if persona_name
+        else "以主人公的第一人称作答，姓名以知识库材料为准"
+    )
+    return PERSONA_AND_PRONOUN_RULES.format(persona_name=persona_name, persona_name_example=name_example)
 
 SELF_ASSESSMENT_OUTPUT_RULES = (
     "只输出JSON对象，不要输出任何其他内容。",
@@ -63,6 +75,11 @@ INTENT_EVIDENCE_RULES = {
 
 
 class RAGPromptBuilder:
+    def __init__(self, persona_name: str = "") -> None:
+        """persona_name：当前人物姓名（未确认人物为空，用中性表述）。"""
+        self.persona_name = (persona_name or "").strip()
+        self._persona_rules = render_persona_rules(self.persona_name)
+
     def build(self, query: str, chunks: list[RetrievalResult]) -> str:
         chunk_blocks = "\n\n".join(self._chunk_block(index, chunk) for index, chunk in enumerate(chunks, start=1))
         if not chunk_blocks:
@@ -71,7 +88,7 @@ class RAGPromptBuilder:
 
         return (
             "你是 ResumeMind，一个基于个人简历、证书、荣誉与项目文档的简历问答助手。\n\n"
-            f"{PERSONA_AND_PRONOUN_RULES}\n"
+            f"{self._persona_rules}\n"
             "请根据【检索到的知识片段】回答用户问题。\n"
             "要求：\n"
             f"{rule_block}\n\n"
@@ -109,7 +126,7 @@ class RAGPromptBuilder:
                 "role": "system",
                 "content": (
                     "你是 ResumeMind 简历问答助手，回答必须符合面试场景的自然口语风格。"
-                    f"{PERSONA_AND_PRONOUN_RULES}"
+                    f"{self._persona_rules}"
                     + "".join(f"{index}. {rule}\n" for index, rule in enumerate(CORE_RAG_RULES, start=1))
                     + structured_rule_block
                     + (policy_rule + "\n" if policy_rule else "")

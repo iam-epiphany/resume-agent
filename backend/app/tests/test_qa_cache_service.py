@@ -148,7 +148,7 @@ class TestAnswerQuestionCacheBranch:
         from backend.app.services import rag_service
 
         cached = make_response("（缓存答案）技术栈是 Java。")
-        monkeypatch.setattr(rag_service.qa_cache_service, "lookup", lambda db, q: cached)
+        monkeypatch.setattr(rag_service.qa_cache_service, "lookup", lambda db, q, persona_id="": cached)
         events: list[dict] = []
 
         response = rag_service.answer_question(
@@ -171,7 +171,7 @@ class TestAnswerQuestionCacheBranch:
         monkeypatch.setattr(
             rag_service.qa_cache_service,
             "lookup",
-            lambda db, q: make_response("我是张三，河南大学本科。"),
+            lambda db, q, persona_id="": make_response("我是张三，河南大学本科。"),
         )
         rag_service.answer_question(test_db, "介绍一下你自己")
         count = test_db.scalar(select(func.count()).select_from(QALog))

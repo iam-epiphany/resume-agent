@@ -4311,3 +4311,47 @@ textarea {
   cursor: pointer;
   padding: 2px 6px;
 }
+
+/* ---- 人物工坊（2026-08-14）---- */
+.workshop-page .alert {
+  margin: 0 24px 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.alert--danger { background: var(--danger-soft, #fdeaea); color: var(--danger, #c0392b); }
+.alert--success { background: var(--success-soft, #e8f7ee); color: var(--success, #27ae60); }
+.workshop-page .panel {
+  margin: 0 24px 20px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.workshop-page .panel h2 { margin: 0 0 10px; font-size: 16px; }
+.panel__hint { color: var(--text-dim, #8a919c); font-size: 13px; margin: 0 0 12px; }
+.persona-card__row { margin-bottom: 6px; }
+.persona-card__dim { color: var(--text-dim, #8a919c); font-size: 13px; }
+.persona-status { margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+.persona-status--confirmed { background: var(--success-soft, #e8f7ee); color: var(--success, #27ae60); }
+.persona-status--draft { background: var(--warning-soft, #fdf3e3); color: var(--warning, #b9770e); }
+.workshop-page .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.workshop-page .field textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  color: var(--text);
+}
+.persona-list { list-style: none; margin: 0; padding: 0; }
+.persona-list__item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th, .data-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.cell-dim { color: var(--text-dim, #8a919c); font-size: 12px; }
+.workshop-page .button { margin-right: 8px; }
+.button--danger { background: var(--danger-soft, #fdeaea); color: var(--danger, #c0392b); border-color: transparent; }

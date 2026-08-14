@@ -19,7 +19,9 @@ from backend.app.api.auth import router as auth_router
 from backend.app.api.documents import router as documents_router
 from backend.app.api.health import admin_router as health_admin_router
 from backend.app.api.health import router as health_router
+from backend.app.api.personas import router as personas_router
 from backend.app.api.qa import router as qa_router
+from backend.app.api.workshop import router as workshop_router
 from backend.app.middleware.rate_limit import RateLimitMiddleware
 from backend.app.core.config import API_TITLE, CORS_ORIGINS, FRONTEND_DEV_SERVER
 from backend.app.core.database import init_db
@@ -137,6 +139,8 @@ app.include_router(health_router, prefix="/api", tags=["health"])
 app.include_router(health_admin_router, prefix="/api", tags=["health"])
 app.include_router(auth_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
+app.include_router(personas_router, prefix="/api")
+app.include_router(workshop_router, prefix="/api")
 app.include_router(qa_router, prefix="/api")
 app.include_router(audit_router, prefix="/api")
 app.include_router(audit_public_router, prefix="/api")

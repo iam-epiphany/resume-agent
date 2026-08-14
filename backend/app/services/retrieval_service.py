@@ -97,8 +97,12 @@ def filter_active_candidates(
     candidates: list[VectorSearchResult],
     *,
     include_inactive: bool = False,
+    persona_id: str | None = None,
 ) -> list[VectorSearchResult]:
-    """Keep only candidates backed by the current active SQLite index."""
+    """Keep only candidates backed by the current active SQLite index.
+
+    persona_id 不为空时同时按人物过滤（多人物隔离，2026-08-14）。
+    """
 
     document_ids = {candidate.document_id for candidate in candidates if candidate.document_id}
     if not document_ids:
@@ -109,6 +113,8 @@ def filter_active_candidates(
             Document.status == "indexed",
             Document.index_version == INDEX_VERSION,
         )
+        if persona_id:
+            query = query.filter(Document.persona_id == persona_id)
         rows = query.all()
     active_documents = {document.document_id: document for document in rows}
     active_ids = set(active_documents)

@@ -1921,6 +1921,7 @@ def test_qa_passes_raw_question_to_retrieval_without_option_stripping(monkeypatc
         rewritten_queries=None,
         memory_context=None,
         budget=None,
+        persona_id=None,
     ):
         captured["question"] = question
         captured["memory_context"] = memory_context
@@ -2485,7 +2486,7 @@ def test_aspect_retrieval_fuses_queries_before_single_rerank(monkeypatch) -> Non
     monkeypatch.setattr(rag_service, "collect_candidates_with_query_hits", fake_collect)
     monkeypatch.setattr(rag_service, "rerank_candidates", fake_rerank)
     monkeypatch.setattr(rag_service, "matches_from_reranked", fake_matches_from_reranked)
-    monkeypatch.setattr(rag_service, "_filter_indexed_matches", lambda db, matches: matches)
+    monkeypatch.setattr(rag_service, "_filter_indexed_matches", lambda db, matches, persona_id=None: matches)
 
     matches, diagnostics = rag_service._retrieve_aspect_matches(object(), aspect)
 

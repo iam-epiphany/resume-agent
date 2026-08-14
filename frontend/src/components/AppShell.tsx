@@ -1,4 +1,4 @@
-import { Activity, BookOpenText, ClipboardList, LogIn, LogOut, MessageSquarePlus, MessageSquareText, X } from "lucide-react";
+import { Activity, BookOpenText, ClipboardList, Wand2, LogIn, LogOut, MessageSquarePlus, MessageSquareText, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 
@@ -64,6 +64,10 @@ export function AppShell({ path, onNavigate, children }: AppShellProps) {
             <button type="button" aria-current={path === "/documents" ? "page" : undefined} className={path === "/documents" ? "nav-item active" : "nav-item"} onClick={() => onNavigate("/documents")}>
               <BookOpenText size={18} />
               知识库
+            </button>
+            <button type="button" aria-current={path === "/workshop" ? "page" : undefined} className={path === "/workshop" ? "nav-item active" : "nav-item"} onClick={() => onNavigate("/workshop")}>
+              <Wand2 size={18} />
+              人物工坊
             </button>
             <button type="button" aria-current={path === "/audit" ? "page" : undefined} className={path === "/audit" ? "nav-item active" : "nav-item"} onClick={() => onNavigate("/audit")}>
               <ClipboardList size={18} />

@@ -291,7 +291,7 @@ def test_retrieve_aspects_routes_multi_aspect_to_fused(monkeypatch) -> None:
     monkeypatch.setattr(rag_service, "SKIP_RERANK_ENABLED", True)
     calls: list[dict] = []
 
-    def fake_fused(db, query_plan, progress_reporter=None, budget=None):
+    def fake_fused(db, query_plan, progress_reporter=None, budget=None, persona_id=None):
         calls.append({"fused": True, "aspects": len(query_plan.aspects)})
         return []
 
@@ -306,7 +306,7 @@ def test_retrieve_aspects_legacy_hook_stays_serial(monkeypatch) -> None:
 
     per_aspect_calls: list[str] = []
 
-    def fake_retrieve_aspect_matches(db, aspect, progress_reporter=None, document_chunk_cache=None, *, enumerative=False, budget=None):
+    def fake_retrieve_aspect_matches(db, aspect, progress_reporter=None, document_chunk_cache=None, *, enumerative=False, budget=None, persona_id=None):
         per_aspect_calls.append(aspect.aspect_id)
         return [], []
 
