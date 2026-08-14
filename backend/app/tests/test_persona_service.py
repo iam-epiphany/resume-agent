@@ -35,15 +35,16 @@ def session(tmp_path):
 def test_get_active_persona_auto_seeds_default(session) -> None:
     persona = get_active_persona(session)
     assert persona.persona_id == DEFAULT_PERSONA_ID
-    assert persona.name == "张三"
+    assert persona.name == ""  # 默认人物不内置任何姓名（由部署者配置或工坊提取）
     assert persona.is_active is True
 
 
 def test_prompt_context_for_confirmed_persona(session) -> None:
     persona = get_active_persona(session)
     ctx = persona_prompt_context(persona)
-    assert ctx["persona_name"] == "张三"
-    assert "张三" in ctx["persona_description"]
+    # 无姓名人物：persona_name 为空 → 提示词用中性"求职者"表述，不注入任何姓名
+    assert ctx["persona_name"] == ""
+    assert "求职者" in ctx["persona_description"]
 
 
 def test_prompt_context_for_draft_persona_stays_neutral(session) -> None:
@@ -88,7 +89,7 @@ def test_activate_persona_switches_and_invalidates_cache(session) -> None:
 def test_public_view_omits_full_profile(session) -> None:
     persona = get_active_persona(session)
     view = public_persona_view(persona)
-    assert view["name"] == "张三"
+    assert view["name"] == ""
     assert view["is_active"] is True
     assert "profile" not in view  # 不暴露完整档案
 

@@ -428,3 +428,25 @@
 - 修测试坑：Windows 文件锁（临时文件库连接池未释放）→ 测试库改内存 StaticPool；fixture clear 指向测试库不碰真实 app.db
 
 **配置**：`QA_CACHE_ENABLED=true`、`QA_CACHE_SEMANTIC_THRESHOLD=0.93`、`QA_CACHE_MAX_ITEMS=300`
+
+## ✅ 人物工坊 skill 化：resume-materials-workshop（2026-08-14）
+
+**需求（用户拍板）**：把「任意简历材料 → 检索友好知识库 Markdown」的 LLM 加工能力封装为可复用、可入库、可对外宣传的 skill，后端按「规范驱动」调用——提示词、输出契约、版本以 skill 目录为单一事实来源，规则改动不再碰业务代码。
+
+**skill（新，`.agents/skills/resume-materials-workshop/`，.gitignore 白名单入库）**
+- `SKILL.md`：frontmatter（name/description/metadata.version=1.0.0）+ 工作流、质量红线、自测指引；`README.md` 对外宣传；`references/transform-prompt.md`（加工师 System Prompt 原文，从 service 常量迁出）；`references/output-schema.json`（JSON Schema 输出契约，draft 2020-12）；`assets/sample-input.txt`/`sample-output.json` 黄金样例（虚构人物）；`scripts/self_test.py` 离线自测（契约合法性 + 黄金样例 + 8 个负例）
+- 顺带修正：旧提示词残留的双花括号转义 `{{"filename"}}` → `{"filename"}`（skill 1.0.0 版本记录）
+
+**后端（规范驱动）**
+- `services/skill_loader.py`（新）：frontmatter 轻量解析取 `metadata.version`（不引 yaml 依赖）、加载提示词与契约；缺失/损坏给可读报错，不静默降级
+- `materials_workshop_service.py`：删除硬编码 `WORKSHOP_TRANSFORM_PROMPT`，改由 skill_loader 加载；LLM 输出经 `jsonschema` 校验，不合契约整批拒绝（WorkshopError）；任务记录 `skill_version`
+- `models/document.py` + `database.py`：`workshop_jobs.skill_version` 列（沿用 ALTER TABLE 迁移模式）
+- `api/workshop.py`：transform 响应与任务列表返回 `skill_version`；前端任务表加「加工版本」列
+- `config.py`：`WORKSHOP_SKILL_DIR`（默认仓库内路径，env 可覆盖）；Dockerfile 打包 `COPY .agents/skills/ → /app/agents-skills/` + `ENV WORKSHOP_SKILL_DIR`
+- 依赖：`jsonschema==4.26.0`（+ referencing/rpds-py/jsonschema-specifications/attrs 锁定）
+
+**测试**：后端 460 单测全绿（新增 skill_loader 6 个 + 工坊 3 个：契约拒绝/提示词来自 skill/版本落库/skill 缺失拒绝开工）；skill 自测 11 项 PASS；前端 tsc 通过
+
+**验证**：`python .agents/skills/resume-materials-workshop/scripts/self_test.py` 退出码 0；`git ls-files --others --exclude-standard .agents/` 仅 7 个 skill 文件；`git check-ignore` 确认白名单生效
+
+**宣传**：docs-guide/人物工坊使用说明.md 新增「加工 skill（规范驱动）」章节；skill 目录自带 README 可直接对外展示

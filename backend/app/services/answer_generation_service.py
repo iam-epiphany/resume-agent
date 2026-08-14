@@ -111,9 +111,9 @@ def generate_answer(
     - timeout_override（硬时间预算）：按剩余预算收紧 LLM 调用超时（秒）
     """
     if intent == INTENT_GREETING:
-        return _redirected(POLITE_REDIRECT_GREETING.format(persona_name=persona_name or "简历主人公"))
+        return _redirected(_greeting_copy(persona_name))
     if intent == INTENT_OFF_TOPIC:
-        return _redirected(POLITE_REDIRECT_OFF_TOPIC.format(persona_name=persona_name or "简历主人公"))
+        return _redirected(_off_topic_copy(persona_name))
 
     generated: GeneratedAnswer | None = None
     if not force_extractive and ANSWER_GENERATION_ENABLED and ANSWER_GENERATION_API_KEY:
@@ -162,13 +162,30 @@ def _redirected(text: str, mode: AnswerMode = "redirected") -> GeneratedAnswer:
     )
 
 
+def _greeting_copy(persona_name: str) -> str:
+    """寒暄转移文案：有姓名时点明主人公；无姓名时完全中性（默认"我"口径）。"""
+    if persona_name:
+        return POLITE_REDIRECT_GREETING.format(persona_name=persona_name)
+    return (
+        "你好！我是简历问答助手，可以围绕求职者的教育背景、项目经历、专业技能、"
+        "荣誉奖项和求职意向提问，比如「介绍一下你的项目经历」或「你的技术栈是什么」？"
+    )
+
+
+def _off_topic_copy(persona_name: str) -> str:
+    """无关话题转移文案：有姓名时点明主人公；无姓名时完全中性。"""
+    if persona_name:
+        return POLITE_REDIRECT_OFF_TOPIC.format(persona_name=persona_name)
+    return (
+        "抱歉，这个问题不在我的简历知识范围内。我是基于知识库中的简历和项目文档"
+        "回答问题的助手，建议换个关于求职者个人经历的问题，比如他的教育背景、"
+        "项目细节或求职意向，我很乐意详细解答。"
+    )
+
+
 def _polite_redirects(persona_name: str) -> tuple[str, str]:
     """礼貌转移文案（随当前人物姓名渲染；空姓名用中性表述）。"""
-    name = persona_name or "简历主人公"
-    return (
-        POLITE_REDIRECT_GREETING.format(persona_name=name),
-        POLITE_REDIRECT_OFF_TOPIC.format(persona_name=name),
-    )
+    return (_greeting_copy(persona_name), _off_topic_copy(persona_name))
 
 
 def _apply_confidence_mode(

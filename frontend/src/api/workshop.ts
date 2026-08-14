@@ -16,6 +16,7 @@ export interface WorkshopJobView {
   persona_id: string;
   status: string;
   stage: string;
+  skill_version: string | null;
   raw_filenames: string[];
   generated_document_ids: string[];
   generated_fact_count: number;

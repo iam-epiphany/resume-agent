@@ -13,9 +13,9 @@ def _chunk() -> RetrievalResult:
         chunk_id="chunk-1",
         rank=1,
         score=0.9,
-        source_doc="简历_张三.pdf",
+        source_doc="简历样例.pdf",
         section_title="基本信息",
-        text="张三，河南大学本科在读。",
+        text="我，本科在读。",
         citation_label="[1]",
         metadata={"rerank_score": 0.9, "document_id": "DOC-TEST"},
     )

@@ -15,8 +15,8 @@ from backend.app.services import answer_generation_service
 from backend.app.services.answer_generation_service import (
     FALLBACK_NO_CONTEXT,
     HEDGE_PREFIX,
-    POLITE_REDIRECT_GREETING,
-    POLITE_REDIRECT_OFF_TOPIC,
+    _greeting_copy,
+    _off_topic_copy,
     GeneratedAnswer,
     generate_answer,
 )
@@ -145,7 +145,7 @@ def test_greeting_maps_to_redirected_with_template_text(monkeypatch) -> None:
     result = generate_answer("你好", [], intent=INTENT_GREETING)
 
     assert result.answer_mode == "redirected"
-    assert result.answer == POLITE_REDIRECT_GREETING.format(persona_name="简历主人公")
+    assert result.answer == _greeting_copy("")
     assert result.evidence_sufficiency is None
     assert result.generation_status == "skipped"
 
@@ -161,7 +161,7 @@ def test_off_topic_maps_to_redirected_with_template_text(monkeypatch) -> None:
     result = generate_answer("今天天气怎么样", [], intent=INTENT_OFF_TOPIC)
 
     assert result.answer_mode == "redirected"
-    assert result.answer == POLITE_REDIRECT_OFF_TOPIC.format(persona_name="简历主人公")
+    assert result.answer == _off_topic_copy("")
     assert result.evidence_sufficiency is None
     assert result.generation_status == "skipped"
 

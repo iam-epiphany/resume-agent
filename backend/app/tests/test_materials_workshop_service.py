@@ -125,6 +125,43 @@ def test_transform_batch_invalid_json_raises(monkeypatch) -> None:
         _transform_batch("材料", batch_index=1, total_batches=1)
 
 
+def test_transform_batch_schema_violation_raises(monkeypatch) -> None:
+    """skill 契约校验：输出结构不合 output-schema.json 时整批拒绝，不静默降级。"""
+    payload = {
+        "persona_profile": {"name": "张三"},
+        "knowledge_documents": [{"filename": "简历.docx", "content": "不是 markdown"}],
+        "facts": [{"subject": "a", "predicate": "b", "value": "c", "status": "maybe"}],
+    }
+    monkeypatch.setattr(
+        workshop, "chat_completion_content", lambda config, messages, **kwargs: json.dumps(payload)
+    )
+    with pytest.raises(workshop.WorkshopError, match="不合 skill 契约"):
+        _transform_batch("材料", batch_index=1, total_batches=1)
+
+
+def test_transform_batch_loads_prompt_from_skill(monkeypatch) -> None:
+    """提示词以 skill 目录为单一事实来源：system 消息为 skill 提示词 + 占位符替换。"""
+    captured: dict = {}
+
+    def fake_llm(config, messages, **kwargs) -> str:
+        captured["messages"] = messages
+        return json.dumps(
+            {
+                "persona_profile": {"name": "张三"},
+                "knowledge_documents": [],
+                "facts": [],
+            }
+        )
+
+    monkeypatch.setattr(workshop, "chat_completion_content", fake_llm)
+    _transform_batch("原始材料内容", batch_index=2, total_batches=3)
+    content = captured["messages"][0]["content"]
+    assert "简历材料加工师" in content
+    assert "第 2/3 批" in content
+    assert "原始材料内容" in content
+    assert "{batch_index}" not in content  # 占位符全部替换
+
+
 # ------------------------------------------------------------------ 入库与回滚
 
 
@@ -222,6 +259,8 @@ def test_transform_end_to_end_mock_llm(session, monkeypatch) -> None:
     )
     assert job.status == "completed"
     assert job.generated_fact_count >= 1
+    # 加工 skill 版本随任务落库（SKILL.md frontmatter 为唯一来源）
+    assert job.skill_version == workshop.skill_loader.skill_version()
     docs = session.scalars(
         select(Document).where(Document.persona_id == "persona-李四")
     ).all()
@@ -237,3 +276,26 @@ def test_transform_end_to_end_mock_llm(session, monkeypatch) -> None:
     # 档案 draft（人工确认前不激活）
     persona = session.scalar(select(Persona).where(Persona.persona_id == "persona-李四"))
     assert persona.status == "draft" or persona.name == "李四"
+
+
+def test_transform_materials_skill_unavailable_raises(session, monkeypatch) -> None:
+    """skill 目录不可用（缺版本/契约）时任务拒绝开工，错误信息可读。"""
+    import asyncio
+
+    from backend.app.services.skill_loader import SkillLoadError
+
+    monkeypatch.setattr(workshop, "enqueue_document_index", lambda document_id: True)
+    # 不依赖宿主环境变量：固定配置与模拟 skill 损坏
+    monkeypatch.setattr(workshop, "WORKSHOP_ENABLED", True)
+    monkeypatch.setattr(workshop, "WORKSHOP_API_KEY", "test-key")
+    monkeypatch.setattr(workshop, "WORKSHOP_MODEL", "test-model")
+    monkeypatch.setattr(
+        workshop.skill_loader,
+        "skill_version",
+        lambda: (_ for _ in ()).throw(SkillLoadError("SKILL.md frontmatter 缺少 metadata.version")),
+    )
+    file = _upload("材料.txt", "张三的简介。".encode("utf-8"))
+    with pytest.raises(workshop.WorkshopError, match="加工 skill 不可用"):
+        asyncio.run(
+            workshop.transform_materials(session, [file], persona_id="persona-张三")
+        )

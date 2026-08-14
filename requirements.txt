@@ -19,6 +19,11 @@ charset-normalizer==3.4.9
 pymupdf==1.28.0
 pymupdf-layout==1.28.0
 pymupdf4llm==1.28.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==2026.6.3
+attrs==26.1.0
 starlette==1.3.1
 tabulate==0.10.0
 typing-inspection==0.4.2

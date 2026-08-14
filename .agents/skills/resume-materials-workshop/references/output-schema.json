@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://resume-mind.dev/skills/resume-materials-workshop/output-schema.json",
+  "title": "简历材料加工输出契约",
+  "description": "「材料加工师」LLM 输出的 JSON 契约：persona_profile（人物档案）+ knowledge_documents[]（一主题一文件的知识库 Markdown）+ facts[]（结构化事实）。后端用 jsonschema 校验，不合契约的任务直接失败，不静默入库。",
+  "type": "object",
+  "required": ["knowledge_documents"],
+  "properties": {
+    "persona_profile": {
+      "type": "object",
+      "description": "人物档案：只放材料中可确认的信息，无法确认的字段省略。",
+      "properties": {
+        "name": { "type": "string", "description": "人物姓名（材料直接给出）" },
+        "display_name": { "type": "string", "description": "对外展示名（默认同 name）" },
+        "summary": { "type": "string", "description": "一句话概述" },
+        "education": { "type": "string", "description": "教育背景摘要" },
+        "job_intent": { "type": "string", "description": "求职意向" },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "projects": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "knowledge_documents": {
+      "type": "array",
+      "description": "知识库文档：一篇只讲一个主题，content 以 `> 材料主题：类别` 开头。",
+      "items": {
+        "type": "object",
+        "required": ["filename", "content"],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "description": "主题_文件名.md（不含路径分隔符与非法字符）",
+            "pattern": "^[^\\\\/:*?\"<>|]{1,200}\\.md$"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "description": "以 `> 材料主题：类别` 开头的 Markdown；类别限：项目经历/技能专长/教育背景/竞赛奖项/荣誉奖励/证书资格/求职意向/个人特质/自我介绍/综合简历"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "facts": {
+      "type": "array",
+      "description": "结构化事实：status 只能从材料直接确认时为 confirmed，其余 pending。",
+      "items": {
+        "type": "object",
+        "required": ["subject", "predicate", "value", "status"],
+        "properties": {
+          "subject": { "type": "string", "minLength": 1 },
+          "predicate": { "type": "string", "minLength": 1 },
+          "value": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["confirmed", "pending"] },
+          "source_file": { "type": "string", "description": "事实来源文件名（可选）" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

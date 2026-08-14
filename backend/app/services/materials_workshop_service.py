@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+import jsonschema
 from fastapi import UploadFile
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -39,6 +40,7 @@ from backend.app.core.config import (
     WORKSHOP_TIMEOUT_SECONDS,
 )
 from backend.app.models.document import Document, DocumentChunk, FactLedger, Persona, WorkshopJob
+from backend.app.services import skill_loader
 from backend.app.services.document_parser import parse_document
 from backend.app.services.document_storage import (
     EmptyDocumentError,
@@ -49,25 +51,15 @@ from backend.app.services.document_upload_service import create_document_upload
 from backend.app.services.fact_ledger_service import seed_fact_records
 from backend.app.services.index_task_service import enqueue_document_index
 from backend.app.services.llm_client import ChatCompletionConfig, chat_completion_content
+from backend.app.services.skill_loader import SkillLoadError
 
 logger = logging.getLogger(__name__)
 
-WORKSHOP_TRANSFORM_PROMPT = """你是简历材料加工师。用户提供了某求职者的原始简历材料（可能是聊天记录、PDF 文本、课程作业说明等），请把它们加工成适合简历问答系统检索的结构化知识库。
-
-输出必须是 JSON 对象，包含：
-1. persona_profile: 人物档案对象 {name, display_name, summary, education, job_intent, skills, projects}——从材料提取；无法确认的字段省略。
-2. knowledge_documents: 数组，每篇一个主题，结构：
-   {{"filename": "主题_文件名.md", "content": "以 `> 材料主题：类别` 开头的 Markdown（类别限：项目经历/技能专长/教育背景/竞赛奖项/荣誉奖励/证书资格/求职意向/个人特质/自我介绍/综合简历），正文每段只陈述一个完整事实或一个“场景—方案—结果”，用具体名词避免“它/这个/上述”指代"}}
-3. facts: 数组，结构化事实 {{"subject", "predicate", "value", "status": "confirmed|pending"}}——status 只能从材料直接确认时为 confirmed，其余 pending。
-
-硬性要求：
-- 忠于材料：姓名、时间、角色、技术、数字、成果不得补写或拔高；材料中没有的标 [待确认]
-- 区分事实与观点：压测数字、排名、奖项等硬事实照抄原文数字，禁止估算
-- 隐私清洗：身份证号、银行卡、手机号、邮箱、家庭住址等一律删除或替换为“[已脱敏]”，不得进入文档内容
-- 一篇文件只讲一个主题；标题表达具体对象
-
-当前任务输入（第 {batch_index}/{total_batches} 批）：
-{input_text}"""
+# 加工提示词不硬编码在业务代码里（2026-08-14 skill 化）：以
+# .agents/skills/resume-materials-workshop/ 为单一事实来源，由 skill_loader
+# 运行时加载提示词与输出契约；修改加工规则请改 skill 并提升 metadata.version。
+# 历史遗留：旧常量 WORKSHOP_TRANSFORM_PROMPT 中的 {{"filename"}} 双花括号转义
+# 已随迁移修正为 {"filename"}（见 skill README 版本记录）。
 
 
 class WorkshopError(RuntimeError):
@@ -118,12 +110,19 @@ async def transform_materials(
         raise WorkshopError(f"单次最多 {max_files} 份材料")
     if not (WORKSHOP_API_KEY and WORKSHOP_MODEL):
         raise WorkshopError("人物工坊 LLM 未配置（WORKSHOP_API_KEY/WORKSHOP_MODEL）")
+    # skill 规范前置检查：版本与契约以 skill 目录为单一事实来源，缺失即拒绝开工
+    try:
+        skill_version = skill_loader.skill_version()
+        skill_loader.load_output_schema()
+    except SkillLoadError as exc:
+        raise WorkshopError(f"加工 skill 不可用：{exc}") from exc
 
     job = WorkshopJob(
         job_id=uuid4().hex[:16],
         persona_id=persona_id,
         status="running",
         stage="parsing",
+        skill_version=skill_version,
         raw_filenames_json=json.dumps([file.filename or "未命名" for file in files], ensure_ascii=False),
     )
     db.add(job)
@@ -265,10 +264,14 @@ def _split_input_chunks(text: str, max_chars: int) -> list[str]:
 
 
 def _transform_batch(input_text: str, *, batch_index: int, total_batches: int) -> WorkshopResult:
+    try:
+        prompt = skill_loader.load_transform_prompt()
+    except SkillLoadError as exc:
+        raise WorkshopError(f"加工 skill 不可用：{exc}") from exc
     messages = [
         {
             "role": "system",
-            "content": WORKSHOP_TRANSFORM_PROMPT
+            "content": prompt
             .replace("{batch_index}", str(batch_index))
             .replace("{total_batches}", str(total_batches))
             .replace("{input_text}", input_text),
@@ -290,6 +293,11 @@ def _transform_batch(input_text: str, *, batch_index: int, total_batches: int) -
         payload = json.loads(_extract_json_object(content))
     except (json.JSONDecodeError, ValueError) as exc:
         raise WorkshopError("LLM 加工输出不是合法 JSON") from exc
+    try:
+        jsonschema.validate(payload, skill_loader.load_output_schema())
+    except jsonschema.exceptions.ValidationError as exc:
+        # 契约校验失败 → 整批拒绝，不静默降级（skill 1.0.0 起的硬性约束）
+        raise WorkshopError(f"LLM 加工输出不合 skill 契约：{exc.message}") from exc
     profile = payload.get("persona_profile")
     documents = payload.get("knowledge_documents") or payload.get("documents") or []
     facts = payload.get("facts") or []

@@ -61,7 +61,9 @@ ResumeMind-Delivery*/
 *.zip
 *.7z
 *.tar
-.agents/
+.agents/*
+!.agents/skills/
+!.agents/skills/**
 .cache/
 models/
 model_cache/
@@ -84,3 +86,6 @@ docs/
 # 评测产物（本地运行生成，不入库）
 data/eval-report.json
 data/eval-ai-interview-*.json
+# 评测/对比运行产物（本地生成，不入库）
+data/eval-ab-*.json
+data/reranker-parity-*.json

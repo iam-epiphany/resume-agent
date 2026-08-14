@@ -11,6 +11,7 @@ pyjwt
 reportlab
 pymupdf4llm
 FlagEmbedding
+jsonschema
 qdrant-client
 torch
 transformers<5

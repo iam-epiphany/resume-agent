@@ -62,6 +62,9 @@ LABEL org.opencontainers.image.title="Resume RAG Agent" \
 COPY backend/ ./backend/
 COPY scripts/ ./scripts/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
+# 人物工坊 skill（规范驱动：提示词/输出契约/版本以该目录为单一事实来源）
+COPY .agents/skills/ ./agents-skills/
+ENV WORKSHOP_SKILL_DIR=/app/agents-skills/resume-materials-workshop
 
 RUN mkdir -p /app/data/documents/originals /app/data/qdrant /app/data/model_cache
 

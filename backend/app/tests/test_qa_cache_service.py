@@ -32,7 +32,7 @@ def test_db(monkeypatch):
     qa_cache_service.clear()
 
 
-def make_response(answer: str = "我是张三。") -> QAResponse:
+def make_response(answer: str = "我是 Java 后端开发者。") -> QAResponse:
     return QAResponse(
         answer=answer,
         answer_mode="answered",
@@ -59,7 +59,7 @@ class TestLookup:
         qa_cache_service.store(test_db, "请介绍一下你自己", make_response())
         hit = qa_cache_service.lookup(test_db, " 请介绍一下，你 自己？")
         assert hit is not None
-        assert hit.answer == "我是张三。"
+        assert hit.answer == "我是 Java 后端开发者。"
         assert hit.cached is False  # 命中后由 rag_service 置位，服务本身不改
 
     def test_exact_match_increments_hit_count(self, test_db) -> None:
@@ -78,7 +78,7 @@ class TestLookup:
         qa_cache_service.store(test_db, "请介绍一下你自己", make_response())
         hit = qa_cache_service.lookup(test_db, "请介绍一下你自己")
         assert hit is not None
-        assert hit.answer == "我是张三。"
+        assert hit.answer == "我是 Java 后端开发者。"
 
     def test_semantic_match_hits_above_threshold(self, test_db, monkeypatch) -> None:
         # 模拟同义改写：向量相似度 0.98 ≥ 0.93
@@ -91,7 +91,7 @@ class TestLookup:
         qa_cache_service.store(test_db, "介绍一下你自己", make_response())
         hit = qa_cache_service.lookup(test_db, "请做自我介绍")
         assert hit is not None
-        assert hit.answer == "我是张三。"
+        assert hit.answer == "我是 Java 后端开发者。"
 
     def test_semantic_miss_below_threshold(self, test_db, monkeypatch) -> None:
         vectors = {"介绍一下你自己": [1.0, 0.0], "秒杀怎么防超卖": [0.6, 0.8]}
@@ -171,7 +171,7 @@ class TestAnswerQuestionCacheBranch:
         monkeypatch.setattr(
             rag_service.qa_cache_service,
             "lookup",
-            lambda db, q, persona_id="": make_response("我是张三，河南大学本科。"),
+            lambda db, q, persona_id="": make_response("我本科就读于计算机专业。"),
         )
         rag_service.answer_question(test_db, "介绍一下你自己")
         count = test_db.scalar(select(func.count()).select_from(QALog))

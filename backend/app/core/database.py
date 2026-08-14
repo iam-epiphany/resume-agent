@@ -6,11 +6,14 @@ import unicodedata
 from sqlalchemy import create_engine, event, func, inspect, select, text, update
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+from backend.app.core import config
 from backend.app.core.config import DATABASE_PATH, ensure_runtime_dirs
 
 DATABASE_URL = f"sqlite:///{DATABASE_PATH.as_posix()}"
 
-# 默认人物（2026-08-14）：单当前人物模型下，存量库零配置升级的兜底人物
+# 默认人物（2026-08-14）：单当前人物模型下，存量库零配置升级的兜底人物。
+# 不内置任何姓名——默认人物姓名由部署者通过 DEFAULT_PERSONA_NAME 配置，
+# 留空即中性"我/求职者"表述。
 DEFAULT_PERSONA_ID = "default"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -43,8 +46,10 @@ def init_db() -> None:
 
 
 def _seed_default_persona() -> None:
-    """存量/全新库的默认人物（张三）种子：零配置升级、向后兼容。
+    """存量/全新库的默认人物种子：零配置升级、向后兼容。
 
+    默认人物不携带任何具体姓名（DEFAULT_PERSONA_NAME 环境变量可配置部署者自己的
+    名字，留空 = 中性"我/求职者"表述，绝不内置任何人的姓名）。
     已有文档/事实回填到默认人物（persona_id=DEFAULT_PERSONA_ID），
     保证旧库升级后检索过滤不丢数据。
     """
@@ -56,12 +61,12 @@ def _seed_default_persona() -> None:
             db.add(
                 Persona(
                     persona_id=DEFAULT_PERSONA_ID,
-                    name="张三",
-                    display_name="张三",
+                    name=config.DEFAULT_PERSONA_NAME,
+                    display_name=config.DEFAULT_PERSONA_NAME or "我",
                     profile_json=json.dumps(
                         {
-                            "name": "张三",
-                            "summary": "AI 应用后端开发方向，计算机相关专业背景。",
+                            "name": config.DEFAULT_PERSONA_NAME,
+                            "summary": "简历问答系统的默认人物。",
                         },
                         ensure_ascii=False,
                     ),
@@ -97,6 +102,7 @@ def _upgrade_sqlite_schema() -> None:
     index_task_columns = {column["name"] for column in inspector.get_columns("document_index_tasks")} if "document_index_tasks" in table_names else set()
     audit_columns = {column["name"] for column in inspector.get_columns("audit_logs")} if "audit_logs" in table_names else set()
     qa_task_columns = {column["name"] for column in inspector.get_columns("qa_tasks")} if "qa_tasks" in table_names else set()
+    workshop_job_columns = {column["name"] for column in inspector.get_columns("workshop_jobs")} if "workshop_jobs" in table_names else set()
     document_migrations = {
         "client_request_id": "ALTER TABLE documents ADD COLUMN client_request_id VARCHAR(128)",
         "document_metadata": "ALTER TABLE documents ADD COLUMN document_metadata TEXT",
@@ -252,6 +258,14 @@ def _upgrade_sqlite_schema() -> None:
             if "persona_id" not in fact_columns:
                 connection.execute(text("ALTER TABLE fact_ledger ADD COLUMN persona_id VARCHAR(40)"))
                 connection.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_ledger_persona_id ON fact_ledger(persona_id)"))
+        # 人物工坊（2026-08-14）：skill 版本随任务落库（加工规范单一事实来源）
+        if "workshop_jobs" in table_names:
+            workshop_job_migrations = {
+                "skill_version": "ALTER TABLE workshop_jobs ADD COLUMN skill_version VARCHAR(40)",
+            }
+            for column_name, statement in workshop_job_migrations.items():
+                if column_name not in workshop_job_columns:
+                    connection.execute(text(statement))
         # 银行场景遗留表已不再建模（模型已移除 SpreadsheetCell），幂等清理旧库残留
         connection.execute(text("DROP TABLE IF EXISTS spreadsheet_cells"))
 

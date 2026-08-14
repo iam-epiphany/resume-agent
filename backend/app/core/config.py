@@ -374,6 +374,17 @@ WORKSHOP_TIMEOUT_SECONDS = _env_float("WORKSHOP_TIMEOUT_SECONDS", 60.0, minimum=
 # 单次转换最多输入字符数（超出按此分批）；单任务最多文件数
 WORKSHOP_MAX_INPUT_CHARS = _env_int("WORKSHOP_MAX_INPUT_CHARS", 12_000, minimum=500)
 WORKSHOP_MAX_FILES_PER_JOB = _env_int("WORKSHOP_MAX_FILES_PER_JOB", 10, minimum=1)
+# 加工 skill 目录（规范驱动，2026-08-14）：加工提示词 / 输出 JSON 契约 / 版本
+# 以 .agents/skills/resume-materials-workshop/ 为单一事实来源，后端运行时读取；
+# Docker 镜像内通过 ENV 指向 /app/agents-skills/...，本地默认仓库内路径。
+WORKSHOP_SKILL_DIR = os.getenv(
+    "WORKSHOP_SKILL_DIR",
+    str(PROJECT_ROOT / ".agents" / "skills" / "resume-materials-workshop"),
+)
+
+# 默认人物姓名（2026-08-14）：部署者自行配置；留空 = 不注入姓名，
+# 提示词与文案使用中性"我/求职者"表述（系统绝不内置任何人的姓名）
+DEFAULT_PERSONA_NAME = os.getenv("DEFAULT_PERSONA_NAME", "").strip()
 
 
 SUPPORTED_DOCUMENT_MIME_TYPES = {    ".txt": {"text/plain"},

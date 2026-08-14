@@ -17,7 +17,10 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SEED = PROJECT_ROOT / "scripts" / "facts_seed.jsonl"
+# 事实种子是部署者自己的个人数据，默认放 data/（不入 git）；
+# 用 --seed 指向自己的种子文件，例如：
+#   python scripts/seed_fact_ledger.py --seed data/facts_seed.jsonl
+DEFAULT_SEED = PROJECT_ROOT / "data" / "facts_seed.jsonl"
 
 VALID_STATUS = {"confirmed", "pending", "inferred", "conflict"}
 
@@ -50,7 +53,14 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.seed.exists():
-        raise SystemExit(f"种子文件不存在：{args.seed}")
+        raise SystemExit(
+            f"种子文件不存在：{args.seed}
+"
+            "事实种子是部署者自己的个人数据（subject/predicate/value/status/source_file）。
+"
+            "参考格式：{\"fact_id\": \"edu_school\", \"subject\": \"学校名\", \"predicate\": \"学历角色\", "
+            "\"value\": \"本科\", \"status\": \"confirmed\", \"source_file\": \"教育背景.md\"}"
+        )
 
     records = load_seed(args.seed)
     print(f"种子文件：{args.seed.name}，共 {len(records)} 条")

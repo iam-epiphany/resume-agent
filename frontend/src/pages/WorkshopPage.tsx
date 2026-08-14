@@ -204,6 +204,7 @@ export function WorkshopPage() {
                 <th>生成文档</th>
                 <th>事实</th>
                 <th>LLM 调用</th>
+                <th>加工版本</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -221,6 +222,7 @@ export function WorkshopPage() {
                   <td>{job.generated_document_ids.length} 篇</td>
                   <td>{job.generated_fact_count} 条</td>
                   <td>{job.llm_call_count} 次</td>
+                  <td>{job.skill_version ?? "—"}</td>
                   <td>
                     {job.status === "completed" ? (
                       <button className="button button--danger" onClick={() => void handleRollback(job.job_id)}>

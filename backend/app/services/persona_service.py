@@ -13,6 +13,7 @@ from threading import RLock
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from backend.app.core import config
 from backend.app.core.database import DEFAULT_PERSONA_ID
 from backend.app.models.document import Persona
 from backend.app.services.qa_cache_service import clear as clear_qa_cache
@@ -38,13 +39,14 @@ def get_active_persona(db: Session) -> Persona:
         # 兜底：保证至少有一个可用人物（默认人物种子在 init_db 时保证）
         persona = db.scalar(select(Persona).where(Persona.persona_id == DEFAULT_PERSONA_ID).limit(1))
     if persona is None:
-        # 测试库/全新库懒加载种子：与 _seed_default_persona 行为一致（幂等）
+        # 测试库/全新库懒加载种子：与 _seed_default_persona 行为一致（幂等）。
+        # 不内置任何姓名——姓名由部署者通过 DEFAULT_PERSONA_NAME 配置或工坊提取
         persona = Persona(
             persona_id=DEFAULT_PERSONA_ID,
-            name="张三",
-            display_name="张三",
+            name=config.DEFAULT_PERSONA_NAME,
+            display_name=config.DEFAULT_PERSONA_NAME or "我",
             profile_json=json.dumps(
-                {"name": "张三", "summary": "AI 应用后端开发方向，计算机相关专业背景。"},
+                {"name": config.DEFAULT_PERSONA_NAME, "summary": "简历问答系统的默认人物。"},
                 ensure_ascii=False,
             ),
             status="confirmed",
