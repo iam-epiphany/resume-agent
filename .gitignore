@@ -89,3 +89,6 @@ data/eval-ai-interview-*.json
 # 评测/对比运行产物（本地生成，不入库）
 data/eval-ab-*.json
 data/reranker-parity-*.json
+# 本地打包与运行时状态（个人数据，禁止入库）
+backend.zip
+.run-state/
