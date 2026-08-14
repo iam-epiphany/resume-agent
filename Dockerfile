@@ -1,5 +1,7 @@
 FROM node:22-bookworm-slim AS frontend-build
 
+ENV NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
+
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -11,7 +13,10 @@ FROM python:3.13-bookworm AS app
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com \
+    PIP_RETRIES=10 \
+    PIP_TIMEOUT=120 \
     RESUME_MODEL_CACHE_DIR=/app/data/model_cache \
     RESUME_OFFLINE_MODE=true \
     HF_ENDPOINT=https://hf-mirror.com \
@@ -28,6 +33,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN set -eux; \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g; s|http://mirrors.aliyun.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
     for attempt in 1 2 3; do \
         apt-get -o Acquire::Retries=5 update; \
         if DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
@@ -44,12 +50,15 @@ RUN set -eux; \
     done; \
     rm -rf /var/lib/apt/lists/*
 
-# CPU-only build: install CPU torch wheel first, then strip the torch line
-# from the main lockfile so pip does not re-resolve a CUDA-bundled torch.
+# CPU-only build: install CPU torch from the pre-downloaded local wheel
+# (wheels/, gitignored; see scripts/download_torch_wheel.py) when available,
+# otherwise fall back to the online CPU index. Then strip the torch line from
+# the main lockfile so pip does not re-resolve a CUDA-bundled torch.
 COPY requirements.txt requirements-cpu.txt ./
-RUN set -eux; \
+COPY wheels/ /wheels/
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
     python -m pip install --upgrade pip; \
-    python -m pip install -r requirements-cpu.txt; \
+    if ls /wheels/*.whl >/dev/null 2>&1; then python -m pip install /wheels/*.whl; else python -m pip install -r requirements-cpu.txt; fi; \
     grep -v '^torch==' requirements.txt > /tmp/requirements-no-torch.txt; \
     python -m pip install -r /tmp/requirements-no-torch.txt; \
     apt-get purge -y --auto-remove build-essential gcc g++ make

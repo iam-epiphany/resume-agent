@@ -1,3 +1,6 @@
+# 在线回退路径（仅当 wheels/ 目录无 torch wheel 时使用）：
+# 网络正常时可直接用此文件安装；网络不稳定时先跑
+# python scripts/download_torch_wheel.py 预下载 wheel 到 wheels/，构建自动走离线安装。
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.12.1+cpu
 fsspec==2026.4.0
