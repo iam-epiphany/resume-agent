@@ -97,27 +97,27 @@ def test_sufficient_evidence_returns_answered_without_prefix(monkeypatch) -> Non
     assert not result.answer.startswith("根据现有知识库推测")
 
 
-def test_partial_sufficiency_forces_hedge_prefix(monkeypatch) -> None:
+def test_partial_sufficiency_maps_to_hedged_without_prefix(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="可能参与了秒杀项目的核心开发。", evidence_sufficiency="partial")
 
     result = generate_answer("秒杀项目你做了什么？", [_chunk()], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
-    assert result.answer.startswith("根据现有知识库推测，")
-    assert "可能参与了秒杀项目的核心开发。" in result.answer
+    # 分级仅内部记录：回答正文原样保留，不再追加推测前缀
+    assert result.answer == "可能参与了秒杀项目的核心开发。"
 
 
-def test_insufficient_evidence_is_hedged_with_prefix(monkeypatch) -> None:
+def test_insufficient_evidence_is_hedged_without_prefix(monkeypatch) -> None:
     _mock_llm_answer(monkeypatch, answer="简历中未明确提及薪资预期。", evidence_sufficiency="insufficient")
 
     result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
-    assert result.answer.startswith("根据现有知识库推测，")
+    assert result.answer == "简历中未明确提及薪资预期。"
 
 
-def test_llm_provided_hedge_prefix_is_not_duplicated(monkeypatch) -> None:
+def test_llm_provided_hedge_prefix_is_preserved_as_is(monkeypatch) -> None:
     _mock_llm_answer(
         monkeypatch,
         answer="根据现有知识库推测，简历中未明确提及薪资预期。",
@@ -127,8 +127,7 @@ def test_llm_provided_hedge_prefix_is_not_duplicated(monkeypatch) -> None:
     result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
-    assert result.answer.count("根据现有知识库推测") == 1
-    assert result.answer.startswith("根据现有知识库推测，")
+    assert result.answer == "根据现有知识库推测，简历中未明确提及薪资预期。"
 
 
 def test_missing_sufficiency_defaults_to_hedged(monkeypatch) -> None:
@@ -138,7 +137,7 @@ def test_missing_sufficiency_defaults_to_hedged(monkeypatch) -> None:
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
-    assert result.answer.startswith("根据现有知识库推测，")
+    assert result.answer == "推测性回答。"
 
 
 def test_invalid_sufficiency_value_defaults_to_hedged(monkeypatch) -> None:
@@ -177,7 +176,8 @@ def test_sufficient_answer_with_unverified_hard_fact_downgrades_to_hedged(monkey
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
-    assert result.answer.startswith("根据现有知识库推测，")
+    # grounding 降级只改变分级，不改写回答正文
+    assert result.answer == "该材料规定本人必须在2099年完成技能评估。"
     assert "硬事实未在检索证据中核实" in (result.hedge_note or "")
     grounding = result.extra.get("grounding_verification") or {}
     assert grounding.get("verified") is False
@@ -212,8 +212,7 @@ def test_api_unavailable_uses_extractive_fallback(monkeypatch) -> None:
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
     assert result.generation_status == "degraded"
-    assert result.answer.startswith("根据现有知识库推测，")
-    assert "2025年12月31日" in result.answer
+    assert result.answer == "证书有效期至2025年12月31日。"
 
 
 def test_empty_context_with_llm_disabled_returns_failed_fallback(monkeypatch) -> None:

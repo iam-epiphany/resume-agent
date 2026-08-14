@@ -18,7 +18,6 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from backend.app.core.config import HEDGE_PREFIX
 from backend.app.core.database import Base
 from backend.app.models.document import Document, DocumentChunk
 from backend.app.schemas.qa import RetrievalResult
@@ -253,7 +252,7 @@ def test_no_evidence_uses_direct_generation_level_3(
     assert response.retrieval_fallback_level == 3
     assert response.context_package.context_chunks == []
     assert response.answer_mode == "hedged"
-    assert response.answer.startswith(f"{HEDGE_PREFIX}，")
+    assert response.answer == "可能参与了项目核心开发。"  # 正文原样保留，不再加推测前缀
     assert llm_calls and llm_calls[-1]["context_chunks"] == []
 
 
@@ -304,4 +303,4 @@ def test_direct_generation_gate_disabled_keeps_level_0_with_empty_context(
     assert response.context_package.context_chunks == []
     assert llm_calls and llm_calls[-1]["context_chunks"] == []  # LLM still invoked
     assert response.answer_mode == "hedged"
-    assert response.answer.startswith(f"{HEDGE_PREFIX}，")
+    assert response.answer == "可能参与了项目核心开发。"  # 正文原样保留，不再加推测前缀

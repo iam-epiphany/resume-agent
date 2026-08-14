@@ -1,13 +1,11 @@
 import type { ReactNode } from "react";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import type { PublicCitation } from "../types/api";
 
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   answerMode?: string;
-  citations?: PublicCitation[];
   status: "streaming" | "done" | "error" | "cancelled";
 }
 

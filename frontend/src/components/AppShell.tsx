@@ -48,7 +48,7 @@ export function AppShell({ path, onNavigate, children }: AppShellProps) {
     <div className="app-shell">
       <aside className="sidebar">
         <button className="brand" type="button" onClick={() => onNavigate("/")} aria-label="进入 ResumeMind 智能问答">
-          <span className="brand-mark"><BrandMark size={38} /></span>
+          <span className="brand-mark"><BrandMark size={46} /></span>
           <span>
             <strong>ResumeMind</strong>
             <small>个人简历智能问答</small>

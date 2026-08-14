@@ -2,7 +2,8 @@ import { AlertTriangle, KeyRound, MessageSquareText } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { qaAccessStatus, qaAccessSubmit, type QAAccessStatus } from "../api/qa";
-import { getActivePersona, type PersonaPublic } from "../api/workshop";
+import { getActivePersona } from "../api/workshop";
+import { BrandMark } from "../components/BrandMark";
 import { QuestionComposer } from "../components/qa/QuestionComposer";
 import { QuestionHistoryDrawer } from "../components/qa/QuestionHistoryDrawer";
 import { useAuth } from "../state/authContext";
@@ -176,7 +177,6 @@ export function RagPage() {
       messages: updateLastAssistant(thread.messages, {
         content: answer.answer ?? "",
         answerMode: answer.answer_mode,
-        citations: answer.citations ?? undefined,
         status: "done",
       }),
     }));
@@ -318,8 +318,23 @@ export function RagPage() {
       <div className="chat-thread" ref={threadRef} aria-label="对话记录">
         {messages.length === 0 ? (
           <div className="chat-empty">
+            <span className="chat-empty__brand" aria-hidden="true">
+              <BrandMark size={40} />
+            </span>
             <h2>您想了解我什么？</h2>
-            <p>可以问我任何关于我的问题，比如项目经历、技术栈或求职意向。</p>
+            <p>可以问我任何关于我的问题，比如项目经历、技术栈或求职意向。点击下方问题可直接填入输入框。</p>
+            <div className="chat-empty__questions">
+              {SUGGESTED_QUESTIONS.map((question) => (
+                <button
+                  key={question}
+                  className="chat-suggestion"
+                  type="button"
+                  onClick={() => qa.setDraftQuestion(question)}
+                >
+                  {question}
+                </button>
+              ))}
+            </div>
           </div>
         ) : (
           messages.map((message) => <ChatBubble key={message.id} message={message} />)
@@ -338,22 +353,6 @@ export function RagPage() {
         message={qa.message || undefined}
       />
 
-      {/* 常见问题：放在输入框下方 */}
-      <div className="chat-suggestions">
-        <span className="chat-suggestions__label">提出较多的问题：</span>
-        {SUGGESTED_QUESTIONS.map((question) => (
-          <button
-            key={question}
-            className="chat-suggestion"
-            type="button"
-            disabled={active}
-            onClick={() => qa.setDraftQuestion(question)}
-          >
-            {question}
-          </button>
-        ))}
-      </div>
-
       <QuestionHistoryDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} onRestore={qa.restoreTask} />
     </main>
   );
@@ -369,48 +368,36 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   }
 
   const thinking = message.status === "streaming" && !message.content;
+  // 仅保留「已引导至简历话题」一种提示；hedged 分级不再向用户展示
   const badge =
-    message.answerMode === "hedged"
-      ? { text: "基于知识库推测", tone: "hedged" }
-      : message.answerMode === "redirected"
-        ? { text: "已引导至简历话题", tone: "redirected" }
-        : null;
-  const citations = message.citations ?? [];
+    message.answerMode === "redirected"
+      ? { text: "已引导至简历话题", tone: "redirected" }
+      : null;
 
   return (
     <div className="chat-message chat-message--assistant">
-      {thinking ? (
-        // 思考中：三个跳动点直接展示，不用聊天框包裹
-        <span className="chat-thinking" role="status" aria-label="思考中">
-          <span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span>
-        </span>
-      ) : (
-        <div className="chat-bubble-stack">
-          {badge ? <span className={`answer-mode-badge answer-mode-badge--${badge.tone}`}>{badge.text}</span> : null}
-          <div className="chat-bubble chat-bubble--assistant">{message.content}</div>
-          {citations.length > 0 ? (
-            <ul className="answer-citations" aria-label="回答依据">
-              {citations.map((citation, index) => (
-                <li key={`${citation.source_doc}-${citation.section_title ?? ""}-${index}`} className="answer-citations__item">
-                  <span className="answer-citations__source">
-                    {citation.source_doc}
-                    {citation.section_title ? ` · ${citation.section_title}` : ""}
-                    {citation.fact_status === "confirmed" ? " · 已核实" : ""}
-                  </span>
-                  {citation.excerpt ? (
-                    <span className="answer-citations__excerpt">“{citation.excerpt}”</span>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          ) : null}
-          {message.status === "error" ? (
-            <span className="chat-message__status">回答未完成</span>
-          ) : message.status === "cancelled" ? (
-            <span className="chat-message__status">已停止</span>
-          ) : null}
-        </div>
-      )}
+      <span className="chat-avatar" aria-hidden="true">
+        <BrandMark size={24} />
+      </span>
+      <div className="chat-bubble-stack">
+        <span className="chat-author">ResumeMind</span>
+        {thinking ? (
+          // 思考中：三个跳动点直接展示，不用聊天框包裹
+          <span className="chat-thinking" role="status" aria-label="思考中">
+            <span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span>
+          </span>
+        ) : (
+          <>
+            {badge ? <span className={`answer-mode-badge answer-mode-badge--${badge.tone}`}>{badge.text}</span> : null}
+            <div className="chat-bubble chat-bubble--assistant">{message.content}</div>
+            {message.status === "error" ? (
+              <span className="chat-message__status">回答未完成</span>
+            ) : message.status === "cancelled" ? (
+              <span className="chat-message__status">已停止</span>
+            ) : null}
+          </>
+        )}
+      </div>
     </div>
   );
 }

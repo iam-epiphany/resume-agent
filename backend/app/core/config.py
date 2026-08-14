@@ -262,9 +262,6 @@ CONVERSATION_MEMORY_ENABLED = _env_bool("CONVERSATION_MEMORY_ENABLED", True)
 CONVERSATION_MEMORY_MAX_TURNS = _env_int("CONVERSATION_MEMORY_MAX_TURNS", 8, minimum=1)
 CONVERSATION_MEMORY_TTL_HOURS = _env_float("CONVERSATION_MEMORY_TTL_HOURS", 24.0, minimum=0.1)
 
-# 推测标注前缀（证据不足时后端强制给回答加的前缀，保证措辞统一）
-HEDGE_PREFIX = os.getenv("HEDGE_PREFIX", "根据现有知识库推测").strip() or "根据现有知识库推测"
-
 # ---- grounding 确定性硬事实校验（2026-08-08）----
 # 生成后校验答案中的数字/日期/书名号专名是否能在检索证据中找到；
 # LLM 自评 sufficient 但硬事实校验失败 → 强制降级 hedged（防"自己生成、自己判断"盲区）。

@@ -22,7 +22,6 @@ from backend.app.core.config import (
     ANSWER_GENERATION_STREAM,
     ANSWER_GENERATION_TIMEOUT_SECONDS,
     GROUNDING_VERIFY_ENABLED,
-    HEDGE_PREFIX,
 )
 from backend.app.schemas.qa import RetrievalResult
 from backend.app.services.prompt_builder import RAGPromptBuilder
@@ -102,7 +101,8 @@ def generate_answer(
 
     - greeting / off_topic → 礼貌转移（零 LLM）
     - 其余 → 单次 LLM 调用输出 {answer, evidence_sufficiency, reason}
-    - 自评 partial/insufficient → hedged 模式，后端强制"根据现有知识库推测"前缀（唯一一次）
+    - 自评 partial/insufficient → hedged 模式：分级与原因仅记录于日志/审计，
+      回答正文不再附加推测前缀（2026-08-15 起面向用户隐藏分级标注）
     - no_evidence（兜底链第 3 级）：无检索证据，限制为 persona 软信息，硬事实必须说明未收录
     - LLM 异常 → 摘录兜底（hedged）；无上下文且 LLM 异常 → 礼貌兜底文案
     - known_entities：知识库已知的简历领域实体（学校/项目/奖项/证书/技术栈等），
@@ -196,11 +196,10 @@ def _apply_confidence_mode(
     ledger_facts: list[Any] | None = None,
     intent: str = "resume_qa",
 ) -> GeneratedAnswer:
-    """按自评结果分级；partial/insufficient 时由系统统一加推测前缀（且只加一次）。
+    """按自评结果分级；partial/insufficient 时保持 hedged 分级（仅内部记录）。
 
-    旧实现同时让 LLM 自写前缀 + 后端 prepend，出现过"根据现有知识库推测"双前缀
-    （LLM 中途插入 + 后端开头追加）。现在前缀完全由系统管理：先剥掉 LLM 在
-    开头自写的（含旧 prompt 历史行为的残留），再精确 prepend 一次。
+    2026-08-15 起不再给回答正文追加"根据现有知识库推测"前缀——面向面试官
+    的分级标注已移除，hedged 仅保留在 answer_mode / hedge_note 中供日志审计。
 
     Grounding 硬事实校验：LLM 自评 sufficient 时，仍用确定性校验器核对答案中的
     数字/日期/书名号专名是否在检索证据中——缺失则降级 hedged（防"自己生成、
@@ -252,21 +251,11 @@ def _apply_confidence_mode(
         generated.answer_mode = "hedged"
         generated.evidence_sufficiency = "partial"
         generated.hedge_note = "；".join(downgrade_reasons)
-        answer = (generated.answer or "").strip()
-        while answer.startswith(HEDGE_PREFIX):
-            answer = answer[len(HEDGE_PREFIX):].lstrip("，,。;； ")
-        answer = answer.strip()
-        generated.answer = f"{HEDGE_PREFIX}，{answer}" if answer else HEDGE_PREFIX
         return generated
     if generated.evidence_sufficiency == "sufficient":
         generated.answer_mode = "answered"
         return generated
     generated.answer_mode = "hedged"
-    answer = (generated.answer or "").strip()
-    while answer.startswith(HEDGE_PREFIX):
-        answer = answer[len(HEDGE_PREFIX):].lstrip("，,。;； ")
-    answer = answer.strip()
-    generated.answer = f"{HEDGE_PREFIX}，{answer}" if answer else HEDGE_PREFIX
     return generated
 
 
@@ -603,7 +592,7 @@ def _read_streaming_llm_content(
 
 
 def _extractive_fallback(context_chunks: list[RetrievalResult]) -> GeneratedAnswer | None:
-    """简化摘录兜底：取 top chunk 原文片段，hedged 标注。"""
+    """简化摘录兜底：取 top chunk 原文片段，hedged 标注（分级仅内部记录）。"""
     if not context_chunks:
         return None
     chunk = context_chunks[0]
@@ -611,7 +600,7 @@ def _extractive_fallback(context_chunks: list[RetrievalResult]) -> GeneratedAnsw
     if not excerpt:
         return None
     return GeneratedAnswer(
-        answer=f"{HEDGE_PREFIX}，{excerpt}",
+        answer=excerpt,
         answer_mode="hedged",
         evidence_sufficiency="partial",
         hedge_note="LLM 生成失败，直接摘录知识库原文",

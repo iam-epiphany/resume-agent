@@ -8,7 +8,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.139-009688?logo=fastapi&logoColor=white)](backend/main.py)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/)
 [![Qdrant](https://img.shields.io/badge/Qdrant-vector%20DB-DC244C?logo=qdrant&logoColor=white)](docker-compose.yml)
-[![Tests](https://img.shields.io/badge/tests-436%20passed-2ea44f)](backend/app/tests/)
+[![Tests](https://img.shields.io/badge/tests-460%20passed-2ea44f)](backend/app/tests/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#)
 
 *Resume · Certificates · Projects → 检索增强生成 → 面试官自然语言提问，证据式回答*
@@ -33,8 +33,30 @@
 | 💬 **多轮追问记忆** | 会话级记忆 + 指代消解（"那怎么解决的？"→ 自动补全前文对象），8 轮 × 24h TTL |
 | 🔐 **访客访问码闸** | 简历附 6 位访问码，输入一次签发 24h httpOnly cookie；输错阶梯锁定（3 次→1min→5→10→30→60min 封顶）+ 每 IP 累计配额 + 全局每日预算保险丝 |
 | 📎 **安全出处** | 匿名访客看到 `citations`（来源文件名 + 章节 + 80 字摘录 + 事实状态），内部 Prompt 与检索全文一律不外泄 |
-| 🛠️ **人物工坊** | 任意简历材料上传 → LLM 加工为一主题一文件的检索知识库 + 人物档案 + 事实台账（自动入库、一键回滚），切换人物即切换问答主体 |
+| 🛠️ **人物工坊** | 任意简历材料上传 → LLM 加工为一主题一文件的检索知识库 + 人物档案 + 事实台账（自动入库、一键回滚），切换人物即切换问答主体；加工规则以 Agent Skill 为单一事实来源（见下） |
 | 📊 **端到端评测体系** | 30 道 AI 应用后端面试题集 + Recall@5 / MRR / 上下文精确率 / 事实关联 / 拒答正确率 / TTFT / 重排耗时 等 10+ 指标，`python scripts/eval_interview_set.py --data scripts/eval_cases_ai_interview.jsonl --stream` |
+
+## 🧠 Skill 规范驱动：加工规则以 Skill 为单一事实来源
+
+人物工坊的加工规则不埋在业务代码里，而是沉淀为一个可复用的 Agent Skill
+（`.agents/skills/resume-materials-workshop/`）——**同一份规则同时驱动两种执行者**：
+
+- **人机协作**：在 AI 助手侧粘贴原始材料时，skill 作为交互技能直接执行；
+- **后端 API**：`POST /api/workshop/transform` 经 `skill_loader.py` 运行时读取同一目录的提示词与契约。
+
+Skill 目录即「规则即代码」：
+
+| 组成 | 说明 |
+|---|---|
+| `SKILL.md` | 工作流 + 质量红线（忠于材料/事实与观点分离/隐私清洗），frontmatter `metadata.version` 为版本唯一来源 |
+| `references/transform-prompt.md` | 「材料加工师」System Prompt 全文，按批次注入输入文本 |
+| `references/output-schema.json` | LLM 输出 JSON 契约，`jsonschema` 校验不通过不降级入库 |
+| `assets/sample-output.json` | 黄金样例，契约/提示词改动后自测回归 |
+| `scripts/self_test.py` | 离线自测：契约合法、黄金样例通过、非法输出被拒 |
+
+- **改规则不改代码**：调整提示词或契约 → 升 `metadata.version` → 后端热读生效，无需发版；版本随每次任务落库 `workshop_jobs.skill_version`，前端任务表可见。
+- **fail-closed**：skill 目录缺失、契约非法时任务直接报错，宁可失败也不进行无版本、无契约的静默加工。
+- **人机一致**：交互式加工与 API 加工走同一份提示词与校验；规则冲突时以 skill 目录为准。
 
 ## 🏗️ 架构
 
@@ -133,6 +155,7 @@ Resume-Agent/
     models/            # SQLAlchemy 模型（含 fact_ledger）
   frontend/            # React + TS + Vite
   scripts/             # 知识库上传 / 台账导入 / 部署预检 / 面试题评测
+  .agents/skills/      # resume-materials-workshop：加工规则单一事实来源（提示词/契约/版本/自测）
   docs/                # 知识库素材（简历/证书/荣誉/项目介绍，一主题一文件）
   docs-guide/          # 部署指南 / 评测报告 / 修订清单
   docker-compose.yml   # app + qdrant（纯 CPU）

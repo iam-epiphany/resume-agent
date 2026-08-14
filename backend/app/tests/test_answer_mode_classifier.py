@@ -3,8 +3,8 @@
 
 矩阵：
 - sufficient → answered（无推测前缀）
-- partial / insufficient / 缺失 / 非法值 → hedged（后端强制“根据现有知识库推测”前缀；
-  LLM 自带前缀时不重复添加）
+- partial / insufficient / 缺失 / 非法值 → hedged（分级仅内部记录，回答正文不再加前缀；
+  LLM 自带前缀时原样保留、不做加工）
 - greeting / off_topic → redirected（礼貌模板文案，零 LLM）
 - 空上下文 + LLM 关闭/异常 → failed（FALLBACK_NO_CONTEXT）
 """
@@ -14,7 +14,6 @@ import pytest
 from backend.app.services import answer_generation_service
 from backend.app.services.answer_generation_service import (
     FALLBACK_NO_CONTEXT,
-    HEDGE_PREFIX,
     _greeting_copy,
     _off_topic_copy,
     GeneratedAnswer,
@@ -62,63 +61,62 @@ def _mock_llm(monkeypatch, *, answer: str, evidence_sufficiency=None) -> None:
 # 映射矩阵：证据充分度 → 回答模式
 # ---------------------------------------------------------------------------
 
-def test_sufficient_maps_to_answered_without_prefix(monkeypatch) -> None:
+def test_sufficient_maps_to_answered_without_hedging(monkeypatch) -> None:
     _mock_llm(monkeypatch, answer="证书有效期至2025年12月31日。", evidence_sufficiency="sufficient")
 
     result = generate_answer("证书有效期是什么？", _chunk(), intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "answered"
     assert result.evidence_sufficiency == "sufficient"
-    assert not result.answer.startswith(HEDGE_PREFIX)
+    assert result.answer == "证书有效期至2025年12月31日。"
 
 
 @pytest.mark.parametrize("sufficiency", ["partial", "insufficient"])
-def test_partial_and_insufficient_map_to_hedged_with_forced_prefix(monkeypatch, sufficiency) -> None:
+def test_partial_and_insufficient_map_to_hedged_without_prefix(monkeypatch, sufficiency) -> None:
     _mock_llm(monkeypatch, answer="推测性回答内容。", evidence_sufficiency=sufficiency)
 
     result = generate_answer("某个没有直接依据的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == sufficiency
-    assert result.answer.startswith(f"{HEDGE_PREFIX}，")
-    assert "推测性回答内容。" in result.answer
+    # 分级仅内部记录：回答正文原样保留，不再追加推测前缀
+    assert result.answer == "推测性回答内容。"
 
 
-def test_llm_provided_prefix_is_kept_without_duplication(monkeypatch) -> None:
+def test_llm_provided_prefix_is_preserved_as_is(monkeypatch) -> None:
     _mock_llm(
         monkeypatch,
-        answer=f"{HEDGE_PREFIX}，简历中未明确提及薪资预期。",
+        answer="根据现有知识库推测，简历中未明确提及薪资预期。",
         evidence_sufficiency="insufficient",
     )
 
     result = generate_answer("期望薪资是多少？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
-    assert result.answer.count(HEDGE_PREFIX) == 1
-    assert result.answer == f"{HEDGE_PREFIX}，简历中未明确提及薪资预期。"
+    assert result.answer == "根据现有知识库推测，简历中未明确提及薪资预期。"
 
 
-def test_llm_provided_prefix_without_comma_is_not_duplicated(monkeypatch) -> None:
+def test_llm_provided_prefix_without_comma_is_kept_unchanged(monkeypatch) -> None:
     _mock_llm(
         monkeypatch,
-        answer=f"{HEDGE_PREFIX}薪资方面没有直接记录。",
+        answer="根据现有知识库推测薪资方面没有直接记录。",
         evidence_sufficiency="partial",
     )
 
     result = generate_answer("薪资如何？", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
-    assert result.answer.count(HEDGE_PREFIX) == 1
+    assert result.answer == "根据现有知识库推测薪资方面没有直接记录。"
 
 
-def test_missing_sufficiency_maps_to_hedged_with_forced_prefix(monkeypatch) -> None:
+def test_missing_sufficiency_maps_to_hedged(monkeypatch) -> None:
     _mock_llm(monkeypatch, answer="没有给出自评的回答。", evidence_sufficiency=None)
 
     result = generate_answer("未自评的问题", [], intent=INTENT_RESUME_QA)
 
     assert result.answer_mode == "hedged"
     assert result.evidence_sufficiency == "partial"
-    assert result.answer.startswith(f"{HEDGE_PREFIX}，")
+    assert result.answer == "没有给出自评的回答。"
 
 
 def test_invalid_sufficiency_maps_to_hedged(monkeypatch) -> None:
