@@ -86,13 +86,17 @@
 # 1. 配置 .env（LLM_API_KEY、ADMIN_PASSWORD、可选 QA_ACCESS_CODE）
 cp .env.example .env
 
-# 2. 构建并启动（纯 CPU 镜像，2C4G 即可）
+# 2. （可选，网络不稳定时）预下载 torch CPU wheel，构建走离线安装
+python scripts/download_torch_wheel.py
+
+# 3. 构建并启动（纯 CPU 镜像，2C4G 即可；有 wheels/*.whl 时自动离线安装 torch）
 docker compose up -d --build
 
-# 3. 上传知识库（docs/ 下的简历/证书/项目介绍 → 解析分块 → 索引）
+# 4. 上传知识库（docs/ 下的简历/证书/项目介绍 → 解析分块 → 索引）
 python scripts/upload_knowledge_base.py --sync
 
-# 4. 打开 http://127.0.0.1:8000 提问；左下角登录进入管理后台
+# 5. 打开 http://127.0.0.1:8000 提问；左下角登录进入管理后台
+#    （端口可用 .env 的 RESUME_APP_PORT 调整）
 ```
 
 上线前先跑预检：
