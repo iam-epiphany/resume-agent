@@ -2,11 +2,12 @@
 
 用法（服务器部署后）:
     python scripts/upload_knowledge_base.py --base-url http://127.0.0.1:8000
-    python scripts/upload_knowledge_base.py --base-url http://127.0.0.1:8000 --root docs
+    python scripts/upload_knowledge_base.py --base-url http://127.0.0.1:8000 --sync
 
 规则:
     - 收录扩展名: pdf/doc/docx/md/txt/html/htm
-    - 自动排除: .git/.venv/node_modules/__pycache__/.idea/dist/outputs/data/.run-state
+    - 默认只收录 docs/ 第一层的正式知识库 Markdown，避免把原始资料、评测报告或系统说明混入
+    - --include-nested 才递归扫描；仅用于已人工审核的独立资料目录
     - jpg/png 等图片无 OCR 解析能力，扫描时列出并跳过（建议先转成 PDF 再入库）
 """
 
@@ -33,7 +34,7 @@ SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".md", ".txt", ".html", ".htm"}
 EXCLUDED_DIRS = {
     ".git", ".venv", "node_modules", "__pycache__", ".idea", ".pytest_cache",
     "dist", "outputs", "data", ".run-state", ".github", "frontend", "backend",
-    "scripts", "docs-guide", "项目",  # docs/项目 为源码归档，不进知识库
+    "scripts", "docs-guide", "项目", "资源（仅供参考生成知识库文件）",  # docs/项目 为源码归档，不进知识库
 }
 
 
@@ -109,13 +110,17 @@ def warmup_models(base_url: str, timeout: float) -> None:
     print(f"模型预热完成: warmed={payload.get('warmed')} elapsed={elapsed:.1f}s")
 
 
-def scan_documents(root: Path) -> tuple[list[Path], list[Path]]:
-    """递归扫描 root，返回 (可上传文件列表, 图片文件列表)。"""
+def scan_documents(root: Path, *, include_nested: bool = False) -> tuple[list[Path], list[Path]]:
+    """扫描 root，返回 (可上传文件列表, 图片文件列表)。默认只扫描第一层。"""
     files: list[Path] = []
     images: list[Path] = []
+    candidates = root.rglob("*") if include_nested else root.iterdir()
     # 规范化文字版是问答口径基线；同一简历 PDF 再入库只会制造重复 chunk。
-    has_canonical_resume = any(path.is_file() for path in root.rglob("简历文字版.md"))
-    for path in sorted(root.rglob("*")):
+    has_canonical_resume = any(
+        path.is_file() and path.name == "简历文字版.md"
+        for path in (root.rglob("简历文字版.md") if include_nested else root.glob("简历文字版.md"))
+    )
+    for path in sorted(candidates):
         if not path.is_file():
             continue
         try:
@@ -411,7 +416,8 @@ def qdrant_collection_points(base_url: str, timeout: float) -> int | None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="上传知识库文档到 ResumeMind")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--root", type=Path, default=PROJECT_ROOT, help="扫描根目录（默认项目根，即 docs/ 会被收录）")
+    parser.add_argument("--root", type=Path, default=PROJECT_ROOT / "docs", help="扫描根目录（默认 docs/ 第一层正式知识库）")
+    parser.add_argument("--include-nested", action="store_true", help="递归扫描子目录；仅用于已人工审核的资料目录")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--poll-interval", type=float, default=5.0)
     parser.add_argument("--ingest-timeout-minutes", type=float, default=120.0)
@@ -421,6 +427,7 @@ def main() -> int:
     parser.add_argument("--delete", action="append", dest="delete_names", metavar="文件名",
                         help="按文件名删除知识库中的文档（可多次指定）")
     parser.add_argument("--purge", action="store_true", help="清空知识库中所有文档")
+    parser.add_argument("--sync", action="store_true", help="删除服务端中不在本次扫描清单的旧文档，然后上传当前清单")
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
@@ -449,12 +456,20 @@ def main() -> int:
         return 0
 
     print(f"扫描根目录: {root}")
-    files, images = scan_documents(root)
+    files, images = scan_documents(root, include_nested=args.include_nested)
     if not files:
         raise RuntimeError(f"{root} 下未找到可上传的文档（支持 {sorted(SUPPORTED_EXTENSIONS)}）。")
     print(f"待上传文档: {len(files)} 个")
     for path in files:
         print(f"  - {path.relative_to(root)}")
+
+    if args.sync:
+        expected_names = {path.name for path in files}
+        existing_names = existing_documents_by_filename(base_url, args.timeout)
+        stale_names = sorted(set(existing_names) - expected_names)
+        if stale_names:
+            print("\n同步模式：删除不在当前清单中的旧文档：")
+            delete_documents(base_url, filenames=stale_names, timeout=args.timeout)
 
     if images:
         print(f"\n发现 {len(images)} 个图片文件（无 OCR 解析能力，跳过）：")

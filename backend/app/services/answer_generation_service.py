@@ -32,8 +32,15 @@ from backend.app.services.llm_client import (
     open_chat_completion,
 )
 from backend.app.services.performance_metrics import measure
-from backend.app.services.intent_router_service import INTENT_GREETING, INTENT_OFF_TOPIC
+from backend.app.services.intent_router_service import (
+    INTENT_GREETING,
+    INTENT_OFF_TOPIC,
+    INTENT_RESUME_FACT,
+    INTENT_TECH_GENERAL,
+    evidence_policy_for,
+)
 from backend.app.services.grounding_verification_service import verify_hard_facts
+from backend.app.services.fact_ledger_service import check_answer as check_answer_against_ledger
 
 CancellationChecker = Callable[[], None]
 PreviewReporter = Callable[[str], None]
@@ -68,6 +75,13 @@ FALLBACK_NO_CONTEXT = (
     "你可以换个角度问我，比如教育背景、项目经历、专业技能、荣誉奖项或求职意向方面的问题。"
 )
 
+# 个人硬事实口径（2026-08-14）：事实类问题证据不足时明确"未记录/待确认"，
+# 不做推测、不引导——面试官更能接受"材料没有记录"，而不是错误的数字或虚构经历。
+FACT_NO_EVIDENCE = (
+    "这个问题在当前材料中没有记录，我不能替你确认；具体信息请以本人实际经历为准。"
+    "如果你愿意，我可以基于材料回答他的教育背景、项目经历或技能细节。"
+)
+
 
 def generate_answer(
     question: str,
@@ -79,6 +93,9 @@ def generate_answer(
     preview_reporter: PreviewReporter | None = None,
     no_evidence: bool = False,
     known_entities: list[str] | None = None,
+    force_extractive: bool = False,
+    timeout_override: float | None = None,
+    ledger_facts: list[Any] | None = None,
 ) -> GeneratedAnswer:
     """单次 LLM 生成 + 答案自评 + 置信度分级。
 
@@ -89,6 +106,8 @@ def generate_answer(
     - LLM 异常 → 摘录兜底（hedged）；无上下文且 LLM 异常 → 礼貌兜底文案
     - known_entities：知识库已知的简历领域实体（学校/项目/奖项/证书/技术栈等），
       用于 grounding 校验——答案中出现但证据缺失的已知实体被标记为未核实
+    - force_extractive（硬时间预算）：跳过 LLM 生成，直接摘录知识库原文
+    - timeout_override（硬时间预算）：按剩余预算收紧 LLM 调用超时（秒）
     """
     if intent == INTENT_GREETING:
         return _redirected(POLITE_REDIRECT_GREETING)
@@ -96,26 +115,40 @@ def generate_answer(
         return _redirected(POLITE_REDIRECT_OFF_TOPIC)
 
     generated: GeneratedAnswer | None = None
-    if ANSWER_GENERATION_ENABLED and ANSWER_GENERATION_API_KEY:
+    if not force_extractive and ANSWER_GENERATION_ENABLED and ANSWER_GENERATION_API_KEY:
         try:
             generated = _call_llm(
                 question,
                 context_chunks,
+                intent=intent,
                 llm_prompt=llm_prompt,
                 cancellation_checker=cancellation_checker,
                 preview_reporter=preview_reporter,
                 no_evidence=no_evidence,
+                timeout_override=timeout_override,
             )
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             logger.warning("LLM 回答生成失败，降级: %s: %s", type(exc).__name__, exc)
             generated = None
     if generated is not None and (generated.answer or "").strip():
-        return _apply_confidence_mode(generated, context_chunks, known_entities=known_entities)
+        # 个人硬事实口径（fact_strict）：证据不足（insufficient/partial）时确定性替换为
+        # "材料未记录/待确认"文案——面试场景下错误数字比"没记录"伤害大得多，
+        # 禁止推测式硬事实回答（2026-08-14 收紧：partial 同样拒答）
+        if intent == INTENT_RESUME_FACT and generated.evidence_sufficiency != "sufficient":
+            return _redirected(FACT_NO_EVIDENCE, mode="failed")
+        return _apply_confidence_mode(
+            generated,
+            context_chunks,
+            known_entities=known_entities,
+            ledger_facts=ledger_facts,
+            intent=intent,
+        )
 
     fallback = _extractive_fallback(context_chunks)
     if fallback is not None and (fallback.answer or "").strip():
         return fallback
-    return _redirected(FALLBACK_NO_CONTEXT, mode="failed")
+    no_context = FACT_NO_EVIDENCE if intent == INTENT_RESUME_FACT else FALLBACK_NO_CONTEXT
+    return _redirected(no_context, mode="failed")
 
 
 def _redirected(text: str, mode: AnswerMode = "redirected") -> GeneratedAnswer:
@@ -132,6 +165,8 @@ def _apply_confidence_mode(
     context_chunks: list[RetrievalResult],
     *,
     known_entities: list[str] | None = None,
+    ledger_facts: list[Any] | None = None,
+    intent: str = "resume_qa",
 ) -> GeneratedAnswer:
     """按自评结果分级；partial/insufficient 时由系统统一加推测前缀（且只加一次）。
 
@@ -141,13 +176,24 @@ def _apply_confidence_mode(
 
     Grounding 硬事实校验：LLM 自评 sufficient 时，仍用确定性校验器核对答案中的
     数字/日期/书名号专名是否在检索证据中——缺失则降级 hedged（防"自己生成、
-    自己判断"的高估盲区）。校验结果写入 extra 供 qa_logs/调试观测。
+    自己判断"的高估盲区）。tech_general（通用技术原理）例外：教科书式数字
+    （链表转树阈值、负载因子等）属通用知识，不做 presence 校验——
+    "通用知识与本人实践分离"由 tech_split 提示词规则约束。
+    校验结果写入 extra 供 qa_logs/调试观测。
+
+    事实台账校验（2026-08-14）：presence-only 校验之上再做「实体—属性—值」
+    归属检查——A 项目的指标安到 B 项目、pending 事实被引用等错配同样强制降级。
     """
     sufficiency = generated.evidence_sufficiency or "partial"
     generated.evidence_sufficiency = (
         sufficiency if sufficiency in {"sufficient", "partial", "insufficient"} else "partial"
     )
-    if generated.evidence_sufficiency == "sufficient" and GROUNDING_VERIFY_ENABLED:
+    downgrade_reasons: list[str] = []
+    if (
+        generated.evidence_sufficiency == "sufficient"
+        and GROUNDING_VERIFY_ENABLED
+        and intent != INTENT_TECH_GENERAL
+    ):
         evidence_texts = [
             part
             for chunk in context_chunks
@@ -157,8 +203,6 @@ def _apply_confidence_mode(
         grounding = verify_hard_facts(generated.answer, evidence_texts, known_entities=known_entities)
         generated.extra["grounding_verification"] = grounding.to_dict()
         if not grounding.verified:
-            generated.answer_mode = "hedged"
-            generated.evidence_sufficiency = "partial"
             missing_parts = []
             if grounding.missing_numbers:
                 missing_parts.append(f"数字 {len(grounding.missing_numbers)}")
@@ -168,15 +212,24 @@ def _apply_confidence_mode(
                 missing_parts.append(f"专名 {len(grounding.missing_names)}")
             if grounding.missing_entities:
                 missing_parts.append(f"实体 {len(grounding.missing_entities)}")
-            generated.hedge_note = (
+            downgrade_reasons.append(
                 f"硬事实未在检索证据中核实：{'、'.join(missing_parts) or '无'}"
             )
-            answer = (generated.answer or "").strip()
-            while answer.startswith(HEDGE_PREFIX):
-                answer = answer[len(HEDGE_PREFIX):].lstrip("，,。;； ")
-            answer = answer.strip()
-            generated.answer = f"{HEDGE_PREFIX}，{answer}" if answer else HEDGE_PREFIX
-            return generated
+    if ledger_facts and GROUNDING_VERIFY_ENABLED:
+        ledger_check = check_answer_against_ledger(generated.answer, ledger_facts)
+        generated.extra["fact_ledger_check"] = ledger_check.to_dict()
+        if ledger_check.mismatches:
+            downgrade_reasons.append(f"事实归属校验失败：{'；'.join(ledger_check.mismatches)}")
+    if downgrade_reasons:
+        generated.answer_mode = "hedged"
+        generated.evidence_sufficiency = "partial"
+        generated.hedge_note = "；".join(downgrade_reasons)
+        answer = (generated.answer or "").strip()
+        while answer.startswith(HEDGE_PREFIX):
+            answer = answer[len(HEDGE_PREFIX):].lstrip("，,。;； ")
+        answer = answer.strip()
+        generated.answer = f"{HEDGE_PREFIX}，{answer}" if answer else HEDGE_PREFIX
+        return generated
     if generated.evidence_sufficiency == "sufficient":
         generated.answer_mode = "answered"
         return generated
@@ -193,23 +246,30 @@ def _call_llm(
     question: str,
     context_chunks: list[RetrievalResult],
     *,
+    intent: str = "resume_qa",
     llm_prompt: str | None = None,
     cancellation_checker: CancellationChecker | None = None,
     preview_reporter: PreviewReporter | None = None,
     no_evidence: bool = False,
+    timeout_override: float | None = None,
 ) -> GeneratedAnswer:
     messages = RAGPromptBuilder().build_generation_messages(
         question,
         context_chunks,
         llm_prompt=llm_prompt,
         no_evidence=no_evidence,
+        evidence_policy=evidence_policy_for(intent),
     )
+    # 硬时间预算：按剩余预算收紧超时（流式重试同样受限，避免超时兜底反而拖长总耗时）
+    effective_timeout = ANSWER_GENERATION_TIMEOUT_SECONDS
+    if timeout_override is not None and timeout_override > 0:
+        effective_timeout = min(ANSWER_GENERATION_TIMEOUT_SECONDS, float(timeout_override))
     config = ChatCompletionConfig(
         provider=ANSWER_GENERATION_PROVIDER,
         api_key=ANSWER_GENERATION_API_KEY,
         base_url=ANSWER_GENERATION_BASE_URL,
         model=ANSWER_GENERATION_MODEL,
-        timeout_seconds=ANSWER_GENERATION_TIMEOUT_SECONDS,
+        timeout_seconds=effective_timeout,
         include_thinking=ANSWER_GENERATION_INCLUDE_THINKING,
         response_format=ANSWER_GENERATION_RESPONSE_FORMAT,
     )
@@ -224,7 +284,7 @@ def _call_llm(
         api_key=ANSWER_GENERATION_API_KEY,
         base_url=ANSWER_GENERATION_BASE_URL,
         model=ANSWER_GENERATION_MODEL,
-        timeout_seconds=max(ANSWER_GENERATION_TIMEOUT_SECONDS * 2, 45.0),
+        timeout_seconds=max(effective_timeout * 2, effective_timeout + 15.0),
         include_thinking=ANSWER_GENERATION_INCLUDE_THINKING,
         response_format=ANSWER_GENERATION_RESPONSE_FORMAT,
     )

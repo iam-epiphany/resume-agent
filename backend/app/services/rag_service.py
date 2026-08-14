@@ -1,11 +1,14 @@
 from collections import OrderedDict
 from dataclasses import dataclass
 import json
+import logging
 import re
 from threading import RLock
 from time import monotonic, perf_counter
 from typing import Any, Callable
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -20,6 +23,8 @@ from backend.app.core.config import (
     FALLBACK_REWRITE_RETRY_ENABLED,
     FINAL_CITATION_LIMIT,
     FORCE_MIN_CHUNKS,
+    GENERATION_MIN_BUDGET_SECONDS,
+    GROUNDING_VERIFY_ENABLED,
     KEYWORD_RECALL_LIMIT,
     MAX_PROMPT_CHUNKS,
     MAX_PROMPT_TOKENS,
@@ -29,12 +34,19 @@ from backend.app.core.config import (
     MIN_LEXICAL_SCORE,
     MIN_PROMPT_CHUNKS,
     PER_DOCUMENT_PROMPT_CAP,
+    PLANNER_MIN_BUDGET_SECONDS,
+    QA_HARD_BUDGET_SECONDS,
     RELAXED_MIN_PROMPT_CHUNKS,
     RELAXED_RERANK_THRESHOLD,
     RELATIVE_SCORE_RATIO,
+    RERANK_BUDGET_SECONDS,
     RERANK_CANDIDATE_LIMIT,
     RERANK_TOP_K,
     RERANK_PROMPT_THRESHOLD,
+    SKIP_RERANK_ENABLED,
+    SKIP_RERANK_MARGIN_RATIO,
+    SKIP_RERANK_MIN_KEYWORD_HITS,
+    SKIP_RERANK_TOP_FUSION_MIN,
 )
 from backend.app.models.document import Document, DocumentChunk, QALog
 from backend.app.schemas.qa import (
@@ -47,6 +59,7 @@ from backend.app.schemas.qa import (
 from backend.app.services.audit_service import record_event
 from backend.app.services.answer_generation_service import generate_answer
 from backend.app.services.conversation_memory_service import record_turn, recent_turns
+from backend.app.services.context_dependency import RESUME_ANCHOR_TERMS
 from backend.app.services.intent_router_service import classify_and_resolve
 from backend.app.services.llm_client import (
     llm_call_count as _request_llm_call_count,
@@ -79,7 +92,9 @@ from backend.app.services.embedding_service import EmbeddingServiceError
 from backend.app.services.model_device_service import get_model_device_info
 from backend.app.services.performance_metrics import measure, trace_operation
 from backend.app.services import qa_cache_service
-from backend.app.services.rerank_service import RerankServiceError, rerank_candidates
+from backend.app.services.fact_ledger_service import fact_status_for_source, load_fact_ledger
+from backend.app.services.rerank_service import RerankServiceError, RerankedChunk, rerank_candidates
+from backend.app.services.time_budget import TimeBudget
 from backend.app.services.vector_store_service import VectorSearchResult, VectorStoreError
 
 
@@ -91,8 +106,6 @@ CONTEXT_CHUNK_CHAR_LIMIT = 1200
 EMPTY_ANSWER_LOG_TEXT = "[RAG_CONTEXT_PACKAGE_ONLY] 当前阶段未接入 LLM，接口仅返回检索上下文包。"
 ASPECT_QUERY_FUSION_METHOD = "aspect_query_rrf_then_bge_rerank"
 RRF_K = 60
-CONSTRAINED_RERANK_CANDIDATE_LIMIT = 20
-MCQ_RERANK_CANDIDATE_LIMIT = 24
 QUERY_TYPE_WEIGHTS = {
     "semantic_question": 1.0,
     "document_style_statement": 1.15,
@@ -234,6 +247,9 @@ def answer_question(
     # 请求级 LLM 调用计数清零：统计本问真实发起的 API 请求数（llm_client 层计数）
     _reset_llm_call_count()
 
+    # 单问硬时间预算（自意图路由起算）：重排前不足跳过重排、生成前不足摘录兜底
+    budget = TimeBudget(QA_HARD_BUDGET_SECONDS)
+
     # 问答答案缓存（独立问题才查；追问链依赖前文，禁止缓存）：
     # 命中直接返回完整答案（含证据上下文），零 LLM 调用、秒回
     if session_id is None:
@@ -340,6 +356,7 @@ def answer_question(
         progress_reporter=progress_reporter,
         cancellation_checker=cancellation_checker,
         memory_context=memory_context,
+        budget=budget,
     )
     package = _package_from_retrieval(
         db,
@@ -397,6 +414,7 @@ def answer_question(
                     progress_reporter=progress_reporter,
                     cancellation_checker=cancellation_checker,
                     rewritten_queries=queries,
+                    budget=budget,
                 )
                 rewritten_package = _package_from_retrieval(
                     db,
@@ -452,6 +470,14 @@ def answer_question(
             f"{package.llm_prompt.rstrip()}\n\n"
             f"【对话上下文】（仅用于理解指代与衔接，回答不得照抄原文）\n{conversation_context}"
         )
+    # 事实台账（与 grounding 并存）：检测"实体—属性—值"错配（张冠李戴），
+    # 同时为最终上下文块标注 fact_status 供公开出处展示
+    ledger_facts = load_fact_ledger(db) if GROUNDING_VERIFY_ENABLED else None
+    if ledger_facts is not None:
+        for chunk in package.context_chunks:
+            fact_status = fact_status_for_source(chunk.source_doc, ledger_facts)
+            if fact_status:
+                chunk.metadata["fact_status"] = fact_status
     generated = generate_answer(
         resolved_question,
         package.context_chunks,
@@ -461,6 +487,10 @@ def answer_question(
         preview_reporter=report_preview,
         no_evidence=(fallback_level == 3),
         known_entities=_known_resume_entities(db),
+        ledger_facts=ledger_facts,
+        # 硬时间预算：剩余不足 LLM 生成下限 → 跳过生成摘录兜底；否则按剩余预算收紧 LLM 超时
+        force_extractive=not budget.can_afford(GENERATION_MIN_BUDGET_SECONDS),
+        timeout_override=max(budget.remaining(), 1.0) if budget.remaining() > 0 else None,
     )
     _report_progress(
         progress_reporter,
@@ -560,6 +590,7 @@ def _plan_and_retrieve(
     *,
     rewritten_queries: list[str] | None = None,
     memory_context: dict | None = None,
+    budget: TimeBudget | None = None,
 ) -> tuple[QueryPlan, list[AspectRetrieval]]:
     """检索规划 + 候选召回（标准与改写重试两条路径共用）。
 
@@ -591,6 +622,9 @@ def _plan_and_retrieve(
         query_plan = QueryPlan(
             original_question=question, aspects=(aspect,), planner="rewrite"
         )
+    elif budget is not None and not budget.can_afford(PLANNER_MIN_BUDGET_SECONDS):
+        # 硬时间预算不足：跳过规划 LLM，零 LLM 单方面计划直接检索
+        query_plan = _budget_synthetic_plan(question)
     else:
         query_plan = plan_query(
             question,
@@ -615,7 +649,7 @@ def _plan_and_retrieve(
             },
         },
     )
-    aspect_retrievals = _retrieve_aspects(db, query_plan, progress_reporter=progress_reporter)
+    aspect_retrievals = _retrieve_aspects(db, query_plan, progress_reporter=progress_reporter, budget=budget)
     return query_plan, aspect_retrievals
 
 
@@ -958,7 +992,12 @@ def _keyword_recall_candidates(
     ]
     if not normalized_terms or limit <= 0:
         return []
-    chunks_by_document = _chunks_by_document(db, _indexed_document_ids(db))
+    try:
+        chunks_by_document = _chunks_by_document(db, _indexed_document_ids(db))
+    except Exception as exc:
+        # 关键词召回是最佳努力路径：SQLite 扫描失败不阻断 dense 检索主链
+        logger.warning("keyword recall skipped: %s", exc)
+        return []
     scored: list[tuple[int, _DocumentChunkSnapshot]] = []
     for chunks in chunks_by_document.values():
         for chunk in chunks:
@@ -1007,15 +1046,142 @@ def _keyword_snapshot_candidate(snapshot: _DocumentChunkSnapshot, hits: int) -> 
     )
 
 
+# ---- 跳重排分级（2026-08-14）：融合分分差 / 关键词锚定 / 时间预算 → 跳过 CPU 重排 ----
+
+
+def _skip_rerank_reason(
+    candidates: list[Any],
+    fusion_scores: dict[str, float],
+) -> str:
+    """重排前判断融合排序是否已决定性，返回跳过原因（"" = 不跳过）。
+
+    信号（保守取并集，任一命中即跳过）：
+    - 候选 ≤1：无需重排
+    - top1 融合分 ≥ 下限 且 与 top2 分差比例 ≥ SKIP_RERANK_MARGIN_RATIO（实体明确、单对象碾压）
+    - top1 候选关键词精确命中 ≥ SKIP_RERANK_MIN_KEYWORD_HITS（词面锚定强信号）
+    - 词面锚定块接近榜首（融合分 ≥ top1×0.5）——口语化/专名问句的重排主要
+      只是给锚定块排序，词面已给出答案方向，跳过可省 4-7s（2026-08-14）
+    """
+    if not SKIP_RERANK_ENABLED:
+        return ""
+    if len(candidates) <= 1:
+        return "single_candidate"
+    ranked = sorted(candidates, key=lambda candidate: fusion_scores.get(candidate.chunk_id, 0.0), reverse=True)
+    top1 = fusion_scores.get(ranked[0].chunk_id, 0.0)
+    top2 = fusion_scores.get(ranked[1].chunk_id, 0.0)
+    if top1 < SKIP_RERANK_TOP_FUSION_MIN:
+        return ""
+    if top2 <= 0.0 or (top1 - top2) / top1 >= SKIP_RERANK_MARGIN_RATIO:
+        return "fusion_margin"
+    if _keyword_hit_count(ranked[0]) >= SKIP_RERANK_MIN_KEYWORD_HITS:
+        return "keyword_anchor"
+    for candidate in ranked[1:8]:
+        if _keyword_hit_count(candidate) >= SKIP_RERANK_MIN_KEYWORD_HITS:
+            fusion = fusion_scores.get(candidate.chunk_id, 0.0)
+            if fusion >= top1 * 0.5:
+                return "keyword_near_top"
+    return ""
+
+
+def _keyword_hit_count(candidate: Any) -> int:
+    hits = (candidate.metadata or {}).get("keyword_hits", 0)
+    try:
+        return int(hits)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fusion_ordered_reranked(
+    candidates: list[Any],
+    fusion_scores: dict[str, float],
+) -> list[RerankedChunk]:
+    """跳重排时的合成分数。
+
+    词面锚定块（keyword_hits ≥ 1，含 dense 召回后补标命中数的块）排最前，
+    给高置信分（0.55 + 0.15×命中数，封顶 0.95）——它们是对象文档的精确锚点；
+    其余 dense 块按融合分相对 top1 归一化映射到 0.05~0.95。
+    下游 prompt 选择以 rerank 分数为相关性信号（_prompt_score 读
+    metadata["rerank_score"]），合成分数必须落在与真实 rerank 相同的语义区间。
+    """
+    anchored = sorted(
+        (c for c in candidates if _keyword_hit_count(c) > 0),
+        key=lambda c: (-_keyword_hit_count(c), -fusion_scores.get(c.chunk_id, 0.0)),
+    )
+    dense = sorted(
+        (c for c in candidates if _keyword_hit_count(c) == 0),
+        key=lambda c: -fusion_scores.get(c.chunk_id, 0.0),
+    )
+    top1_fusion = max((fusion_scores.get(c.chunk_id, 0.0) for c in candidates), default=0.0) or 1.0
+    ordered: list[RerankedChunk] = []
+    for candidate in [*anchored, *dense]:
+        if _keyword_hit_count(candidate) > 0:
+            synthetic = min(0.95, 0.55 + 0.15 * _keyword_hit_count(candidate))
+        else:
+            ratio = fusion_scores.get(candidate.chunk_id, 0.0) / top1_fusion
+            synthetic = min(0.95, 0.05 + 0.90 * ratio)
+        ordered.append(RerankedChunk(candidate=candidate, rerank_score=synthetic))
+    return ordered
+
+
+def _rerank_or_skip(
+    *,
+    rerank_question: str,
+    rerank_input: list[Any],
+    fusion_scores: dict[str, float],
+    budget: TimeBudget | None,
+    rerank_limit: int,
+) -> tuple[list[RerankedChunk], str]:
+    """重排/跳过分流：返回 (reranked, skip_reason)；skip_reason 为空 = 真实重排。
+
+    跳过顺序：① 融合分分差/关键词锚定判定 ② 时间预算不足。
+    真实重排异常（RerankServiceError）向上抛出，由检索不可用兜底处理。
+    """
+    if not rerank_input:
+        return [], ""
+    reason = _skip_rerank_reason(rerank_input, fusion_scores)
+    if reason:
+        return _fusion_ordered_reranked(rerank_input, fusion_scores), reason
+    if budget is not None and not budget.can_afford(RERANK_BUDGET_SECONDS):
+        return _fusion_ordered_reranked(rerank_input, fusion_scores), "time_budget"
+    # 真实重排：记录融合分分差，供跳重排阈值校准（top1/top2 分差不足则无法跳过）
+    ranked = sorted(fusion_scores.values(), reverse=True)
+    top1 = ranked[0] if ranked else 0.0
+    top2 = ranked[1] if len(ranked) > 1 else 0.0
+    logger.info(
+        "rerank engaged: top1_fusion=%.4f top2_fusion=%.4f margin=%.2f candidates=%d",
+        top1, top2, (top1 - top2) / top1 if top1 > 0 else 0.0, len(rerank_input),
+    )
+    return (
+        rerank_candidates(question=rerank_question, candidates=rerank_input, limit=rerank_limit),
+        "",
+    )
+
+
+def _budget_synthetic_plan(question: str) -> QueryPlan:
+    """预算不足时的零 LLM 检索计划：单 aspect，原问直接作 semantic 查询。"""
+    aspect = QueryAspect(
+        aspect_id="budget",
+        question=question,
+        search_queries=(QuerySearchQuery(question, "semantic_question"),),
+        evidence_need="相关材料依据",
+        keywords=(),
+    )
+    return QueryPlan(original_question=question, aspects=(aspect,), planner="budget")
+
+
 def _retrieve_aspects(
     db: Session,
     query_plan: QueryPlan,
     progress_reporter: ProgressReporter | None = None,
+    budget: TimeBudget | None = None,
 ) -> list[AspectRetrieval]:
-    if query_plan.enumerative and len(query_plan.aspects) > 1:
-        # 枚举/补集问句：对象文档跨 aspect 高度重叠（5 个项目文档被 5 个 aspect 各查一遍），
-        # 走融合检索——全部查询一次召回、一次重排，再按 aspect 切分（省 4/5 重排计算）
-        return _retrieve_aspects_fused(db, query_plan, progress_reporter=progress_reporter)
+    if len(query_plan.aspects) > 1 and retrieve_citations is _DEFAULT_RETRIEVE_CITATIONS:
+        # 多角度问题（枚举/补集/复合）：对象文档跨 aspect 高度重叠（5 个项目文档被
+        # 5 个 aspect 各查一遍），走融合检索——全部查询一次召回、一次重排，
+        # 再按 aspect 切分（省 4/5 重排计算；歧义低时进一步跳过重排）。
+        # retrieve_citations 被替换（测试/自定义检索钩子）时保持逐 aspect 串行，
+        # 保留 legacy hook 的既有语义。
+        return _retrieve_aspects_fused(db, query_plan, progress_reporter=progress_reporter, budget=budget)
     retrieval_started_at = perf_counter()
     _report_progress(
         progress_reporter,
@@ -1051,6 +1217,7 @@ def _retrieve_aspects(
             progress_reporter=progress_reporter,
             document_chunk_cache=document_chunk_cache,
             enumerative=query_plan.enumerative,
+            budget=budget,
         )
         candidates = _to_retrieval_results(matches)
         for candidate in candidates:
@@ -1123,13 +1290,15 @@ def _retrieve_aspects_fused(
     db: Session,
     query_plan: QueryPlan,
     progress_reporter: ProgressReporter | None = None,
+    budget: TimeBudget | None = None,
 ) -> list[AspectRetrieval]:
-    """枚举问句融合检索：全部 aspect 的查询一次 dense 召回 + 关键词精确召回 → 一次 BGE rerank。
+    """多角度融合检索：全部 aspect 的查询一次 dense 召回 + 关键词精确召回 → 至多一次 BGE rerank。
 
-    枚举/补集问句（"还有哪些项目"）的对象文档跨 aspect 高度重叠：5 个项目文档会被
+    多角度问句（枚举/补集/复合）的对象文档跨 aspect 高度重叠：5 个项目文档会被
     5 个 aspect 各查一遍、各重排一遍（CPU 上每次重排 20 对 ≈ 8-9s），浪费约 4/5 计算。
     融合路径把召回与重排合并为一次，再按"查询命中"把候选切分回各 aspect，
-    随后统一走配额式多样性选择。相关性信号与单 aspect 路径完全一致（加权 RRF + rerank）。
+    随后统一走配额式多样性选择。相关性信号与单 aspect 路径完全一致
+    （加权 RRF + rerank；融合分差足够大时进一步跳过重排）。
     """
     aspects = query_plan.aspects
     retrieval_started_at = perf_counter()
@@ -1140,7 +1309,7 @@ def _retrieve_aspects_fused(
             "status": "running",
             "title": "正在检索相关依据",
             "detail": f"正在按 {len(aspects)} 个问题方面融合召回知识库片段……",
-            "summary": {"total_aspects": len(aspects), "fusion": "enumerative_fused"},
+            "summary": {"total_aspects": len(aspects), "fusion": "multi_aspect_fused"},
         },
     )
 
@@ -1170,13 +1339,20 @@ def _retrieve_aspects_fused(
     except (EmbeddingServiceError, VectorStoreError) as exc:
         raise RetrievalServiceUnavailable(str(exc)) from exc
     if KEYWORD_RECALL_LIMIT > 0:
-        all_keywords = [keyword for aspect in aspects for keyword in aspect.keywords]
-        existing_ids = {candidate.chunk_id for candidate in candidates}
+        all_keywords: list[str] = []
+        for aspect in aspects:
+            all_keywords.extend(_recall_terms(aspect))
+        all_keywords = list(dict.fromkeys(all_keywords))
+        existing_by_chunk_id = {candidate.chunk_id: candidate for candidate in candidates}
         for snapshot, hits in _keyword_recall_candidates(db, all_keywords):
-            if snapshot.chunk_id in existing_ids:
+            existing = existing_by_chunk_id.get(snapshot.chunk_id)
+            if existing is not None:
+                if existing.metadata is None:
+                    existing.metadata = {}
+                existing.metadata["keyword_hits"] = int(existing.metadata.get("keyword_hits") or 0) + int(hits)
                 continue
             candidates.append(_keyword_snapshot_candidate(snapshot, hits))
-            existing_ids.add(snapshot.chunk_id)
+            existing_by_chunk_id[snapshot.chunk_id] = candidates[-1]
 
     # 3. 加权 RRF 融合（与单 aspect 路径的 QUERY_TYPE_WEIGHTS/RRF_K 完全一致）
     fusion_scores: dict[str, float] = {}
@@ -1204,15 +1380,25 @@ def _retrieve_aspects_fused(
         reverse=True,
     )
 
-    # 4. 一次重排（rerank 查询 = 原问题 + 全部对象文档名）
+    # 4. 至多一次重排（rerank 查询 = 原问题 + 全部对象文档名 + 各 aspect 问题；
+    #    融合分差足够大或时间预算不足时跳过，按融合分排序直接输出）
     rerank_started_at = perf_counter()
     object_names = [
         object_name_from_filename(doc)
         for aspect in aspects
         for doc in aspect.anchor_documents
     ]
+    aspect_questions = [
+        aspect.question
+        for aspect in aspects
+        if aspect.question and aspect.question != query_plan.original_question
+    ]
     rerank_question = "\n".join(
-        [query_plan.original_question, *dict.fromkeys(name for name in object_names if name)]
+        dict.fromkeys(
+            value
+            for value in [query_plan.original_question, *object_names, *aspect_questions]
+            if value and str(value).strip()
+        )
     )
     # 重排输入：融合排序后的 dense 候选取前 RERANK_CANDIDATE_LIMIT，
     # 关键词精确召回的对象块（排序在融合末尾）无条件保留——它们是对象文档的可靠锚点，
@@ -1246,19 +1432,21 @@ def _retrieve_aspects_fused(
             "status": "running",
             "title": "正在重排候选片段",
             "detail": f"融合候选 {len(rerank_input)} 个片段进入重排……",
-            "summary": {"rerank_input_count": len(rerank_input), "fusion": "enumerative_fused"},
+            "summary": {"rerank_input_count": len(rerank_input), "fusion": "multi_aspect_fused"},
         },
     )
     try:
-        reranked = rerank_candidates(
-            question=rerank_question,
-            candidates=rerank_input,
-            limit=RERANK_TOP_K,
+        reranked, skip_reason = _rerank_or_skip(
+            rerank_question=rerank_question,
+            rerank_input=rerank_input,
+            fusion_scores=fusion_scores,
+            budget=budget,
+            rerank_limit=RERANK_TOP_K,
         )
     except RerankServiceError as exc:
         raise RetrievalServiceUnavailable(str(exc)) from exc
     diagnostics.timings_ms["rerank"] = _elapsed_ms(rerank_started_at)
-    diagnostics.rerank_call_count = 1 if rerank_input else 0
+    diagnostics.rerank_call_count = 0 if skip_reason else (1 if rerank_input else 0)
     diagnostics.reranked_count = len(reranked)
     # 枚举/补集问句：保留全部重排结果（不只 top-12），由选择层的对象配额做最终取舍，
     # 避免高分文档（如自我介绍/简历）挤掉对象文档（如外卖平台/EchoGuide）
@@ -1315,10 +1503,11 @@ def _retrieve_aspects_fused(
         fused_diagnostics = diagnostics.to_summary_fields()
         fused_diagnostics.update(
             {
-                "query_type": "enumerative_fused",
+                "query_type": "multi_aspect_fused",
                 "search_query": query_plan.original_question,
-                "rationale": "枚举问句融合检索：全部查询一次召回、一次重排后按查询命中切分",
+                "rationale": "多角度融合检索：全部查询一次召回、至多一次重排后按查询命中切分",
                 "match_count": len(valid_candidates),
+                "rerank_skipped": skip_reason,
             }
         )
         aspect_retrievals.append(
@@ -1356,13 +1545,18 @@ def _retrieve_aspects_fused(
             "stage": "retrieval",
             "status": "completed",
             "title": "融合检索完成",
-            "detail": f"一次重排输出 {diagnostics.reranked_count} 个片段，切分给 {len(aspects)} 个方面",
+            "detail": (
+                f"重排已跳过（{skip_reason}），按融合分输出 {diagnostics.reranked_count} 个片段，切分给 {len(aspects)} 个方面"
+                if skip_reason
+                else f"一次重排输出 {diagnostics.reranked_count} 个片段，切分给 {len(aspects)} 个方面"
+            ),
             "elapsed_ms": diagnostics.timings_ms.get("total"),
             "summary": {
                 "total_aspects": len(aspects),
-                "rerank_call_count": 1,
+                "rerank_call_count": 0 if skip_reason else 1,
                 "reranked_count": diagnostics.reranked_count,
-                "fusion": "enumerative_fused",
+                "rerank_skipped": skip_reason,
+                "fusion": "multi_aspect_fused",
             },
         },
     )
@@ -1429,6 +1623,27 @@ def _document_style_evidence_score(candidate: Any, aspect: QueryAspect) -> float
 
 
 
+def _recall_terms(aspect: QueryAspect) -> list[str]:
+    """关键词精确召回的术语集：aspect.keywords + 简历领域锚点命中 + 《》/引号专名。
+
+    fast-path 规划的中文关键词是 2-12 字连跑切分（"你有哪些可以写进简历的证"），
+    对全库子串扫描几乎没有召回力；补充领域锚点（证书/项目/学校/技术栈等，单一
+    事实源见 context_dependency.RESUME_ANCHOR_TERMS）与书名号专名，
+    保证口语化问句（"REV 项目是你一个人做的吗"）也能把对象文档召回入池。
+    """
+    terms: list[str] = []
+    for keyword in aspect.keywords or ():
+        keyword = str(keyword).strip()
+        if keyword:
+            terms.append(keyword)
+    for anchor in RESUME_ANCHOR_TERMS:
+        if anchor in aspect.question:
+            terms.append(anchor)
+    for quoted in re.findall(r"[《「“]([^》」”]{2,40})[》」”]", aspect.question):
+        terms.append(quoted)
+    return list(dict.fromkeys(terms))
+
+
 def _retrieve_aspect_matches(
     db: Session,
     aspect: QueryAspect,
@@ -1436,6 +1651,7 @@ def _retrieve_aspect_matches(
     document_chunk_cache: dict[str, list[DocumentChunk]] | None = None,
     *,
     enumerative: bool = False,
+    budget: TimeBudget | None = None,
 ) -> tuple[list[RetrievalMatch], list[dict[str, Any]]]:
     if retrieve_citations is not _DEFAULT_RETRIEVE_CITATIONS:
         return _retrieve_aspect_matches_legacy_hook(db, aspect, progress_reporter)
@@ -1479,16 +1695,24 @@ def _retrieve_aspect_matches(
             hit["rrf_contribution"] = round(contribution, 6)
 
     pre_filter_candidate_count = len(candidates)
-    # 枚举/补集问句：dense 召回对列举对象文档弱（语义查询下对象文档常排 40 名开外），
-    # 用关键词精确召回把对象文档的片段注入候选池（相关性最终由 rerank 裁决）
-    if enumerative and KEYWORD_RECALL_LIMIT > 0:
-        keyword_candidates = _keyword_recall_candidates(db, list(aspect.keywords))
-        existing_ids = {candidate.chunk_id for candidate in candidates}
+    # 关键词精确召回（2026-08-14 起全问题开放，不再限于枚举问句）：
+    # 改写式/口语化问句（"REV 项目是你一个人做的吗"）下 dense 会把目标文档排到
+    # 50 名开外，词面子串命中（项目名/证书/学校等专名）保证对象文档的片段必然入池，
+    # 相关性最终由 rerank/融合分裁决。小库全量扫，CPU 开销可忽略。
+    if KEYWORD_RECALL_LIMIT > 0:
+        keyword_candidates = _keyword_recall_candidates(db, _recall_terms(aspect))
+        existing_by_chunk_id = {candidate.chunk_id: candidate for candidate in candidates}
         for snapshot, hits in keyword_candidates:
-            if snapshot.chunk_id in existing_ids:
+            existing = existing_by_chunk_id.get(snapshot.chunk_id)
+            if existing is not None:
+                # dense 已召回同一块：保留 dense 身份，但标注词面命中数——
+                # 供选择层逃生门槛与跳重排判定使用（证书/项目名等精确锚点）
+                if existing.metadata is None:
+                    existing.metadata = {}
+                existing.metadata["keyword_hits"] = int(existing.metadata.get("keyword_hits") or 0) + int(hits)
                 continue
             candidates.append(_keyword_snapshot_candidate(snapshot, hits))
-            existing_ids.add(snapshot.chunk_id)
+            existing_by_chunk_id[snapshot.chunk_id] = candidates[-1]
     diagnostics.candidate_count = len(candidates)
     document_style_scores = {
         candidate.chunk_id: _document_style_evidence_score(candidate, aspect)
@@ -1512,11 +1736,28 @@ def _retrieve_aspect_matches(
     # by one raw vector score here would undo multi-query fusion and starve
     # exact option/statement hits in long documents before cross-encoding.
     effective_rerank_limit = _effective_rerank_candidate_limit(candidates, enumerative=enumerative)
+    # 关键词精确召回块（排序在融合末尾）无条件保留（与融合路径一致的 dense/keyword 双池）：
+    # 口语化问句下它们是对象文档的唯一锚点，不能被 RERANK_CANDIDATE_LIMIT 截断挤出
+    dense_pool = [
+        candidate
+        for candidate in candidates
+        if (candidate.metadata or {}).get("recall_path") != "keyword"
+    ]
+    keyword_pool = [
+        candidate
+        for candidate in candidates
+        if (candidate.metadata or {}).get("recall_path") == "keyword"
+    ]
     rerank_input = limit_rerank_candidates(
-        candidates,
+        dense_pool,
         preserve_order=True,
         limit=effective_rerank_limit,
     )
+    rerank_input = rerank_input + [
+        candidate
+        for candidate in keyword_pool
+        if not any(candidate.chunk_id == item.chunk_id for item in rerank_input)
+    ]
     diagnostics.rerank_input_count = len(rerank_input)
     _report_progress(
         progress_reporter,
@@ -1536,15 +1777,17 @@ def _retrieve_aspect_matches(
     )
     rerank_started_at = perf_counter()
     try:
-        reranked = rerank_candidates(
-            question=_rerank_query_for_aspect(aspect),
-            candidates=rerank_input,
-            limit=RERANK_TOP_K,
+        reranked, skip_reason = _rerank_or_skip(
+            rerank_question=_rerank_query_for_aspect(aspect),
+            rerank_input=rerank_input,
+            fusion_scores=fusion_scores,
+            budget=budget,
+            rerank_limit=RERANK_TOP_K,
         )
     except RerankServiceError as exc:
         raise RetrievalServiceUnavailable(str(exc)) from exc
-    diagnostics.rerank_call_count = 1 if rerank_input else 0
     diagnostics.timings_ms["rerank"] = _elapsed_ms(rerank_started_at)
+    diagnostics.rerank_call_count = 0 if skip_reason else (1 if rerank_input else 0)
     diagnostics.reranked_count = len(reranked)
     diagnostics.score_range = _score_range_for_candidates(candidates, reranked)
     matches = matches_from_reranked(
@@ -1601,6 +1844,7 @@ def _retrieve_aspect_matches(
                 for rank, item in enumerate(reranked, start=1)
             ],
             "effective_rerank_candidate_limit": effective_rerank_limit,
+            "rerank_skipped": skip_reason,
             **diagnostics.to_summary_fields(),
         }
     )
@@ -1610,7 +1854,11 @@ def _retrieve_aspect_matches(
             "stage": "retrieval",
             "status": "completed",
             "title": "候选重排完成",
-            "detail": f"方面“{aspect.question}”完成 1 次融合重排，输出 {diagnostics.reranked_count} 个片段",
+            "detail": (
+                f"方面“{aspect.question}”重排已跳过（{skip_reason}），按融合分取 {diagnostics.reranked_count} 个片段"
+                if skip_reason
+                else f"方面“{aspect.question}”完成 1 次融合重排，输出 {diagnostics.reranked_count} 个片段"
+            ),
             "aspect_id": aspect.aspect_id,
             "elapsed_ms": diagnostics.timings_ms.get("rerank"),
             "summary": {
@@ -1618,6 +1866,7 @@ def _retrieve_aspect_matches(
                 "rerank_call_count": diagnostics.rerank_call_count,
                 "rerank_input_count": diagnostics.rerank_input_count,
                 "reranked_count": diagnostics.reranked_count,
+                "rerank_skipped": skip_reason,
             },
         },
     )
@@ -1815,9 +2064,8 @@ def _effective_rerank_candidate_limit(candidates: list[Any], *, enumerative: boo
         # 枚举问句（多对象列举）：候选截断会把部分对象的材料挤出 rerank，
         # 全量参与重排，保证每个被列举对象都有机会进入 prompt
         return len(candidates)
-    if len(candidates) <= CONSTRAINED_RERANK_CANDIDATE_LIMIT:
-        return len(candidates)
-    return max(CONSTRAINED_RERANK_CANDIDATE_LIMIT, min(len(candidates), MCQ_RERANK_CANDIDATE_LIMIT))
+    # 过去这里被 20/24 的常量下限覆盖，导致环境变量 RERANK_CANDIDATE_LIMIT 在普通问题上失效。
+    return min(len(candidates), RERANK_CANDIDATE_LIMIT)
 
 def _normalize_exact_support_text(value: str) -> str:
     without_breaks = re.sub(r"<br\s*/?>", "", str(value or ""), flags=re.IGNORECASE)
@@ -1973,11 +2221,11 @@ def _select_prompt_chunks(
         return 1
 
     def _passes_fill_bar(chunk: RetrievalResult) -> bool:
-        """填充阶段门槛：绝对分数为主；关键词精确召回的对象块允许低分逃生。"""
+        """填充阶段门槛：绝对分数为主；词面锚定块（keyword_hits 或精确召回）允许低分逃生。"""
         score = _prompt_score(chunk)
         if score >= bar:
             return True
-        if chunk.metadata.get("recall_path") == "keyword":
+        if chunk.metadata.get("recall_path") == "keyword" or chunk.metadata.get("keyword_hits"):
             return score >= MIN_LEXICAL_RERANK_SCORE
         return False
 

@@ -9,7 +9,7 @@ Chain levels (QAResponse.retrieval_fallback_level):
 - 3: no evidence -> direct generation with an empty context package (hedged)
 
 Config gates: FALLBACK_LOWER_THRESHOLD_ENABLED / FALLBACK_REWRITE_RETRY_ENABLED /
-FALLBACK_DIRECT_GENERATION_ENABLED (all default True).
+FALLBACK_DIRECT_GENERATION_ENABLED. 面试部署默认关闭后二者，本文件会在需要时显式开启。
 
 The retrieval and LLM layers are mocked; no network calls are made.
 """
@@ -82,7 +82,7 @@ class _FakeRetrieval:
         self.rewritten = rewritten if rewritten is not None else standard
         self.seen_aspects: list[tuple[str, list[str]]] = []
 
-    def __call__(self, db, query_plan: QueryPlan, progress_reporter=None) -> list[AspectRetrieval]:
+    def __call__(self, db, query_plan: QueryPlan, progress_reporter=None, budget=None) -> list[AspectRetrieval]:
         aspect = query_plan.aspects[0]
         self.seen_aspects.append(
             (aspect.aspect_id, [search_query.query for search_query in aspect.search_queries])
@@ -222,10 +222,11 @@ def test_weak_evidence_triggers_relaxed_reselection_level_1(
 
 
 def test_still_weak_after_relaxed_triggers_rewrite_level_2(
-    db_session, rewritten_calls, install_retrieval, llm_calls
+    monkeypatch, db_session, rewritten_calls, install_retrieval, llm_calls
 ) -> None:
     """Only 2 candidates: relaxed fills to 2, still weak -> rewrite + re-retrieve."""
     _seed_chunks(db_session)
+    monkeypatch.setattr("backend.app.services.rag_service.FALLBACK_REWRITE_RETRY_ENABLED", True)
     weak_chunks = [_chunk(index, 0.06) for index in range(1, 3)]
     strong_rewritten = [_chunk(index, 0.6) for index in range(9, 15)]
     retrieval = install_retrieval(standard=weak_chunks, rewritten=strong_rewritten)
@@ -241,9 +242,10 @@ def test_still_weak_after_relaxed_triggers_rewrite_level_2(
 
 
 def test_no_evidence_uses_direct_generation_level_3(
-    db_session, rewritten_calls, install_retrieval, llm_calls
+    monkeypatch, db_session, rewritten_calls, install_retrieval, llm_calls
 ) -> None:
     _seed_chunks(db_session)
+    monkeypatch.setattr("backend.app.services.rag_service.FALLBACK_DIRECT_GENERATION_ENABLED", True)
     install_retrieval(standard=[])
 
     response = answer_question(db_session, QUESTION, include_debug=True)

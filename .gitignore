@@ -80,3 +80,7 @@ docs/
 
 # ZCode 工作区内部文件（计划/会话记录），不入库
 .zcode/
+
+# 评测产物（本地运行生成，不入库）
+data/eval-report.json
+data/eval-ai-interview-*.json

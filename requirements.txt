@@ -39,3 +39,4 @@ FlagEmbedding==1.4.0
 qdrant-client==1.18.0
 torch==2.12.1
 transformers<5
+tokenizers>=0.22,<0.24

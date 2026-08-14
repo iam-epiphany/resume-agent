@@ -1920,6 +1920,7 @@ def test_qa_passes_raw_question_to_retrieval_without_option_stripping(monkeypatc
         *,
         rewritten_queries=None,
         memory_context=None,
+        budget=None,
     ):
         captured["question"] = question
         captured["memory_context"] = memory_context
@@ -2490,7 +2491,7 @@ def test_aspect_retrieval_fuses_queries_before_single_rerank(monkeypatch) -> Non
 
     assert len(matches) == 2
     assert rerank_calls == [
-        ("技能掌握情况应如何处理\n技能掌握 掌握程度 分类 认定方法", 6, 20)
+        ("技能掌握情况应如何处理\n技能掌握 掌握程度 分类 认定方法", 6, 6)
     ]
     fused = diagnostics[-1]
     assert fused["query_type"] == "aspect_fused"

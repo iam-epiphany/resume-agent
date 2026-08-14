@@ -33,8 +33,8 @@
       RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-512}
       RERANK_INPUT_MODE: ${RERANK_INPUT_MODE:-compact}
       # 2C4G 下 cross-encoder 是本地热路径；十余篇个人材料无需重排 24 个候选。
-      RERANK_CANDIDATE_LIMIT: ${RERANK_CANDIDATE_LIMIT:-12}
-      RERANK_TOP_K: ${RERANK_TOP_K:-12}
+      RERANK_CANDIDATE_LIMIT: ${RERANK_CANDIDATE_LIMIT:-8}
+      RERANK_TOP_K: ${RERANK_TOP_K:-6}
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-2}
       TORCH_NUM_INTEROP_THREADS: ${TORCH_NUM_INTEROP_THREADS:-1}
       RERANKER_ONNX_MODEL_PATH: ${RERANKER_ONNX_MODEL_PATH:-/app/data/models/bge-reranker-base-onnx-int8/model.onnx}
@@ -81,7 +81,6 @@
       AUTH_REQUIRED: ${AUTH_REQUIRED:-true}
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
       QA_IP_RATE_LIMIT_PER_MINUTE: ${QA_IP_RATE_LIMIT_PER_MINUTE:-30}
-      QA_IP_DAILY_LIMIT: ${QA_IP_DAILY_LIMIT:-500}
       # One local inference lock protects the 2C4G CPU; a small queue prevents
       # concurrent visitors from creating a memory/latency spiral.
       QA_GLOBAL_CONCURRENCY: ${QA_GLOBAL_CONCURRENCY:-2}
@@ -97,6 +96,9 @@
       # fast path：普通独立问题减少 LLM 调用（默认开，可关回退完整链路）
       INTENT_FAST_PATH_ENABLED: ${INTENT_FAST_PATH_ENABLED:-true}
       PLANNER_FAST_PATH_ENABLED: ${PLANNER_FAST_PATH_ENABLED:-true}
+      # 面试事实优先忠实性与时延：弱证据不额外触发整轮 LLM 改写+重检索；无证据不编造。
+      FALLBACK_REWRITE_RETRY_ENABLED: ${FALLBACK_REWRITE_RETRY_ENABLED:-false}
+      FALLBACK_DIRECT_GENERATION_ENABLED: ${FALLBACK_DIRECT_GENERATION_ENABLED:-false}
       # grounding：确定性硬事实校验（默认开，可关）
       GROUNDING_VERIFY_ENABLED: ${GROUNDING_VERIFY_ENABLED:-true}
     ports:

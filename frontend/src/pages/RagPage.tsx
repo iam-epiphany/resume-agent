@@ -161,6 +161,7 @@ export function RagPage() {
       messages: updateLastAssistant(thread.messages, {
         content: answer.answer ?? "",
         answerMode: answer.answer_mode,
+        citations: answer.citations ?? undefined,
         status: "done",
       }),
     }));
@@ -359,6 +360,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
       : message.answerMode === "redirected"
         ? { text: "已引导至简历话题", tone: "redirected" }
         : null;
+  const citations = message.citations ?? [];
 
   return (
     <div className="chat-message chat-message--assistant">
@@ -371,6 +373,22 @@ function ChatBubble({ message }: { message: ChatMessage }) {
         <div className="chat-bubble-stack">
           {badge ? <span className={`answer-mode-badge answer-mode-badge--${badge.tone}`}>{badge.text}</span> : null}
           <div className="chat-bubble chat-bubble--assistant">{message.content}</div>
+          {citations.length > 0 ? (
+            <ul className="answer-citations" aria-label="回答依据">
+              {citations.map((citation, index) => (
+                <li key={`${citation.source_doc}-${citation.section_title ?? ""}-${index}`} className="answer-citations__item">
+                  <span className="answer-citations__source">
+                    {citation.source_doc}
+                    {citation.section_title ? ` · ${citation.section_title}` : ""}
+                    {citation.fact_status === "confirmed" ? " · 已核实" : ""}
+                  </span>
+                  {citation.excerpt ? (
+                    <span className="answer-citations__excerpt">“{citation.excerpt}”</span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : null}
           {message.status === "error" ? (
             <span className="chat-message__status">回答未完成</span>
           ) : message.status === "cancelled" ? (

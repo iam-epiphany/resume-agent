@@ -439,6 +439,14 @@ export interface QATaskRequest extends QARequest {
   client_request_id: string;
 }
 
+export interface PublicCitation {
+  source_doc: string;
+  section_title: string | null;
+  excerpt: string;
+  score: number | null;
+  fact_status: string | null;
+}
+
 export interface QAResponse {
   answer: string | null;
   answer_mode: "answered" | "hedged" | "redirected" | "failed";
@@ -448,8 +456,11 @@ export interface QAResponse {
   resolved_question: string | null;
   retrieval_fallback_level: number;
   context_package: LLMContextPackage | null;
+  citations: PublicCitation[] | null;
   degraded: boolean;
   generation_status: string;
+  llm_call_count?: number;
+  cached?: boolean;
 }
 
 export interface QAAnswerPreview {

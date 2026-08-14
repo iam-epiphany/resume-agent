@@ -338,11 +338,11 @@ def test_retrieve_citations_limits_candidates_before_rerank(monkeypatch) -> None
 
     assert matches
     assert len(rerank_inputs) == 1
-    assert len(rerank_inputs[0]) == 24
-    assert [item.chunk_id for item in rerank_inputs[0]] == [item.chunk_id for item in items[:24]]
+    assert len(rerank_inputs[0]) == 6
+    assert [item.chunk_id for item in rerank_inputs[0]] == [item.chunk_id for item in items[:6]]
     diagnostics = get_last_retrieval_diagnostics()
     assert diagnostics.query_count > 1
     assert diagnostics.raw_candidate_count == 40 * diagnostics.query_count
     assert diagnostics.candidate_count == 40
-    assert diagnostics.rerank_input_count == 24
-    assert diagnostics.reranked_count == 20
+    assert diagnostics.rerank_input_count == 6
+    assert diagnostics.reranked_count == 6

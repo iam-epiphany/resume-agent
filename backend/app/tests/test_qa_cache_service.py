@@ -73,6 +73,13 @@ class TestLookup:
         )
         assert row.hit_count == 2
 
+    def test_exact_match_survives_embedding_failure(self, test_db, monkeypatch) -> None:
+        monkeypatch.setattr(qa_cache_service, "embed_query", lambda question: (_ for _ in ()).throw(RuntimeError("offline")))
+        qa_cache_service.store(test_db, "请介绍一下你自己", make_response())
+        hit = qa_cache_service.lookup(test_db, "请介绍一下你自己")
+        assert hit is not None
+        assert hit.answer == "我是张三。"
+
     def test_semantic_match_hits_above_threshold(self, test_db, monkeypatch) -> None:
         # 模拟同义改写：向量相似度 0.98 ≥ 0.93
         vectors = {"介绍一下你自己": [1.0, 0.0], "请做自我介绍": [0.98, 0.02]}

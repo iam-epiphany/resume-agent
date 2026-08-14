@@ -101,8 +101,24 @@ class LLMContextPackage(BaseModel):
     llm_prompt: str
 
 
+class PublicCitation(BaseModel):
+    """公开出处（2026-08-14）：匿名视角可见的最小来源信息。
+
+    只含 文件名 + 章节标题 + 一小段原文摘录 + 分数 + 事实状态；
+    不含内部 prompt、文档全文、内部 chunk_id / document_id。
+    事实状态由事实台账标注：confirmed=该来源文件的事实已确认；
+    mixed=该文件含待确认/冲突事实；None=未关联台账。
+    """
+
+    source_doc: str
+    section_title: str | None = None
+    excerpt: str
+    score: float | None = None
+    fact_status: str | None = None
+
+
 class QAResponse(BaseModel):
-    """简历面试问答响应：纯文本 + 置信度分级，无引用标注。"""
+    """简历面试问答响应：纯文本 + 置信度分级，无引用标注（出处走结构化 citations）。"""
 
     answer: str | None
     answer_mode: Literal["answered", "hedged", "redirected", "failed"] = "answered"
@@ -112,6 +128,8 @@ class QAResponse(BaseModel):
     resolved_question: str | None = None
     retrieval_fallback_level: int = 0
     context_package: LLMContextPackage | None = None
+    # 公开出处（2026-08-14）：匿名视角由 API 层从 context_package 构造；管理员仍见完整包
+    citations: list[PublicCitation] | None = None
     degraded: bool = False
     generation_status: str = "completed"
     # 本次请求的 LLM 调用次数（意图分类/规划/改写/生成合计），供评测与观测

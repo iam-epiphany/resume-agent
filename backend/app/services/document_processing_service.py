@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Callable
 
 from sqlalchemy import delete
@@ -10,6 +9,7 @@ from sqlalchemy.orm import Session
 from backend.app.core.config import INDEX_VERSION
 from backend.app.models.document import Document, DocumentChunk
 from backend.app.services.chunk_service import build_chunks_from_parsed
+from backend.app.services.document_lifecycle_service import resolve_original_path
 from backend.app.services.document_parser import DocumentParseError, parse_document
 from backend.app.services.document_metadata_service import (
     apply_document_metadata,
@@ -41,7 +41,10 @@ def ensure_document_chunks(
     try:
         _report(stage_reporter, "parsing")
         with measure("index.parse"):
-            parsed = parse_document(Path(document.storage_path), source_name=document.filename)
+            # storage_path 可能来自容器绝对路径（/app/data/...）——统一走
+            # resolve_original_path 的「原文路径 → DOCUMENT_DIR 兜底」解析，
+            # 保证容器与宿主机直跑两种部署方式都能定位原始文件（2026-08-14 修复）
+            parsed = parse_document(resolve_original_path(document), source_name=document.filename)
         apply_document_metadata(
             document,
             infer_metadata_from_parsed(parsed, document.filename),

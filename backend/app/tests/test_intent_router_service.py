@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""意图路由服务测试：纯 LLM 3 类分类 / 混合问题归 resume_qa / 失败回退 / 合并追问补全。"""
+"""意图路由服务测试：LLM 7 类分类 / 混合问题 / 失败回退 / 合并追问补全。"""
 
 import pytest
 
@@ -7,8 +7,12 @@ from backend.app.services import intent_router_service
 from backend.app.services.intent_router_service import (
     ALL_INTENTS,
     INTENT_GREETING,
+    INTENT_HR_BEHAVIOR,
     INTENT_OFF_TOPIC,
+    INTENT_PROJECT_DEEPDIVE,
+    INTENT_RESUME_FACT,
     INTENT_RESUME_QA,
+    INTENT_TECH_GENERAL,
     _STRATEGIES,
     classify_and_resolve,
 )
@@ -61,6 +65,7 @@ def test_llm_classifies_each_of_three_intents(monkeypatch, intent) -> None:
 
 
 def test_llm_classifies_resume_qa_for_project_question(monkeypatch) -> None:
+    monkeypatch.setattr(intent_router_service, "INTENT_FAST_PATH_ENABLED", False)
     _llm_mock_json(monkeypatch, _payload(INTENT_RESUME_QA))
 
     result = classify_and_resolve("秒杀项目怎么解决超卖问题的？")
@@ -86,8 +91,13 @@ def test_llm_classifies_off_topic(monkeypatch) -> None:
     assert result.strategy.polite_redirect is True
 
 
-def test_strategy_mapping_only_polite_redirect_remains() -> None:
+def test_strategy_mapping_policies() -> None:
     assert _STRATEGIES[INTENT_RESUME_QA].polite_redirect is False
+    assert _STRATEGIES[INTENT_RESUME_QA].evidence_policy == "default"
+    assert _STRATEGIES[INTENT_RESUME_FACT].evidence_policy == "fact_strict"
+    assert _STRATEGIES[INTENT_PROJECT_DEEPDIVE].evidence_policy == "project_grounded"
+    assert _STRATEGIES[INTENT_TECH_GENERAL].evidence_policy == "tech_split"
+    assert _STRATEGIES[INTENT_HR_BEHAVIOR].evidence_policy == "persona_soft"
     assert _STRATEGIES[INTENT_GREETING].polite_redirect is True
     assert _STRATEGIES[INTENT_OFF_TOPIC].polite_redirect is True
 
@@ -246,8 +256,16 @@ def test_llm_json_escaped_output_is_parsed(monkeypatch) -> None:
     assert result.rewritten_question == "介绍一下你的秒杀项目"
 
 
-def test_all_intents_are_exactly_three() -> None:
-    assert set(ALL_INTENTS) == {INTENT_RESUME_QA, INTENT_GREETING, INTENT_OFF_TOPIC}
+def test_all_intents_are_seven() -> None:
+    assert set(ALL_INTENTS) == {
+        INTENT_RESUME_QA,
+        INTENT_RESUME_FACT,
+        INTENT_PROJECT_DEEPDIVE,
+        INTENT_TECH_GENERAL,
+        INTENT_HR_BEHAVIOR,
+        INTENT_GREETING,
+        INTENT_OFF_TOPIC,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +358,55 @@ def test_fast_path_independent_question_skips_llm_even_with_history(monkeypatch)
     previous = {"question": "你有哪些项目？", "answer_excerpt": "秒杀、外卖、REV。"}
 
     result = classify_and_resolve("HashMap 为什么线程不安全", previous)
+
+    assert result.classifier == "fast_path"
+    assert result.intent == INTENT_TECH_GENERAL
+
+
+def test_fast_path_independent_fact_question(monkeypatch) -> None:
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("自足硬事实问题不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+
+    result = classify_and_resolve("你得过什么奖学金？")
+
+    assert result.classifier == "fast_path"
+    assert result.intent == INTENT_RESUME_FACT
+
+
+def test_fast_path_independent_hr_question(monkeypatch) -> None:
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("自足 HR/行为问题不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+
+    result = classify_and_resolve("你最大的缺点是什么？")
+
+    assert result.classifier == "fast_path"
+    assert result.intent == INTENT_HR_BEHAVIOR
+
+
+def test_fast_path_independent_project_deepdive(monkeypatch) -> None:
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("项目深挖问题不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+
+    result = classify_and_resolve("秒杀项目怎么解决超卖问题的？")
+
+    assert result.classifier == "fast_path"
+    assert result.intent == INTENT_PROJECT_DEEPDIVE
+
+
+def test_fast_path_project_overview_stays_resume_qa(monkeypatch) -> None:
+    """“介绍一下你的项目经历”是概述而非深挖——仍归 resume_qa。"""
+    def assert_not_called(config, messages, **kwargs):
+        raise AssertionError("含锚点的混合问题不应调用 LLM")
+
+    monkeypatch.setattr(intent_router_service, "chat_completion_content", assert_not_called)
+
+    result = classify_and_resolve("介绍一下你的项目经历")
 
     assert result.classifier == "fast_path"
     assert result.intent == INTENT_RESUME_QA

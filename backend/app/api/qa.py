@@ -25,6 +25,7 @@ from backend.app.middleware.rate_limit import get_client_ip
 from backend.app.models.document import QALog
 from backend.app.schemas.qa import (
     LLMContextPackage,
+    PublicCitation,
     QARequest,
     QAResponse,
     QATaskRequest,
@@ -406,6 +407,8 @@ def _stream_qa_events(
             # 匿名视角剥离检索依据与内部提示词（SSE 无法带 Authorization 头）
             if not is_admin:
                 stripped = response.model_copy(deep=False)
+                if stripped.context_package is not None:
+                    stripped.citations = _build_public_citations(stripped.context_package)
                 stripped.context_package = None
                 events.put(("final", stripped.model_dump(mode="json")))
             else:
@@ -455,18 +458,39 @@ def _sse_frame(event_name: str, payload: dict[str, Any]) -> str:
     return f"event: {event_name}\ndata: {data}\n\n"
 
 
+def _build_public_citations(package: Any) -> list[PublicCitation]:
+    """从内部上下文包构造公开出处：文件名 + 章节 + 短摘录 + 分数 + 事实状态。
+
+    不暴露内部 prompt、文档全文、chunk_id/document_id；最多返回 6 条。
+    """
+    citations: list[PublicCitation] = []
+    for chunk in package.context_chunks[:6]:
+        citations.append(
+            PublicCitation(
+                source_doc=chunk.source_doc,
+                section_title=chunk.section_title,
+                excerpt=(chunk.text or "").strip()[:80],
+                score=round(chunk.score, 4) if chunk.score is not None else None,
+                fact_status=chunk.metadata.get("fact_status"),
+            )
+        )
+    return citations
+
+
 def _strip_context_package(task: QATaskStatusResponse | QAResponse) -> QATaskStatusResponse | QAResponse:
-    """匿名视角剥离检索依据（context_chunks 全文与内部提示词），仅保留公开字段。"""
+    """匿名视角剥离检索依据（context_chunks 全文与内部提示词），替换为公开出处列表。"""
     if isinstance(task, QAResponse):
         if task.context_package is None:
             return task
         stripped = task.model_copy(deep=False)
+        stripped.citations = _build_public_citations(task.context_package)
         stripped.context_package = None
         return stripped
     if task.answer is None or task.answer.context_package is None:
         return task
     stripped = task.model_copy(deep=False)
     stripped.answer = task.answer.model_copy(deep=False)
+    stripped.answer.citations = _build_public_citations(task.answer.context_package)
     stripped.answer.context_package = None
     return stripped
 

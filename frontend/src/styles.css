@@ -2507,6 +2507,35 @@ textarea {
   background: var(--info-soft);
 }
 
+/* 回答依据（公开出处，2026-08-14）：文件名 + 章节 + 一小段原文摘录 */
+.answer-citations {
+  list-style: none;
+  margin: 8px 20px 0;
+  padding: 0;
+}
+
+.answer-citations__item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-left: 2px solid var(--border);
+  padding: 2px 0 2px 10px;
+  margin-bottom: 6px;
+}
+
+.answer-citations__source {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim, #8a919c);
+}
+
+.answer-citations__excerpt {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim, #8a919c);
+  overflow-wrap: anywhere;
+}
+
 .choice-options {
   margin: 0;
   border-bottom: 1px solid var(--border);

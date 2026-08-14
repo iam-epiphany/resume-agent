@@ -169,13 +169,17 @@ EMBEDDING_DIMENSION = _env_int("EMBEDDING_DIMENSION", 512, minimum=1)
 EMBEDDING_BATCH_SIZE = _env_int("EMBEDDING_BATCH_SIZE", 8, minimum=1)
 EMBEDDING_MAX_BATCH_SIZE = _env_int("EMBEDDING_MAX_BATCH_SIZE", 16, minimum=1)
 RETRIEVAL_TOP_K = _env_int("RETRIEVAL_TOP_K", 50, minimum=1)
-RERANK_TOP_K = _env_int("RERANK_TOP_K", 20, minimum=1)
-RERANK_CANDIDATE_LIMIT = _env_int("RERANK_CANDIDATE_LIMIT", 24, minimum=1)
+# 十余篇个人资料库中，cross-encoder 是 CPU 热路径；默认控制候选数，歧义问题可通过环境变量提高。
+RERANK_TOP_K = _env_int("RERANK_TOP_K", 6, minimum=1)
+# 2026-08-14 评测校准 8→6：重排 ~1.2s/对，少 2 对省 ~2.4s，p50 逼近 6s 目标
+RERANK_CANDIDATE_LIMIT = _env_int("RERANK_CANDIDATE_LIMIT", 6, minimum=1)
 MAX_PROMPT_CHUNKS = 12
 MAX_PROMPT_TOKENS = _env_int("MAX_PROMPT_TOKENS", 3600, minimum=1)
 MIN_PROMPT_CHUNKS = _env_int("MIN_PROMPT_CHUNKS", 6, minimum=0)
 FORCE_MIN_CHUNKS = _env_bool("FORCE_MIN_CHUNKS", True)
 RERANK_PROMPT_THRESHOLD = _env_float("RERANK_PROMPT_THRESHOLD", 0.20)
+# 跳重排分差比例调参入口（2026-08-14 激活：跳重排判定以 SKIP_RERANK_MARGIN_RATIO
+# 为准，本参数保留供旧配置兼容；改这里不影响默认行为）
 RELATIVE_SCORE_RATIO = _env_float("RELATIVE_SCORE_RATIO", 0.40)
 # 每个文档在最终 prompt 中的最大片段数（多样性约束，防止单一文档霸屏挤掉其他对象）
 PER_DOCUMENT_PROMPT_CAP = _env_int("PER_DOCUMENT_PROMPT_CAP", 2, minimum=1)
@@ -288,11 +292,36 @@ QA_BUDGET_WARNING_RATIO = _env_float("QA_BUDGET_WARNING_RATIO", 0.15, minimum=0.
 
 # ---- 检索兜底链（P3）：证据不足时不拒答，逐级放宽 ----
 FALLBACK_LOWER_THRESHOLD_ENABLED = _env_bool("FALLBACK_LOWER_THRESHOLD_ENABLED", True)
-FALLBACK_REWRITE_RETRY_ENABLED = _env_bool("FALLBACK_REWRITE_RETRY_ENABLED", True)
-FALLBACK_DIRECT_GENERATION_ENABLED = _env_bool("FALLBACK_DIRECT_GENERATION_ENABLED", True)
+# 面试问答优先忠实性：默认不为弱证据再触发一轮 LLM+检索，也不在无证据时虚构个人经历。
+FALLBACK_REWRITE_RETRY_ENABLED = _env_bool("FALLBACK_REWRITE_RETRY_ENABLED", False)
+FALLBACK_DIRECT_GENERATION_ENABLED = _env_bool("FALLBACK_DIRECT_GENERATION_ENABLED", False)
 # 降阈重试：rerank 分数低于该值视为"弱证据"；重试时不过滤直接取 top-N
 RELAXED_RERANK_THRESHOLD = _env_float("RELAXED_RERANK_THRESHOLD", 0.05)
 RELAXED_MIN_PROMPT_CHUNKS = _env_int("RELAXED_MIN_PROMPT_CHUNKS", 6, minimum=1)
+
+# ---- 速度分级链路（2026-08-14）：跳重排 + 单问硬时间预算 ----
+# 重排是 2C4G 热路径（每次约 8-9s）。分级策略：融合分分差足够大（实体明确的单对象问题）
+# 或关键词精确命中锚定时跳过重排，只有歧义问题才重排；多角度问题合并后只重排一次。
+SKIP_RERANK_ENABLED = _env_bool("SKIP_RERANK_ENABLED", True)
+# top1 与 top2 融合分的分差比例（(top1-top2)/top1）达到该值 → 排序决定性，跳过重排。
+# 2026-08-14 评测校准为 0.15（0.40/0.25 均过于保守，重排 p50 仍 4s+）；
+# 融合分是 RRF 加权累加的小数值，分差天然偏大，0.15 为保守起步值。
+SKIP_RERANK_MARGIN_RATIO = _env_float("SKIP_RERANK_MARGIN_RATIO", 0.15, minimum=0.0)
+# top1 融合分绝对下限：低于该值的候选池信号不够强，不允许跳重排
+SKIP_RERANK_TOP_FUSION_MIN = _env_float("SKIP_RERANK_TOP_FUSION_MIN", 0.015, minimum=0.0)
+# top1 候选的关键词精确命中数达到该值 → 词面锚定强信号，跳过重排。
+# 2026-08-14 起召回术语已扩充（锚点+专名），1 次精确命中即可信
+SKIP_RERANK_MIN_KEYWORD_HITS = _env_int("SKIP_RERANK_MIN_KEYWORD_HITS", 1, minimum=1)
+# 单问硬时间预算（秒，自意图路由起算）：重排前剩余预算不足即跳过重排，
+# 生成前不足即跳过 LLM 生成改用摘录兜底。P95 ≤ 6s 目标的总预算上限；
+# 2026-08-14 评测校准为 10（跳重排生效后重排 ~0-3s，给生成留足 5s+）。
+QA_HARD_BUDGET_SECONDS = _env_float("QA_HARD_BUDGET_SECONDS", 10.0, minimum=0.5)
+# 重排预估成本（秒）：剩余预算低于该值时跳过重排，按融合分排序直接输出
+RERANK_BUDGET_SECONDS = _env_float("RERANK_BUDGET_SECONDS", 3.0, minimum=0.1)
+# LLM 规划的最小预算（秒）：剩余预算低于该值时跳过规划 LLM，用零 LLM 单方面计划
+PLANNER_MIN_BUDGET_SECONDS = _env_float("PLANNER_MIN_BUDGET_SECONDS", 1.5, minimum=0.1)
+# LLM 生成的最小预算（秒）：剩余预算低于该值时跳过生成，摘录知识库原文（hedged）
+GENERATION_MIN_BUDGET_SECONDS = _env_float("GENERATION_MIN_BUDGET_SECONDS", 1.5, minimum=0.1)
 
 # ---- 负载指示灯（公开状态 /api/qa/status 的 load 字段，2026-08-12）----
 # 按 2C4G 校准（QA_TASK_WORKERS=2，任务管线双 worker 并行）：1-2 人提问绿、3 人黄、4 人及以上红。

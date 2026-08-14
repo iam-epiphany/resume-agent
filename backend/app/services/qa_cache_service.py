@@ -24,7 +24,7 @@ from threading import RLock
 from typing import Any
 
 import numpy as np
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from backend.app.core import config
@@ -59,12 +59,14 @@ def lookup(db: Session, question: str) -> QAResponse | None:
     if not norm:
         return None
     signature = model_signature()
+    # 精确命中不应依赖 embedding：模型预热失败或临时不可用时，仍可安全复用同一个问题。
+    exact = _load_answer(db, signature, norm)
+    if exact is not None:
+        _bump_hit(db, signature, norm)
+        return exact
+
     _ensure_loaded(db, signature)
     with _LOCK:
-        if (signature, norm) in _VECTORS:
-            _bump_hit(db, signature, norm)
-            return _load_answer(db, signature, norm)
-
         query_vector = _embed_vector(question)
         if query_vector is None:
             return None
@@ -90,27 +92,34 @@ def store(db: Session, question: str, response: QAResponse) -> None:
         return
     signature = model_signature()
     vector = _embed_vector(question)
-    if vector is None:
-        return
     _ensure_loaded(db, signature)
     with _LOCK:
         key = (signature, norm)
-        if key not in _VECTORS and len(_VECTORS) >= config.QA_CACHE_MAX_ITEMS:
-            _evict_oldest(db, signature)
         row = db.scalar(
             select(QAAnswerCache).where(
                 QAAnswerCache.model_signature == signature,
                 QAAnswerCache.norm_question == norm,
             )
         )
+        item_count = int(
+            db.scalar(
+                select(func.count()).select_from(QAAnswerCache).where(
+                    QAAnswerCache.model_signature == signature
+                )
+            )
+            or 0
+        )
+        if row is None and item_count >= config.QA_CACHE_MAX_ITEMS:
+            _evict_oldest(db, signature)
         now = datetime.now(timezone.utc)
+        embedding_json = json.dumps(vector.tolist(), ensure_ascii=False) if vector is not None else "[]"
         if row is None:
             db.add(
                 QAAnswerCache(
                     model_signature=signature,
                     norm_question=norm,
                     question=question,
-                    embedding_json=json.dumps(vector.tolist(), ensure_ascii=False),
+                    embedding_json=embedding_json,
                     answer_json=response.model_dump_json(),
                     created_at=now,
                     updated_at=now,
@@ -118,11 +127,14 @@ def store(db: Session, question: str, response: QAResponse) -> None:
             )
         else:
             row.question = question
-            row.embedding_json = json.dumps(vector.tolist(), ensure_ascii=False)
+            row.embedding_json = embedding_json
             row.answer_json = response.model_dump_json()
             row.updated_at = now
         db.commit()
-        _VECTORS[key] = vector
+        if vector is None:
+            _VECTORS.pop(key, None)
+        else:
+            _VECTORS[key] = vector
 
 
 def clear() -> None:
@@ -159,9 +171,9 @@ def _ensure_loaded(db: Session, signature: str) -> None:
         for row in rows:
             try:
                 values = json.loads(row.embedding_json)
-                _VECTORS[(row.model_signature, row.norm_question)] = np.asarray(
-                    values, dtype=np.float64
-                )
+                vector = np.asarray(values, dtype=np.float64)
+                if vector.size:
+                    _VECTORS[(row.model_signature, row.norm_question)] = vector
             except (ValueError, TypeError):
                 continue
         _LOADED = True
