@@ -1,20 +1,22 @@
 ﻿:root {
-  --bg: #fbfdff;
-  --bg-tint-blue: #eef6ff;
-  --bg-tint-violet: #f5f0ff;
-  --surface: rgba(255, 255, 255, 0.86);
+  /* 西电红主题（参照 XDU-EchoGuide）：主色西电红 #C8102E · 辅色深蓝 #1E3A5F · 背景浅灰白 */
+  --bg: #f4f6f9;
+  --bg-tint-blue: #fdeef0;
+  --bg-tint-violet: #eef2f8;
+  --surface: rgba(255, 255, 255, 0.88);
   --surface-solid: #ffffff;
-  --surface-muted: #f7faff;
-  --surface-subtle: #f9fbff;
-  --surface-accent: #edf5ff;
-  --border: #dfe7f2;
-  --border-strong: #c9d6e6;
-  --text: #07152b;
-  --muted: #64748b;
-  --text-muted: #64748b;
-  --primary: #2563eb;
-  --primary-strong: #123a8c;
-  --primary-soft: #edf5ff;
+  --surface-muted: #f8fafb;
+  --surface-subtle: #fbfcfd;
+  --surface-accent: #fdeef0;
+  --border: #e3e9f0;
+  --border-strong: #cfd8e2;
+  --text: #18202c;
+  --muted: #637386;
+  --text-muted: #637386;
+  --primary: #c8102e;
+  --primary-strong: #a30d26;
+  --primary-soft: #fdeef0;
+  --accent: #c8102e;
   --ledger: #9a7a2f;
   --ledger-soft: #fff8df;
   --success: #15803d;
@@ -24,8 +26,8 @@
   --warning-soft: #fff7df;
   --danger: #b42318;
   --danger-soft: #fff1ef;
-  --info: #2563eb;
-  --info-soft: #edf5ff;
+  --info: #2f6fce;
+  --info-soft: #eef4fd;
   --radius: 12px;
   --radius-sm: 10px;
   --radius-control: 10px;
@@ -43,8 +45,9 @@
 body {
   margin: 0;
   background:
-    radial-gradient(circle at 1px 1px, rgba(37, 99, 235, 0.045) 1px, transparent 0) 0 0 / 34px 34px,
-    linear-gradient(135deg, var(--bg-tint-blue) 0%, #ffffff 42%, var(--bg-tint-violet) 100%);
+    radial-gradient(circle at 12% 0%, rgba(200, 16, 46, 0.06), transparent 30%),
+    radial-gradient(circle at 88% 8%, rgba(30, 58, 95, 0.06), transparent 26%),
+    var(--bg);
   background-attachment: fixed;
 }
 
@@ -67,7 +70,7 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
-  outline: 3px solid rgba(37, 99, 235, 0.2);
+  outline: 3px solid rgba(200, 16, 46, 0.2);
   outline-offset: 2px;
 }
 
@@ -129,7 +132,7 @@ nav {
 .nav-item.active,
 .nav-item:hover {
   color: var(--primary-strong);
-  border-color: #d8e7ff;
+  border-color: #f0c8d0;
   background: var(--primary-soft);
 }
 
@@ -137,7 +140,7 @@ nav {
   color: #ffffff;
   border-color: var(--primary);
   background: var(--primary);
-  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.18);
+  box-shadow: 0 10px 24px rgba(200, 16, 46, 0.18);
 }
 
 .icon-button:disabled {
@@ -267,7 +270,7 @@ h3 {
 }
 
 .action-card:hover {
-  border-color: #bfd8ff;
+  border-color: #e8aeb8;
   background: var(--surface-solid);
 }
 
@@ -300,7 +303,7 @@ h3 {
   border-radius: 999px;
   padding: 2px 9px;
   color: var(--primary-strong);
-  border: 1px solid #d8e7ff;
+  border: 1px solid #f0c8d0;
   background: var(--primary-soft);
   font-size: 12px;
   font-weight: 800;
@@ -330,7 +333,7 @@ h3 {
 }
 
 .expandable-text:hover {
-  color: #0f766e;
+  color: #a30d26;
   text-decoration: underline;
 }
 
@@ -730,11 +733,11 @@ td {
 th {
   color: #52627a;
   font-size: 13px;
-  background: #f3f8ff;
+  background: #fdf1f3;
 }
 
 tbody tr:hover {
-  background: #f7fbff;
+  background: #fdf5f6;
 }
 
 textarea {
@@ -857,7 +860,7 @@ textarea {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: #1f2937;
-  background: #f7fbff;
+  background: #fdf5f6;
   font-family: "Cascadia Mono", Consolas, monospace;
   line-height: 1.65;
 }
@@ -906,8 +909,8 @@ textarea {
 }
 
 .progress-step.running {
-  border-color: #9ed3dc;
-  background: #eef8fb;
+  border-color: #c6ddf8;
+  background: #eef4fd;
 }
 
 .progress-step.failed {
@@ -1653,7 +1656,7 @@ textarea {
 }
 
 .nav-item.active {
-  box-shadow: inset 3px 0 0 var(--primary), 0 8px 18px rgba(37, 99, 235, 0.08);
+  box-shadow: inset 3px 0 0 var(--primary), 0 8px 18px rgba(200, 16, 46, 0.08);
 }
 
 .sidebar-status {
@@ -1752,7 +1755,7 @@ textarea {
   gap: 8px;
   padding: 11px;
   border-bottom: 1px solid var(--border);
-  background: linear-gradient(135deg, rgba(237, 245, 255, 0.9), rgba(255, 255, 255, 0.86));
+  background: linear-gradient(135deg, rgba(253, 238, 240, 0.9), rgba(255, 255, 255, 0.86));
 }
 
 .system-status-panel__head > div {
@@ -1945,7 +1948,7 @@ textarea {
   padding: 10px 16px;
   color: #fff;
   background: var(--primary);
-  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.18);
+  box-shadow: 0 10px 24px rgba(200, 16, 46, 0.18);
 }
 
 .primary-button:hover:not(:disabled) {
@@ -2109,13 +2112,13 @@ textarea {
   border-radius: 50%;
   padding: 0;
   color: #fff;
-  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.22);
+  box-shadow: 0 10px 24px rgba(200, 16, 46, 0.22);
   transition: transform 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
 }
 
 .composer-action-button:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: 0 14px 30px rgba(37, 99, 235, 0.28);
+  box-shadow: 0 14px 30px rgba(200, 16, 46, 0.28);
 }
 
 .composer-action-button--submit {
@@ -2575,7 +2578,7 @@ textarea {
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
   padding: 11px;
-  background: #f7fbff;
+  background: #fdf5f6;
 }
 
 .table-result-grid strong {
@@ -2707,7 +2710,7 @@ textarea {
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
   padding: 10px;
-  background: #f7fbff;
+  background: #fdf5f6;
 }
 
 .context-chunk-list strong,
@@ -2795,7 +2798,7 @@ textarea {
 }
 
 .task-history-list button:hover {
-  background: #f7fbff;
+  background: #fdf5f6;
 }
 
 .task-history-list__icon {
@@ -3396,7 +3399,7 @@ textarea {
 }
 
 .document-identity-card__custody a {
-  color: #2563a9;
+  color: #c8102e;
   font-weight: 700;
 }
 
@@ -3467,8 +3470,8 @@ textarea {
 
 .identity-field input:focus-visible,
 .identity-field select:focus-visible {
-  border-color: #2563eb;
-  outline: 3px solid rgba(37, 99, 235, 0.14);
+  border-color: #c8102e;
+  outline: 3px solid rgba(200, 16, 46, 0.14);
 }
 
 .identity-editor__error {

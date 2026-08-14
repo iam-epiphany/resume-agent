@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="none">
   <defs>
     <linearGradient id="resumemind-brand-bg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
-      <stop stopColor="#4f46e5" />
-      <stop offset="1" stopColor="#8b5cf6" />
+      <stop stopColor="#c8102e" />
+      <stop offset="1" stopColor="#a30d26" />
     </linearGradient>
   </defs>
   <rect width="40" height="40" rx="11" fill="url(#resumemind-brand-bg)" />

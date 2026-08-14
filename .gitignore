@@ -92,3 +92,7 @@ data/reranker-parity-*.json
 # 本地打包与运行时状态（个人数据，禁止入库）
 backend.zip
 .run-state/
+
+# 构建用离线 wheel（本地下载，不入库）
+wheels/*
+!wheels/.gitkeep
