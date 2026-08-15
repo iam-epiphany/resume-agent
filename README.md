@@ -1,4 +1,4 @@
-# ResumeMind · 基于 RAG 的个人简历问答 Agent
+# ResumeMind · 让面试官“对话”你的简历
 
 <div align="center">
 
