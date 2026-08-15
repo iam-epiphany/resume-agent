@@ -16,14 +16,15 @@ def _fact(
     subject: str,
     predicate: str,
     value: str,
-    status: str = "confirmed",
+    evidence_status: str = "explicit",
 ) -> FactLedger:
     return FactLedger(
         fact_id=fact_id,
         subject=subject,
         predicate=predicate,
         value=value,
-        status=status,
+        evidence_status=evidence_status,
+        review_status="pending",
         source_file="测试.md",
     )
 
@@ -33,7 +34,7 @@ FACTS = [
     _fact("echo_test", "XDU-EchoGuide", "实测结果", "285项测试通过"),
     _fact("rev_param", "REV 密码算法", "环参数", "n=1152，q=2017素数"),
     _fact("edu_gpa", "河南大学", "本科绩点", "3.61/4"),
-    _fact("award_pending", "大学生算法大赛", "获奖级别", "二等奖（年份待确认）", status="pending"),
+    _fact("award_pending", "大学生算法大赛", "获奖级别", "二等奖（年份待确认）", evidence_status="missing"),
 ]
 
 
@@ -88,7 +89,7 @@ def test_seed_fact_records_idempotent(tmp_path) -> None:
             "subject": "河南大学",
             "predicate": "本科绩点",
             "value": "3.61/4",
-            "status": "confirmed",
+            "evidence_status": "explicit",
             "source_file": "教育背景.md",
         },
         {
@@ -96,7 +97,7 @@ def test_seed_fact_records_idempotent(tmp_path) -> None:
             "subject": "河南大学",
             "predicate": "专业排名",
             "value": "6/177",
-            "status": "confirmed",
+            "evidence_status": "explicit",
             "source_file": "教育背景.md",
         },
     ]
@@ -110,4 +111,45 @@ def test_seed_fact_records_idempotent(tmp_path) -> None:
     by_id = {row.fact_id: row for row in rows}
     assert by_id["edu_gpa"].value == "3.62/4"
     assert by_id["edu_rank"].value == "6/177"
+    # 新字段落库 + 旧 status 列写兼容镜像
+    assert by_id["edu_gpa"].evidence_status == "explicit"
+    assert by_id["edu_gpa"].review_status == "pending"
+    assert by_id["edu_gpa"].status == "confirmed"
+    engine.dispose()
+
+
+def test_seed_maps_legacy_status(tmp_path) -> None:
+    """旧种子（status 字段）兼容：confirmed→explicit、pending→missing。"""
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'legacy.db').as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        seed_fact_records(
+            db,
+            [
+                {
+                    "fact_id": "legacy_ok",
+                    "subject": "S",
+                    "predicate": "P",
+                    "value": "v",
+                    "status": "confirmed",
+                    "source_file": "x.md",
+                },
+                {
+                    "fact_id": "legacy_missing",
+                    "subject": "S2",
+                    "predicate": "P",
+                    "value": "v2",
+                    "status": "pending",
+                    "source_file": "x.md",
+                },
+            ],
+        )
+        rows = {row.fact_id: row for row in db.scalars(select(FactLedger)).all()}
+    assert rows["legacy_ok"].evidence_status == "explicit"
+    assert rows["legacy_missing"].evidence_status == "missing"
+    assert rows["legacy_missing"].review_status == "pending"
     engine.dispose()

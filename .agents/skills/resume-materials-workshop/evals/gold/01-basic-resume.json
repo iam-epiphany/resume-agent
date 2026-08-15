@@ -1,0 +1,15 @@
+{
+  "files": ["01-basic-resume.txt"],
+  "expected_facts": [
+    { "subject": "周明轩", "predicate": "毕业时间", "value": "2024 年 6 月" },
+    { "subject": "周明轩", "predicate": "毕业院校", "value": "西安电子科技大学" },
+    { "subject": "周明轩", "predicate": "专业", "value": "计算机科学与技术" },
+    { "subject": "周明轩", "predicate": "求职意向", "value": "Java 后端开发实习生" },
+    { "subject": "周明轩", "predicate": "绩点", "value": "3.7/4.0" },
+    { "subject": "校园失物招领小程序", "predicate": "上线后注册用户", "value": "800 余人" }
+  ],
+  "expected_pii": [],
+  "conflict_pairs": [],
+  "forbidden_text": [],
+  "notes": "普通简历：全部事实应显式提取，不得补写排名比例之外的数字。"
+}

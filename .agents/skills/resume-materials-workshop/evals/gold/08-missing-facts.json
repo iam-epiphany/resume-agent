@@ -1,0 +1,10 @@
+{
+  "files": ["08-missing-facts.txt"],
+  "expected_facts": [
+    { "subject": "周明轩", "predicate": "专业", "value": "计算机科学与技术" }
+  ],
+  "expected_pii": [],
+  "conflict_pairs": [],
+  "forbidden_text": [],
+  "notes": "缺失事实：实习公司/时间/岗位材料缺失，不得补写（幻觉率指标）；可标 evidence_status=missing。"
+}

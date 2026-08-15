@@ -1,0 +1,11 @@
+{
+  "files": ["09-exaggerated.txt"],
+  "expected_facts": [
+    { "subject": "周明轩", "predicate": "届别", "value": "2024 届" },
+    { "subject": "校园失物招领小程序", "predicate": "丢物找回率", "value": "60%" }
+  ],
+  "expected_pii": [],
+  "conflict_pairs": [],
+  "forbidden_text": [],
+  "notes": "故意夸大：1000 倍/零故障/国家级一等奖等无支撑表述不得照抄为事实（幻觉率指标）。"
+}

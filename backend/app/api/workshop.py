@@ -55,6 +55,7 @@ async def transform(
         "generated_document_ids": json.loads(job.generated_document_ids_json or "[]"),
         "generated_fact_count": job.generated_fact_count,
         "llm_call_count": job.llm_call_count,
+        "conflicts": json.loads(job.conflicts_json or "[]"),
         "error": job.error,
     }
 
@@ -73,6 +74,7 @@ def jobs(limit: int = 20, db: Session = Depends(get_db)) -> list[dict]:
             "generated_document_ids": json.loads(job.generated_document_ids_json or "[]"),
             "generated_fact_count": job.generated_fact_count,
             "llm_call_count": job.llm_call_count,
+            "conflicts": json.loads(job.conflicts_json or "[]"),
             "error": job.error,
             "created_at": job.created_at.isoformat() if job.created_at else None,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,

@@ -4,6 +4,7 @@ import {
   type WorkshopJobView,
   activatePersona,
   confirmPersona,
+  downloadPersonaSkillPackage,
   getActivePersona,
   listPersonas,
   listWorkshopJobs,
@@ -12,13 +13,14 @@ import {
 } from "../api/workshop";
 
 /**
- * 人物工坊（admin）：当前人物档案 + 任意简历材料 → LLM 加工 → 自动入库。
+ * 人物工坊（admin）：当前人物档案 + 任意简历材料 → LLM 加工 → 自动入库 → 人物 Skill 包。
  */
 export function WorkshopPage() {
   const [personas, setPersonas] = useState<PersonaPublic[]>([]);
   const [active, setActive] = useState<PersonaPublic | null>(null);
   const [jobs, setJobs] = useState<WorkshopJobView[]>([]);
   const [busy, setBusy] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [profileDraft, setProfileDraft] = useState<Record<string, unknown>>({});
@@ -61,7 +63,8 @@ export function WorkshopPage() {
       } else {
         setMessage(
           `转换完成：生成 ${result.generated_document_ids.length} 篇文档、` +
-            `${result.generated_fact_count} 条事实。人物档案为草稿，请确认后生效。`,
+            `${result.generated_fact_count} 条事实，人物 Skill 包已自动更新。` +
+            `人物档案为草稿，请确认后生效。`,
         );
       }
       await refresh();
@@ -70,6 +73,22 @@ export function WorkshopPage() {
     } finally {
       setBusy(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  async function handleDownloadSkillPackage() {
+    if (!active) return;
+    setDownloading(true);
+    setError(null);
+    try {
+      const filename = await downloadPersonaSkillPackage(active.persona_id);
+      setMessage(
+        `已下载人物 Skill 包（${filename}）。解压后放入任意 Agent 的 skills 目录，即可让 AI 按本人材料回答。`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "下载失败");
+    } finally {
+      setDownloading(false);
     }
   }
 
@@ -109,7 +128,10 @@ export function WorkshopPage() {
     <main className="page workshop-page">
       <header className="page-header">
         <h1>人物工坊</h1>
-        <p>把任意人的简历材料交给大模型加工成检索友好的知识库，自动入库后即可切换为该人物问答。</p>
+        <p>
+          把任意人的简历材料交给大模型加工成检索友好的知识库（自动入库、一键回滚），
+          并封装为可独立调用的人物 Skill 包（下载即用），切换人物即切换问答主体。
+        </p>
       </header>
 
       {error ? <div className="alert alert--danger">{error}</div> : null}
@@ -140,6 +162,26 @@ export function WorkshopPage() {
                 />
               </label>
             </div>
+            {active.skill_package ? (
+              <div className="persona-card__actions">
+                <button
+                  className="button"
+                  disabled={busy || downloading}
+                  onClick={() => void handleDownloadSkillPackage()}
+                >
+                  {downloading ? "打包中…" : "下载人物 Skill 包（.zip）"}
+                </button>
+                <span className="cell-dim">
+                  {active.skill_package.file_count} 个文件 · 规范版本{" "}
+                  {active.skill_package.skill_version ?? "—"}
+                </span>
+              </div>
+            ) : (
+              <p className="panel__hint">
+                人物 Skill 包：运行一次转换后自动生成（SKILL.md + references/ + facts.json），
+                可下载后放入任意 Agent 的 skills 目录，让 AI 按本人材料回答。
+              </p>
+            )}
           </div>
         ) : (
           <p>正在加载人物信息…</p>
@@ -217,6 +259,11 @@ export function WorkshopPage() {
                   </td>
                   <td>
                     {job.status}
+                    {job.conflicts.length > 0 ? (
+                      <div className="cell-dim" title={job.conflicts.join("\n")}>
+                        ⚠ {job.conflicts.length} 项冲突（悬停查看）
+                      </div>
+                    ) : null}
                     {job.error ? <div className="cell-dim">{job.error}</div> : null}
                   </td>
                   <td>{job.generated_document_ids.length} 篇</td>

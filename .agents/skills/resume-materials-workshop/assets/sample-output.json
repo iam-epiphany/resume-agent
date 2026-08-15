@@ -11,25 +11,28 @@
   "knowledge_documents": [
     {
       "filename": "综合简历_周明轩.md",
-      "content": "> 材料主题：综合简历\n\n周明轩，2024 年 6 月毕业于西安电子科技大学计算机科学与技术专业，求职意向为 Java 后端开发实习生，联系方式已脱敏。\n\n在校绩点为 3.7/4.0（材料原文数字）。\n\n周明轩的实习经历待确认：材料只提到可能在某大厂实习过，没有时间、岗位与公司名称，标 [待确认]。"
+      "content": "> 材料主题：综合简历\n\n周明轩，2024 年 6 月毕业于西安电子科技大学计算机科学与技术专业，求职意向为 Java 后端开发实习生，联系方式已脱敏。\n\n在校绩点为 3.7/4.0（材料原文数字）。\n\n周明轩的实习经历待确认：材料只提到可能在某大厂实习过，没有时间、岗位与公司名称，标 [待确认]。",
+      "sources": ["聊天记录节选"]
     },
     {
       "filename": "项目经历_校园失物招领小程序.md",
-      "content": "> 材料主题：项目经历\n\n校园失物招领小程序是周明轩的个人项目，后端由周明轩独立设计与开发，前端使用微信小程序。\n\n后端技术选择：Java + Spring Boot 提供接口，MySQL 存储业务数据，Redis 做缓存，部署在阿里云 2C4G 云服务器。\n\n项目结果：上线 2 个月注册用户 800 余人，丢物找回率约 60%（材料原文数字）。"
+      "content": "> 材料主题：项目经历\n\n校园失物招领小程序是周明轩的个人项目，后端由周明轩独立设计与开发，前端使用微信小程序。\n\n后端技术选择：Java + Spring Boot 提供接口，MySQL 存储业务数据，Redis 做缓存，部署在阿里云 2C4G 云服务器。\n\n项目结果：上线 2 个月注册用户 800 余人，丢物找回率约 60%（材料原文数字）。",
+      "sources": ["聊天记录节选"]
     },
     {
       "filename": "技能专长_周明轩.md",
-      "content": "> 材料主题：技能专长\n\n周明轩的编程语言为 Java，后端框架使用 Spring Boot，数据库使用 MySQL，缓存使用 Redis，Linux 可进行基本操作。\n\n以上技能为材料自述，熟练程度未经评测，属于本人表述而非第三方验证。"
+      "content": "> 材料主题：技能专长\n\n周明轩的编程语言为 Java，后端框架使用 Spring Boot，数据库使用 MySQL，缓存使用 Redis，Linux 可进行基本操作。\n\n以上技能为材料自述，熟练程度未经评测，属于本人表述而非第三方验证。",
+      "sources": ["聊天记录节选"]
     }
   ],
   "facts": [
-    { "subject": "周明轩", "predicate": "毕业时间", "value": "2024 年 6 月", "status": "confirmed" },
-    { "subject": "周明轩", "predicate": "毕业院校", "value": "西安电子科技大学", "status": "confirmed" },
-    { "subject": "周明轩", "predicate": "专业", "value": "计算机科学与技术", "status": "confirmed" },
-    { "subject": "周明轩", "predicate": "绩点", "value": "3.7/4.0", "status": "confirmed" },
-    { "subject": "周明轩", "predicate": "求职意向", "value": "Java 后端开发实习生", "status": "confirmed" },
-    { "subject": "校园失物招领小程序", "predicate": "上线后注册用户", "value": "800 余人（2 个月）", "status": "confirmed" },
-    { "subject": "校园失物招领小程序", "predicate": "丢物找回率", "value": "约 60%", "status": "confirmed" },
-    { "subject": "周明轩", "predicate": "实习经历", "value": "待确认：材料提到可能在某大厂实习，无详情", "status": "pending" }
+    { "subject": "周明轩", "predicate": "毕业时间", "value": "2024 年 6 月", "evidence_status": "explicit", "source_file": "聊天记录节选" },
+    { "subject": "周明轩", "predicate": "毕业院校", "value": "西安电子科技大学", "evidence_status": "explicit", "source_file": "聊天记录节选" },
+    { "subject": "周明轩", "predicate": "专业", "value": "计算机科学与技术", "evidence_status": "explicit", "source_file": "聊天记录节选" },
+    { "subject": "周明轩", "predicate": "绩点", "value": "3.7/4.0", "evidence_status": "explicit", "source_file": "聊天记录节选" },
+    { "subject": "周明轩", "predicate": "求职意向", "value": "Java 后端开发实习生", "evidence_status": "explicit", "source_file": "聊天记录节选" },
+    { "subject": "校园失物招领小程序", "predicate": "上线后注册用户", "value": "800 余人（2 个月）", "evidence_status": "explicit", "source_file": "聊天记录节选" },
+    { "subject": "校园失物招领小程序", "predicate": "丢物找回率", "value": "约 60%", "evidence_status": "explicit", "source_file": "聊天记录节选" },
+    { "subject": "周明轩", "predicate": "实习经历", "value": "待确认：材料提到可能在某大厂实习，无详情", "evidence_status": "missing", "source_file": "聊天记录节选" }
   ]
 }

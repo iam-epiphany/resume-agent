@@ -1,0 +1,11 @@
+{
+  "files": ["04-long-material.txt"],
+  "expected_facts": [
+    { "subject": "周明轩", "predicate": "专业", "value": "计算机科学与技术" },
+    { "subject": "校园失物招领小程序", "predicate": "上线后注册用户", "value": "800 余人" }
+  ],
+  "expected_pii": [],
+  "conflict_pairs": [],
+  "forbidden_text": [],
+  "notes": "大段超长资料：核心事实仍应提取；重复课程笔记应去噪，不得生成 40 篇重复文档（文档重复率指标）。"
+}

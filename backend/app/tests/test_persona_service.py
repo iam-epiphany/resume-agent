@@ -12,10 +12,13 @@ from backend.app.models.document import Document, FactLedger, Persona
 from backend.app.services import persona_service
 from backend.app.services.persona_service import (
     activate_persona,
+    confirm_persona_profile,
     get_active_persona,
     persona_prompt_context,
     public_persona_view,
+    update_persona_metadata,
 )
+from backend.app.services.persona_skill_service import load_persona_skill_package
 
 
 @pytest.fixture()
@@ -92,6 +95,41 @@ def test_public_view_omits_full_profile(session) -> None:
     assert view["name"] == ""
     assert view["is_active"] is True
     assert "profile" not in view  # 不暴露完整档案
+    assert view["skill_package"] is None  # 未生成包时为 None（元信息字段常驻）
+
+
+def test_confirm_profile_regenerates_skill_package(session) -> None:
+    """档案确认 → 人物 Skill 包重建：profile.md 反映确认后的档案。"""
+    draft = Persona(
+        persona_id="persona-赵六",
+        name="赵六",
+        display_name="赵六",
+        profile_json='{"name": "赵六", "summary": "草稿摘要"}',
+        status="draft",
+        is_active=False,
+    )
+    session.add(draft)
+    session.commit()
+
+    confirmed = confirm_persona_profile(
+        session, "persona-赵六", profile={"name": "赵六", "summary": "确认后的摘要：RAG 后端"}
+    )
+    assert confirmed.status == "confirmed"
+    package = load_persona_skill_package(confirmed)
+    assert package is not None
+    profile_md = package["files"]["persona-赵六/references/profile.md"]
+    assert "确认后的摘要：RAG 后端" in profile_md
+    assert "草稿摘要" not in profile_md
+
+
+def test_update_metadata_regenerates_skill_package(session) -> None:
+    """姓名/称呼修改 → 人物 Skill 包重建：SKILL.md 中的姓名随之更新。"""
+    persona = get_active_persona(session)
+    update_persona_metadata(session, persona.persona_id, display_name="老王")
+    package = load_persona_skill_package(persona)
+    assert package is not None
+    skill_md = package["files"]["persona-default/SKILL.md"]
+    assert "老王" in skill_md
 
 
 def test_persona_scoped_documents_and_facts(session) -> None:

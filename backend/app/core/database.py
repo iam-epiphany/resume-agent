@@ -258,13 +258,53 @@ def _upgrade_sqlite_schema() -> None:
             if "persona_id" not in fact_columns:
                 connection.execute(text("ALTER TABLE fact_ledger ADD COLUMN persona_id VARCHAR(40)"))
                 connection.execute(text("CREATE INDEX IF NOT EXISTS ix_fact_ledger_persona_id ON fact_ledger(persona_id)"))
+            # 事实状态拆分（2026-08-15）：evidence_status（事实可信度）+ review_status（人工审核）。
+            # 存量回填映射：confirmed→explicit/pending、pending→missing/pending、
+            # inferred→inferred/pending、conflict→conflict/pending；其余→missing/pending。
+            # 回填只在两列首次补齐时执行一次：后续每次启动不得再触碰
+            # review_status，避免抹掉人工审核结果（approved/rejected）。
+            columns_added = False
+            if "evidence_status" not in fact_columns:
+                connection.execute(
+                    text("ALTER TABLE fact_ledger ADD COLUMN evidence_status VARCHAR(20) DEFAULT 'explicit'")
+                )
+                columns_added = True
+            if "review_status" not in fact_columns:
+                connection.execute(
+                    text("ALTER TABLE fact_ledger ADD COLUMN review_status VARCHAR(20) DEFAULT 'pending'")
+                )
+                columns_added = True
+            if columns_added:
+                connection.execute(
+                    text(
+                        "UPDATE fact_ledger SET evidence_status = CASE status "
+                        "WHEN 'confirmed' THEN 'explicit' "
+                        "WHEN 'pending' THEN 'missing' "
+                        "WHEN 'inferred' THEN 'inferred' "
+                        "WHEN 'conflict' THEN 'conflict' "
+                        "ELSE 'missing' END, "
+                        "review_status = 'pending' "
+                        "WHERE status IS NOT NULL AND status != ''"
+                    )
+                )
         # 人物工坊（2026-08-14）：skill 版本随任务落库（加工规范单一事实来源）
         if "workshop_jobs" in table_names:
             workshop_job_migrations = {
                 "skill_version": "ALTER TABLE workshop_jobs ADD COLUMN skill_version VARCHAR(40)",
+                "conflicts_json": "ALTER TABLE workshop_jobs ADD COLUMN conflicts_json TEXT",
             }
             for column_name, statement in workshop_job_migrations.items():
                 if column_name not in workshop_job_columns:
+                    connection.execute(text(statement))
+        # 人物 Skill 包（2026-08-15）：工坊产物二次封装为可独立调用的人物 Skill（zip 下载）
+        if "personas" in table_names:
+            persona_columns = {column["name"] for column in inspector.get_columns("personas")}
+            persona_migrations = {
+                "skill_package_json": "ALTER TABLE personas ADD COLUMN skill_package_json TEXT",
+                "skill_package_updated_at": "ALTER TABLE personas ADD COLUMN skill_package_updated_at DATETIME",
+            }
+            for column_name, statement in persona_migrations.items():
+                if column_name not in persona_columns:
                     connection.execute(text(statement))
         # 银行场景遗留表已不再建模（模型已移除 SpreadsheetCell），幂等清理旧库残留
         connection.execute(text("DROP TABLE IF EXISTS spreadsheet_cells"))

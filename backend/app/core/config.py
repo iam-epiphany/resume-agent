@@ -378,6 +378,10 @@ WORKSHOP_SKILL_DIR = os.getenv(
     "WORKSHOP_SKILL_DIR",
     str(PROJECT_ROOT / ".agents" / "skills" / "resume-materials-workshop"),
 )
+# Skill 注册表根目录（2026-08-15）：扫描 <dir>/*/SKILL.md 自动发现全部 skill；
+# 默认取工坊 skill 目录的父目录（本地 .agents/skills，Docker /app/agents-skills），
+# 与 WORKSHOP_SKILL_DIR 单点指向兼容。
+SKILLS_DIR = os.getenv("SKILLS_DIR", str(Path(WORKSHOP_SKILL_DIR).parent))
 
 # 默认人物姓名（2026-08-14）：部署者自行配置；留空 = 不注入姓名，
 # 提示词与文案使用中性"我/求职者"表述（系统绝不内置任何人的姓名）

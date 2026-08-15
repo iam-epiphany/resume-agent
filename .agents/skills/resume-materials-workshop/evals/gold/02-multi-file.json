@@ -1,0 +1,12 @@
+{
+  "files": ["简历.txt", "项目说明.txt"],
+  "expected_facts": [
+    { "subject": "周明轩", "predicate": "专业", "value": "计算机科学与技术" },
+    { "subject": "校园失物招领小程序", "predicate": "丢物找回率", "value": "60%" },
+    { "subject": "校园失物招领小程序", "predicate": "上线后注册用户", "value": "800 余人" }
+  ],
+  "expected_pii": [],
+  "conflict_pairs": [],
+  "forbidden_text": [],
+  "notes": "多文件：项目指标事实的 source_file 应指向 项目说明.txt（来源匹配率指标）。"
+}

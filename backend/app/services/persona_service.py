@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from backend.app.core import config
 from backend.app.core.database import DEFAULT_PERSONA_ID
 from backend.app.models.document import Persona
+from backend.app.services.persona_skill_service import regenerate_persona_skill, skill_package_info
 from backend.app.services.qa_cache_service import clear as clear_qa_cache
 
 # 进程内 active persona_id 缓存（写入/激活/更新时失效；ORM 实例不入缓存——
@@ -96,6 +97,8 @@ def confirm_persona_profile(db: Session, persona_id: str, profile: dict | None =
     persona.status = "confirmed"
     db.commit()
     _invalidate_active_persona()
+    # 档案变化 → 重建人物 Skill 包（profile.md/SKILL.md 随之更新；best-effort）
+    regenerate_persona_skill(db, persona_id)
     return persona
 
 
@@ -109,6 +112,8 @@ def update_persona_metadata(db: Session, persona_id: str, *, name: str | None = 
         persona.display_name = display_name
     db.commit()
     _invalidate_active_persona()
+    # 姓名/称呼变化 → 重建人物 Skill 包（SKILL.md 姓名与描述随之更新；best-effort）
+    regenerate_persona_skill(db, persona_id)
     return persona
 
 
@@ -146,7 +151,11 @@ def persona_prompt_context(persona: Persona) -> dict[str, str]:
 
 
 def public_persona_view(persona: Persona) -> dict:
-    """匿名安全视图：仅姓名/称呼/确认状态（面试官视角，不含完整档案）。"""
+    """匿名安全视图：仅姓名/称呼/确认状态（面试官视角，不含完整档案）。
+
+    skill_package 只含元信息（文件数/规范版本/生成时间），不含任何个人材料内容；
+    完整包内容仅通过管理员鉴权的下载端点（GET /api/personas/{id}/skill-package）获取。
+    """
     profile = persona_profile(persona)
     return {
         "persona_id": persona.persona_id,
@@ -155,4 +164,5 @@ def public_persona_view(persona: Persona) -> dict:
         "status": persona.status,
         "profile_summary": profile.get("summary") or "",
         "is_active": bool(persona.is_active),
+        "skill_package": skill_package_info(persona),
     }

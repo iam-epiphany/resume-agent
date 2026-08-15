@@ -1,12 +1,17 @@
 """关键事实台账服务（2026-08-14）：生成后「实体—属性—值」错配校验（零 LLM）。
 
 解决 presence-only 校验的盲区：数字/日期在证据全文出现 ≠ 归属于正确对象。
-台账以 fact_id 组织 subject/predicate/value/status/source，生成后检查答案中的
-事实归属关系：
+台账以 fact_id 组织 subject/predicate/value/evidence_status/review_status/source，
+生成后检查答案中的事实归属关系：
 - A 实体的值出现在 B 实体附近（张冠李戴）→ mismatch
 - 值出现但归属实体未出现、且同属性的其他实体出现 → mismatch
-- pending 事实被直接引用 → warning（回答者引用了待确认信息）
+- 非 explicit 事实（missing/inferred）被直接引用 → warning（回答者引用了待确认信息）
 - conflict 事实仅存档可见，不参与值校验（保留冲突不做选择）
+
+2026-08-15 状态语义拆分：evidence_status（explicit/inferred/conflict/missing）
+= 事实可信度；review_status（pending/approved/rejected）= 人工审核状态。
+旧 status 列保留为兼容镜像（confirmed/pending/inferred/conflict），新代码写
+evidence_status/review_status。
 """
 
 from __future__ import annotations
@@ -19,6 +24,21 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.models.document import FactLedger
+
+# 旧 status 词表 → 新 evidence_status 词表（种子数据/存量兼容）
+LEGACY_STATUS_TO_EVIDENCE = {
+    "confirmed": "explicit",
+    "pending": "missing",
+    "inferred": "inferred",
+    "conflict": "conflict",
+}
+# 新 evidence_status → 旧 status 镜像（保持旧列可读，供任何遗留消费方）
+EVIDENCE_TO_LEGACY_STATUS = {
+    "explicit": "confirmed",
+    "missing": "pending",
+    "inferred": "inferred",
+    "conflict": "conflict",
+}
 
 
 @dataclass
@@ -55,18 +75,18 @@ def load_fact_ledger(db: Session, persona_id: str | None = None) -> list[FactLed
 
 
 def fact_status_for_source(source_file: str | None, facts: list[FactLedger]) -> str | None:
-    """来源文件的台账事实状态（供公开出处标注）。
+    """来源文件的台账事实证据状态（供公开出处标注）。
 
-    confirmed=该文件只有 confirmed 事实；mixed=含 pending/inferred/conflict 事实；
-    None=该文件未关联任何台账事实。
+    explicit=该文件只有 explicit 事实；mixed=含 missing/inferred/conflict 事实；
+    None=该文件未关联任何台账事实。审核状态（review_status）不参与本标注。
     """
     if not source_file:
         return None
-    statuses = {fact.status for fact in facts if fact.source_file == source_file}
-    if not statuses:
+    evidence = {fact.evidence_status for fact in facts if fact.source_file == source_file}
+    if not evidence:
         return None
-    if statuses <= {"confirmed"}:
-        return "confirmed"
+    if evidence <= {"explicit"}:
+        return "explicit"
     return "mixed"
 
 
@@ -76,12 +96,21 @@ def seed_fact_records(db: Session, records: Iterable[dict[str, Any]]) -> int:
     for record in records:
         fact_id = str(record["fact_id"]).strip()
         existing = db.scalar(select(FactLedger).where(FactLedger.fact_id == fact_id))
+        evidence_status = str(
+            record.get("evidence_status")
+            or LEGACY_STATUS_TO_EVIDENCE.get(str(record.get("status") or ""), "explicit")
+        )[:20]
+        review_status = str(record.get("review_status") or "pending")[:20]
         values = {
             "subject": str(record["subject"])[:255],
             "predicate": str(record["predicate"])[:255],
             "value": str(record["value"])[:500],
             "unit": (str(record["unit"])[:50] if record.get("unit") else None),
-            "status": str(record.get("status") or "confirmed")[:20],
+            "persona_id": (str(record["persona_id"])[:40] if record.get("persona_id") else None),
+            "evidence_status": evidence_status,
+            "review_status": review_status,
+            # 旧列兼容镜像（新代码的语义以 evidence/review 两列为准）
+            "status": EVIDENCE_TO_LEGACY_STATUS.get(evidence_status, "confirmed"),
             "source_file": (str(record["source_file"])[:255] if record.get("source_file") else None),
             "source_section": (str(record["source_section"])[:255] if record.get("source_section") else None),
             "source_type": (str(record["source_type"])[:40] if record.get("source_type") else None),
@@ -129,11 +158,12 @@ def check_answer(answer: str, facts: list[FactLedger]) -> FactCheckResult:
     for subject, entries in by_subject.items():
         if subject not in subjects_in_answer:
             continue
-        # pending 事实所属实体被讨论 → warning（回答者可能引用了待确认信息）
+        # 非 explicit 事实所属实体被讨论 → warning（回答者可能引用了待确认信息）
         for fact in entries:
-            if fact.status == "pending":
+            if fact.evidence_status != "explicit":
                 result.warnings.append(
-                    f"涉及待确认事实：{fact.subject}·{fact.predicate}={fact.value}（{fact.status}）"
+                    f"涉及待确认事实：{fact.subject}·{fact.predicate}={fact.value}"
+                    f"（evidence={fact.evidence_status}，review={fact.review_status}）"
                 )
         positions = [match.start() for match in re.finditer(re.escape(subject), ans)]
         for other_subject, other_entries in by_subject.items():
@@ -144,7 +174,7 @@ def check_answer(answer: str, facts: list[FactLedger]) -> FactCheckResult:
                 if (
                     not other_value
                     or len(other_value) < 4
-                    or other_fact.status in {"conflict", "pending"}
+                    or other_fact.evidence_status in {"conflict", "missing"}
                 ):
                     continue
                 for position in positions:

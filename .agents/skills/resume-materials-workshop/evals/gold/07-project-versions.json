@@ -1,0 +1,11 @@
+{
+  "files": ["v1.txt", "v2.txt"],
+  "expected_facts": [
+    { "subject": "校园失物招领小程序", "predicate": "丢物找回率", "value": "60%" },
+    { "subject": "校园失物招领小程序", "predicate": "丢物找回率", "value": "75%" }
+  ],
+  "expected_pii": [],
+  "conflict_pairs": [["校园失物招领小程序"]],
+  "forbidden_text": [],
+  "notes": "同项目多版本：两个版本的指标都要保留并标 conflict，不得覆盖成单一数字。"
+}

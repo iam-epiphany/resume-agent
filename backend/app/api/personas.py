@@ -1,12 +1,14 @@
 """人物档案接口（2026-08-14）。
 
 公开：GET /api/personas/active（匿名安全视图——面试官视角，驱动前台文案）。
-管理员：列表 / 创建 / 切换 / 确认档案 / 更新姓名称呼。
+管理员：列表 / 创建 / 切换 / 确认档案 / 更新姓名称呼 / 下载人物 Skill 包。
 """
 
 import json
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -21,6 +23,10 @@ from backend.app.services.persona_service import (
     persona_profile,
     public_persona_view,
     update_persona_metadata,
+)
+from backend.app.services.persona_skill_service import (
+    load_persona_skill_package,
+    persona_skill_zip_bytes,
 )
 
 router = APIRouter(prefix="/personas", tags=["personas"])
@@ -39,6 +45,14 @@ class PersonaUpdateRequest(BaseModel):
     confirm: bool = False
 
 
+class SkillPackageInfo(BaseModel):
+    """人物 Skill 包元信息（不含内容；完整内容走管理员下载端点）。"""
+
+    file_count: int
+    skill_version: str | None
+    generated_at: str | None
+
+
 class PersonaPublicResponse(BaseModel):
     persona_id: str
     name: str
@@ -46,6 +60,7 @@ class PersonaPublicResponse(BaseModel):
     status: str
     profile_summary: str
     is_active: bool
+    skill_package: SkillPackageInfo | None = None
 
 
 @router.get("/active", response_model=PersonaPublicResponse)
@@ -117,3 +132,36 @@ def update_persona(
         merged = {**current, **(payload.profile or {})} if payload.profile else current
         persona = confirm_persona_profile(db, persona_id, profile=merged)
     return PersonaPublicResponse(**public_persona_view(persona))
+
+
+@router.get(
+    "/{persona_id}/skill-package",
+    dependencies=[Depends(require_admin)],
+    response_class=Response,
+    responses={404: {"description": "人物不存在或尚未生成人物 Skill 包"}},
+)
+def download_persona_skill_package(
+    persona_id: str,
+    db: Session = Depends(get_db),
+) -> Response:
+    """管理员：下载人物 Skill 包（zip，含 SKILL.md + references/ + facts.json）。
+
+    包内容是该人物的全部个人材料，必须管理员鉴权——下载端点独立挂 require_admin
+    （人物档案常规端点目前未鉴权，见路由注册）。
+    """
+    persona = db.scalar(select(Persona).where(Persona.persona_id == persona_id))
+    if persona is None:
+        raise HTTPException(status_code=404, detail="人物不存在")
+    package = load_persona_skill_package(persona)
+    if package is None:
+        raise HTTPException(
+            status_code=404,
+            detail="该人物还没有生成人物 Skill 包，请先运行一次人物工坊转换",
+        )
+    zip_bytes = persona_skill_zip_bytes(package)
+    filename = f"{(package.get('dir_name') or 'persona')}.skill.zip"
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )

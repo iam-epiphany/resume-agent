@@ -2,15 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://resume-mind.dev/skills/resume-materials-workshop/output-schema.json",
   "title": "简历材料加工输出契约",
-  "description": "「材料加工师」LLM 输出的 JSON 契约：persona_profile（人物档案）+ knowledge_documents[]（一主题一文件的知识库 Markdown）+ facts[]（结构化事实）。后端用 jsonschema 校验，不合契约的任务直接失败，不静默入库。",
+  "description": "「材料加工师」LLM 输出的 JSON 契约：persona_profile（人物档案）+ knowledge_documents[]（一主题一文件的知识库 Markdown）+ facts[]（结构化事实，必带来源与证据分级）。后端用 jsonschema 校验，不合契约的任务直接失败，不静默入库。",
   "type": "object",
   "required": ["knowledge_documents"],
+  "additionalProperties": false,
   "properties": {
     "persona_profile": {
       "type": "object",
-      "description": "人物档案：只放材料中可确认的信息，无法确认的字段省略。",
+      "description": "人物档案：只放材料中可确认的信息，无法确认的字段省略；不得携带额外字段。",
       "properties": {
-        "name": { "type": "string", "description": "人物姓名（材料直接给出）" },
+        "name": { "type": "string", "minLength": 1, "description": "人物姓名（材料直接给出）" },
         "display_name": { "type": "string", "description": "对外展示名（默认同 name）" },
         "summary": { "type": "string", "description": "一句话概述" },
         "education": { "type": "string", "description": "教育背景摘要" },
@@ -18,11 +19,11 @@
         "skills": { "type": "array", "items": { "type": "string" } },
         "projects": { "type": "array", "items": { "type": "string" } }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "knowledge_documents": {
       "type": "array",
-      "description": "知识库文档：一篇只讲一个主题，content 以 `> 材料主题：类别` 开头。",
+      "description": "知识库文档：一篇只讲一个主题，content 首行必须为 `> 材料主题：类别`。",
       "items": {
         "type": "object",
         "required": ["filename", "content"],
@@ -35,7 +36,13 @@
           "content": {
             "type": "string",
             "minLength": 1,
-            "description": "以 `> 材料主题：类别` 开头的 Markdown；类别限：项目经历/技能专长/教育背景/竞赛奖项/荣誉奖励/证书资格/求职意向/个人特质/自我介绍/综合简历"
+            "pattern": "^> 材料主题：[^\\n]+",
+            "description": "首行必须以 `> 材料主题：类别` 开头；类别限：项目经历/技能专长/教育背景/竞赛奖项/荣誉奖励/证书资格/求职意向/个人特质/自我介绍/综合简历"
+          },
+          "sources": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "description": "本文档内容来自哪些原始材料文件名（可选项，供溯源展示）"
           }
         },
         "additionalProperties": false
@@ -43,20 +50,20 @@
     },
     "facts": {
       "type": "array",
-      "description": "结构化事实：status 只能从材料直接确认时为 confirmed，其余 pending。",
+      "description": "结构化事实：evidence_status 为证据分级（材料明确写出→explicit；合理推断→inferred；材料间冲突→conflict；材料缺失→missing）；source_file 必填且只能来自输入材料标注的来源名。",
       "items": {
         "type": "object",
-        "required": ["subject", "predicate", "value", "status"],
+        "required": ["subject", "predicate", "value", "evidence_status", "source_file"],
         "properties": {
           "subject": { "type": "string", "minLength": 1 },
           "predicate": { "type": "string", "minLength": 1 },
           "value": { "type": "string", "minLength": 1 },
-          "status": { "type": "string", "enum": ["confirmed", "pending"] },
-          "source_file": { "type": "string", "description": "事实来源文件名（可选）" }
+          "evidence_status": { "type": "string", "enum": ["explicit", "inferred", "conflict", "missing"] },
+          "source_file": { "type": "string", "minLength": 1, "description": "事实来源文件名（必须来自输入材料中标注的来源）" },
+          "source_section": { "type": "string", "description": "来源章节/段落（可选）" }
         },
-        "additionalProperties": true
+        "additionalProperties": false
       }
     }
-  },
-  "additionalProperties": true
+  }
 }

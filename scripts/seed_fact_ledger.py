@@ -22,7 +22,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 #   python scripts/seed_fact_ledger.py --seed data/facts_seed.jsonl
 DEFAULT_SEED = PROJECT_ROOT / "data" / "facts_seed.jsonl"
 
-VALID_STATUS = {"confirmed", "pending", "inferred", "conflict"}
+# 2026-08-15 起优先写 evidence_status（explicit/inferred/conflict/missing）；
+# 旧种子文件的 status（confirmed/pending/inferred/conflict）仍兼容，由
+# seed_fact_records 映射。
+VALID_EVIDENCE_STATUS = {"explicit", "inferred", "conflict", "missing"}
+VALID_LEGACY_STATUS = {"confirmed", "pending", "inferred", "conflict"}
 
 
 def load_seed(path: Path) -> list[dict]:
@@ -37,11 +41,20 @@ def load_seed(path: Path) -> list[dict]:
         missing = [key for key in ("fact_id", "subject", "predicate", "value") if not record.get(key)]
         if missing:
             raise SystemExit(f"{path.name}:{line_no} 缺少必填字段：{', '.join(missing)}")
-        status = str(record.get("status") or "confirmed")
-        if status not in VALID_STATUS:
-            raise SystemExit(
-                f"{path.name}:{line_no} status={status!r} 非法，允许值：{sorted(VALID_STATUS)}"
-            )
+        if record.get("evidence_status"):
+            evidence = str(record["evidence_status"])
+            if evidence not in VALID_EVIDENCE_STATUS:
+                raise SystemExit(
+                    f"{path.name}:{line_no} evidence_status={evidence!r} 非法，"
+                    f"允许值：{sorted(VALID_EVIDENCE_STATUS)}"
+                )
+        else:
+            status = str(record.get("status") or "confirmed")
+            if status not in VALID_LEGACY_STATUS:
+                raise SystemExit(
+                    f"{path.name}:{line_no} status={status!r} 非法，"
+                    f"允许值：{sorted(VALID_LEGACY_STATUS)}（或改用 evidence_status）"
+                )
         records.append(record)
     return records
 
@@ -56,10 +69,10 @@ def main() -> int:
         raise SystemExit(
             f"种子文件不存在：{args.seed}
 "
-            "事实种子是部署者自己的个人数据（subject/predicate/value/status/source_file）。
+            "事实种子是部署者自己的个人数据（subject/predicate/value/evidence_status/source_file）。
 "
             "参考格式：{\"fact_id\": \"edu_school\", \"subject\": \"学校名\", \"predicate\": \"学历角色\", "
-            "\"value\": \"本科\", \"status\": \"confirmed\", \"source_file\": \"教育背景.md\"}"
+            "\"value\": \"本科\", \"evidence_status\": \"explicit\", \"source_file\": \"教育背景.md\"}"
         )
 
     records = load_seed(args.seed)

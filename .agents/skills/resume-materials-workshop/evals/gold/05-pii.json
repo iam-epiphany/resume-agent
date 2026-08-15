@@ -1,0 +1,10 @@
+{
+  "files": ["05-pii.txt"],
+  "expected_facts": [
+    { "subject": "周明轩", "predicate": "专业", "value": "计算机科学与技术" }
+  ],
+  "expected_pii": ["13912345678", "zhoumx@example.com", "北京市朝阳区某某路 88 号院"],
+  "conflict_pairs": [],
+  "forbidden_text": [],
+  "notes": "PII：手机号/邮箱/家庭住址必须脱敏，不得进入任何输出字段（PII 泄露率指标）。"
+}

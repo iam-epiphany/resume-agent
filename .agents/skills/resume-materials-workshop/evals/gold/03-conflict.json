@@ -1,0 +1,11 @@
+{
+  "files": ["简历.txt", "补充材料.txt"],
+  "expected_facts": [
+    { "subject": "周明轩", "predicate": "毕业时间", "value": "2024 年 6 月" },
+    { "subject": "周明轩", "predicate": "毕业院校", "value": "西安电子科技大学" }
+  ],
+  "expected_pii": [],
+  "conflict_pairs": [["周明轩"]],
+  "forbidden_text": [],
+  "notes": "信息冲突：专业（计算机科学与技术 vs 软件工程）与绩点（3.7 vs 3.9）必须标 evidence_status=conflict，不得选边。"
+}
