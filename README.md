@@ -1,8 +1,6 @@
-# ResumeMind
+# ResumeMind · 基于 RAG 的个人简历问答 Agent
 
 <div align="center">
-
-**基于 RAG 的个人简历问答 Agent**
 
 将简历、项目资料和个人经历整理为可检索的结构化知识，让面试官可以通过自然语言继续追问简历中的内容。
 
